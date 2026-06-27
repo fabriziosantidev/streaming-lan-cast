@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Streaming LAN Cast",
+  "version": "0.2.0",
+  "default_locale": "en",
+  "description": "__MSG_extDescription__",
+  "author": "Fabrizio Santi",
+  "homepage_url": "https://fabriziosantidev.github.io/streaming-lan-cast/",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "lancast@local",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": ["activeTab", "storage", "clipboardRead"],
+  "optional_permissions": ["webRequest"],
+  "host_permissions": ["http://127.0.0.1:9988/*"],
+  "optional_host_permissions": ["<all_urls>"],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "Streaming LAN Cast",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icon-16.png", "32": "icon-32.png" }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "icons": { "16": "icon-16.png", "32": "icon-32.png", "48": "icon-48.png", "96": "icon-96.png", "128": "icon-128.png" }
+}

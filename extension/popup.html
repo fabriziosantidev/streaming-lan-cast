@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    /* dark (default / fallback before JS runs) */
+    --bg:#16181c; --fg:#e6e6e6; --muted:#8a8f98; --name:#ffffff;
+    --card:#1c1f24; --border:#2a2e35; --hover-border:#3a4049;
+    --accent:#2563eb; --accent-fg:#ffffff; --ghost:#2a2e35; --danger:#b91c1c;
+    --sel-border:#16a34a; --sel-bg:#15241a;
+  }
+  :root[data-theme="light"] {
+    --bg:#ffffff; --fg:#1a1d23; --muted:#6b7280; --name:#111418;
+    --card:#f3f4f6; --border:#e2e5ea; --hover-border:#c7ccd4;
+    --accent:#2563eb; --accent-fg:#ffffff; --ghost:#e5e7eb; --danger:#dc2626;
+    --sel-border:#16a34a; --sel-bg:#e8f6ec;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) {
+      --bg:#ffffff; --fg:#1a1d23; --muted:#6b7280; --name:#111418;
+      --card:#f3f4f6; --border:#e2e5ea; --hover-border:#c7ccd4;
+      --accent:#2563eb; --accent-fg:#ffffff; --ghost:#e5e7eb; --danger:#dc2626;
+      --sel-border:#16a34a; --sel-bg:#e8f6ec;
+    }
+  }
+  body {
+    width:300px; margin:0; padding:12px;
+    font:13px/1.4 system-ui, sans-serif;
+    background:var(--bg); color:var(--fg);
+  }
+  .bar { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:10px; }
+  h1 { font-size:14px; margin:0; display:flex; align-items:center; gap:6px; }
+  h1 .dot { width:8px; height:8px; border-radius:50%; background:var(--border); }
+  h1.live .dot { background:#16a34a; box-shadow:0 0 0 3px rgba(22,163,74,.25); }
+  .themebtn {
+    width:28px; height:28px; flex:none; padding:0; border:0; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--ghost); color:var(--fg); cursor:pointer;
+  }
+  .themebtn svg { width:16px; height:16px; }
+  .muted { color:var(--muted); font-size:12px; }
+  #devices { display:flex; flex-direction:column; gap:4px; margin:8px 0; max-height:180px; overflow:auto; }
+  label.dev {
+    display:flex; align-items:center; gap:8px; padding:7px 8px;
+    border:1px solid var(--border); border-radius:8px; cursor:pointer;
+    animation: fadein .25s ease;
+  }
+  label.dev:hover { border-color:var(--hover-border); background:var(--card); }
+  label.dev.sel { border-color:var(--sel-border); background:var(--sel-bg); }
+  label.dev .name { font-weight:600; }
+  label.dev .model { color:var(--muted); font-size:11px; margin-left:auto; }
+  @keyframes fadein { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+  .pickhead { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .spin { width:13px; height:13px; border:2px solid var(--border); border-top-color:var(--accent);
+          border-radius:50%; opacity:0; transition:opacity .15s; flex:none; }
+  .spin.on { opacity:1; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .ph { padding:10px 4px; }
+  .qrow { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  .qrow > .muted { flex:0 0 58px; }   /* fixed label column so Quality/Buffer selects line up */
+  .qrow select { flex:1; min-width:0; padding:6px; border-radius:7px; font-size:12px;
+                 background:var(--card); color:var(--fg); border:1px solid var(--border); }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  button {
+    flex:1; padding:9px; border:0; border-radius:8px; cursor:pointer;
+    font-weight:600; font-size:13px; color:var(--accent-fg); background:var(--accent);
+  }
+  button.ghost { background:var(--ghost); color:var(--fg); }
+  button.danger { background:var(--danger); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:10px; font-size:12px; min-height:16px; color:var(--muted); }
+  /* inline notice: replaces native alert(), which renders clipped in this narrow popup */
+  .notice { margin:0 0 10px; padding:9px 10px; border-radius:8px;
+            font-size:12px; line-height:1.45; word-break:break-word; white-space:pre-line;
+            background:var(--card); border:1px solid var(--border); color:var(--fg); cursor:pointer; }
+  .notice.err { border-color:var(--danger); }
+  [hidden] { display:none !important; }   /* a class display rule must not override the hidden attribute */
+  .linkbtn { display:block; width:100%; margin-top:6px; padding:6px; background:none; border:0;
+             color:var(--muted); font-size:12px; cursor:pointer; text-decoration:underline; font-weight:500; }
+  .linkbtn:hover { color:var(--fg); }
+  .center { text-align:center; }
+  .casting-box { text-align:center; padding:14px 4px 4px; }
+  .casting-box .to { font-size:12px; color:var(--muted); }
+  .casting-box .name { font-size:16px; font-weight:700; margin-top:4px; color:var(--name); }
+  .casting-box .what {
+    margin-top:8px; font-size:12px; color:var(--muted);
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden; word-break:break-word;
+  }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <h1 id="title"><span class="dot"></span> Streaming LAN Cast</h1>
+    <button id="themeBtn" class="themebtn" title="" aria-label="theme"></button>
+  </div>
+
+  <!-- inline notice (click to dismiss); replaces native alert() -->
+  <div id="notice" class="notice" hidden></div>
+
+  <!-- helper not detected -->
+  <div id="noHelper" hidden>
+    <div class="center" style="padding:14px 4px">
+      <div><span data-i18n="helperTitle">Helper not detected.</span></div>
+      <div class="muted" style="margin-top:6px" data-i18n="helperHint">Install the local helper, or start it and retry.</div>
+      <div class="row">
+        <button id="getHelper" data-i18n="getHelper">Get the helper</button>
+        <button id="retryHelper" class="ghost" data-i18n="retry">Retry</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- token not set up -->
+  <div id="needToken" hidden>
+    <div class="center" style="padding:14px 4px">
+      <div><span data-i18n="needTokenTitle">Token not set up.</span></div>
+      <div class="muted" style="margin-top:6px" data-i18n="needTokenHint">Paste the helper's token in the options.</div>
+      <div class="row"><button id="openOptions" class="ghost" data-i18n="openOptions">Open options</button></div>
+    </div>
+  </div>
+
+  <!-- view: pick a device -->
+  <div id="pickerView" hidden>
+    <div class="pickhead">
+      <span class="muted" data-i18n="pickerPrompt">Choose where to cast the current tab</span>
+      <span id="spin" class="spin"></span>
+    </div>
+    <div id="devices"></div>
+    <div class="qrow">
+      <span class="muted" data-i18n="qualityLabel">Quality</span>
+      <select id="quality"><option value="best" data-i18n="qualityBest">Best available</option></select>
+    </div>
+    <div class="qrow">
+      <span class="muted" data-i18n="bufferLabel">Buffer</span>
+      <select id="buffer" data-i18n-title="bufferHint">
+        <option value="3">~3s</option><option value="5">~5s</option>
+        <option value="8">~8s</option><option value="12">~12s</option>
+      </select>
+    </div>
+    <div class="row"><button id="castBtn" data-i18n="castButton">Cast this tab</button></div>
+    <div id="status"></div>
+    <button id="enableDetect" class="linkbtn" data-i18n="enableDetect" hidden>Enable source detection</button>
+  </div>
+
+  <!-- view: casting -->
+  <div id="castingView" hidden>
+    <div class="casting-box">
+      <div class="to">📺 <span data-i18n="castingTo">Casting to</span></div>
+      <div class="name" id="castingName"></div>
+      <div class="what" id="castingTitle"></div>
+    </div>
+    <div class="qrow">
+      <span class="muted" data-i18n="qualityLabel">Quality</span>
+      <select id="castQuality"><option value="best" data-i18n="qualityBest">Best available</option></select>
+      <span id="castQSpin" class="spin"></span>
+    </div>
+    <div class="qrow">
+      <span class="muted" data-i18n="bufferLabel">Buffer</span>
+      <select id="castBuffer" data-i18n-title="bufferHint">
+        <option value="3">~3s</option><option value="5">~5s</option>
+        <option value="8">~8s</option><option value="12">~12s</option>
+      </select>
+      <span id="castBSpin" class="spin"></span>
+    </div>
+    <div class="row"><button id="stopBtn" class="danger" data-i18n="stopButton">Stop</button></div>
+  </div>
+</body>
+<script src="constants.js"></script>
+<script src="popup.js"></script>
+</html>

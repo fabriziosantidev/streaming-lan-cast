@@ -1,0 +1,8 @@
+# Keep LF line endings in the repo for every text file (consistent across OSes).
+* text=auto eol=lf
+
+# Binary assets: never touch line endings.
+*.png binary
+*.xpi binary
+*.zip binary
+*.svg text eol=lf

@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streaming LAN Cast</title>
+<meta name="description" content="Cast the live video in your browser tab to a DLNA or Google Cast device on your own network, straight from Firefox. Private and local.">
+<link rel="canonical" href="https://fabriziosantidev.github.io/streaming-lan-cast/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Streaming LAN Cast">
+<meta property="og:description" content="Cast the live video in your browser tab to a DLNA or Google Cast device on your own network, straight from Firefox. Private and local.">
+<meta property="og:url" content="https://fabriziosantidev.github.io/streaming-lan-cast/">
+<meta property="og:image" content="https://fabriziosantidev.github.io/streaming-lan-cast/icon-128.png">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="icon-128.png">
+<style>
+  :root {
+    --bg:#16181c; --fg:#e6e6e6; --muted:#8a8f98; --name:#ffffff;
+    --card:#1c1f24; --border:#2a2e35; --hover:#3a4049;
+    --accent:#2563eb; --accent-fg:#ffffff; --code:#111316;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#ffffff; --fg:#1a1d23; --muted:#6b7280; --name:#111418;
+      --card:#f6f7f9; --border:#e2e5ea; --hover:#c7ccd4;
+      --accent:#2563eb; --accent-fg:#ffffff; --code:#f0f1f4;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.6 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width:860px; margin:0 auto; padding:0 20px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  header { text-align:center; padding:64px 20px 40px; }
+  header img { width:88px; height:88px; }
+  h1 { font-size:34px; margin:14px 0 6px; color:var(--name); letter-spacing:-.5px; }
+  .tag { font-size:18px; color:var(--muted); max-width:560px; margin:0 auto; }
+  .badges { margin-top:18px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+  .badge { font-size:12.5px; color:var(--muted); background:var(--card);
+           border:1px solid var(--border); border-radius:999px; padding:5px 12px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:1.2px; color:var(--muted);
+       margin:48px 0 16px; font-weight:700; }
+  .cards { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
+  @media (max-width:680px){ .cards { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:20px; }
+  .card.hi { border-color:var(--accent); box-shadow:0 0 0 3px rgba(37,99,235,.15); }
+  .card h3 { margin:0 0 4px; font-size:17px; color:var(--name); }
+  .card .os { font-size:12.5px; color:var(--muted); margin-bottom:14px; }
+  .btn { display:block; text-align:center; background:var(--accent); color:var(--accent-fg);
+         font-weight:600; padding:10px; border-radius:9px; }
+  .btn:hover { text-decoration:none; filter:brightness(1.08); }
+  .btn.ghost { background:transparent; color:var(--fg); border:1px solid var(--border); }
+  code, pre { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background:var(--code); border:1px solid var(--border); border-radius:9px;
+        padding:11px 12px; font-size:12.5px; overflow:auto; margin:0 0 12px; }
+  ol.steps { padding-left:20px; }
+  ol.steps li { margin:8px 0; }
+  .note { color:var(--muted); font-size:14px; }
+  footer { text-align:center; color:var(--muted); font-size:13.5px; padding:48px 20px 60px;
+           border-top:1px solid var(--border); margin-top:56px; }
+  footer a { margin:0 8px; }
+</style>
+</head>
+<body>
+  <header>
+    <img src="icon-128.png" alt="Streaming LAN Cast">
+    <h1>Streaming LAN Cast</h1>
+    <p class="tag">Cast the live video in your browser tab to a DLNA or Google Cast device on your
+    own network, straight from Firefox. Private and local: nothing about what you watch leaves your machine.</p>
+    <div class="badges">
+      <span class="badge">Firefox 128+</span>
+      <span class="badge">DLNA / UPnP</span>
+      <span class="badge">Google Cast</span>
+      <span class="badge">No account</span>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- ===================================================================
+         EDIT THE DOWNLOAD LINKS BELOW:
+           - Windows: upload Setup.exe to a GitHub Release; releases/latest then resolves to it.
+           - Firefox: replace the AMO href once the add-on is listed.
+         =================================================================== -->
+    <h2>1. Install the helper</h2>
+    <p class="note" style="margin-top:-6px">A small local program that does the casting. Pick your OS.</p>
+    <div class="cards">
+      <div class="card" data-os="win">
+        <h3>Windows</h3>
+        <div class="os">Windows 10/11, 64-bit</div>
+        <a class="btn" href="https://github.com/fabriziosantidev/streaming-lan-cast/releases/latest">Download installer</a>
+      </div>
+      <div class="card" data-os="mac">
+        <h3>macOS</h3>
+        <div class="os">Terminal, no admin</div>
+        <a class="btn ghost" href="https://github.com/fabriziosantidev/streaming-lan-cast/blob/main/installer/unix/README.md">How to install</a>
+      </div>
+      <div class="card" data-os="linux">
+        <h3>Linux</h3>
+        <div class="os">Terminal, no sudo</div>
+        <a class="btn ghost" href="https://github.com/fabriziosantidev/streaming-lan-cast/blob/main/installer/unix/README.md">How to install</a>
+      </div>
+    </div>
+    <p class="note" style="margin-top:14px">On Linux or macOS, one command sets it all up:</p>
+    <pre>curl -fsSL https://raw.githubusercontent.com/fabriziosantidev/streaming-lan-cast/main/installer/unix/install.sh | bash</pre>
+
+    <h2>2. Add the Firefox extension</h2>
+    <div class="cards">
+      <div class="card" data-os="any">
+        <h3>Firefox add-on</h3>
+        <div class="os">The toolbar button you cast from</div>
+        <a class="btn" href="https://addons.mozilla.org/firefox/addon/streaming-lan-cast/">Get the add-on</a>
+      </div>
+    </div>
+    <p class="note" style="margin-top:14px">After installing, open the add-on's options once and paste the
+    token the helper printed (or click <strong>Paste</strong>). That pairs the extension with your helper.</p>
+
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li>The <strong>extension</strong> finds DLNA and Google Cast devices on your network and lets you pick one.</li>
+      <li>The <strong>helper</strong> pulls the stream and sends it to the device over your LAN.</li>
+      <li>Everything runs on your own machine. Nothing about what you watch reaches anyone else.</li>
+    </ol>
+  </main>
+
+  <footer>
+    <a href="https://github.com/fabriziosantidev/streaming-lan-cast">GitHub</a>
+    <a href="https://github.com/fabriziosantidev/streaming-lan-cast/blob/main/PRIVACY.md">Privacy</a>
+    <a href="https://github.com/fabriziosantidev/streaming-lan-cast/blob/main/LICENSE">License</a>
+    <div style="margin-top:10px">PolyForm Noncommercial 1.0.0 &copy; 2026 Fabrizio Santi</div>
+  </footer>
+
+  <script>
+    // highlight the visitor's OS download card (progressive enhancement)
+    var p = (navigator.userAgent + " " + (navigator.platform || "")).toLowerCase();
+    var os = p.includes("win") ? "win" : (p.includes("mac") ? "mac" : (p.includes("linux") && !p.includes("android") ? "linux" : ""));
+    if (os) { var c = document.querySelector('.card[data-os="' + os + '"]'); if (c) c.classList.add("hi"); }
+  </script>
+</body>
+</html>

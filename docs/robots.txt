@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://fabriziosantidev.github.io/streaming-lan-cast/sitemap.xml

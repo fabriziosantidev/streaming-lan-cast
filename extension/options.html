@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg:#16181c; --fg:#e6e6e6; --muted:#8a8f98; --card:#1c1f24;
+    --border:#2a2e35; --accent:#2563eb; --accent-fg:#ffffff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#ffffff; --fg:#1a1d23; --muted:#6b7280; --card:#f3f4f6;
+      --border:#e2e5ea; --accent:#2563eb; --accent-fg:#ffffff;
+    }
+  }
+  body { font:13px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg);
+         margin:0; padding:18px; max-width:460px; }
+  h1 { font-size:15px; margin:0 0 4px; }
+  p.muted { color:var(--muted); margin:6px 0 14px; }
+  label { display:block; font-weight:600; margin-bottom:6px; }
+  input { width:100%; box-sizing:border-box; padding:9px 10px; border-radius:8px;
+          border:1px solid var(--border); background:var(--card); color:var(--fg);
+          font:13px ui-monospace, monospace; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:12px; }
+  .trow { display:flex; gap:8px; align-items:center; }
+  .trow input { flex:1; min-width:0; }
+  button { padding:9px 16px; border:0; border-radius:8px; cursor:pointer;
+           font-weight:600; color:var(--accent-fg); background:var(--accent); }
+  button.ghost { background:var(--card); color:var(--fg); border:1px solid var(--border); }
+  #saved { font-size:12px; opacity:0; transition:opacity .2s; }
+  #saved.on { opacity:1; }
+</style>
+</head>
+<body>
+  <h1 data-i18n="optionsTitle">Streaming LAN Cast: Settings</h1>
+  <p class="muted" data-i18n="optionsHelp">Paste the helper's token. You'll find it in the file ~/.streaming-lan-cast/token in your home folder (the helper also prints it on startup).</p>
+  <label for="token" data-i18n="optionsTokenLabel">Helper token</label>
+  <div class="trow">
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="a1b2c3...">
+    <button id="paste" type="button" class="ghost" data-i18n="paste">Paste</button>
+  </div>
+  <div class="row">
+    <button id="save" data-i18n="save">Save</button>
+    <span id="saved"></span>
+  </div>
+<script src="constants.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

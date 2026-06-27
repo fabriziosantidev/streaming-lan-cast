@@ -1,0 +1,24 @@
+# Build / packaging output
+dist/
+build/work/
+web-ext-artifacts/
+*.zip
+*.xpi
+*.part
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets & runtime state (must never be committed)
+.streaming-lan-cast/
+token
+*.token
+streaming-lan-cast-state.json
+streaming-lan-cast-proxy.pid
+streaming-lan-cast.log
+
+# macOS (contributors)
+.DS_Store
