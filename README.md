@@ -42,7 +42,7 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
 
 ## Requirements
 
-- **Firefox 128+**
+- **Firefox 140+**
 - **Python 3.10+** (the Linux/macOS installer builds an isolated venv with streamlink, pychromecast,
   and ffmpeg for you; the Windows `.exe` bundles them all, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**

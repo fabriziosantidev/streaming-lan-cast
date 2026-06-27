@@ -57,7 +57,8 @@ function applyTheme() {
   document.documentElement.setAttribute("data-theme", eff);
   document.documentElement.style.colorScheme = eff;
   const b = $("themeBtn");
-  b.innerHTML = ICON[themeMode];
+  const icon = new DOMParser().parseFromString(ICON[themeMode], "image/svg+xml");
+  b.replaceChildren(document.importNode(icon.documentElement, true));
   b.title = t(themeMode === "auto" ? "themeAuto" : themeMode === "light" ? "themeLight" : "themeDark");
 }
 async function initTheme() {
@@ -148,7 +149,7 @@ function ensureOption(sel, val) {
   }
 }
 function buildQualityOptions(sel, qualities, current) {
-  sel.innerHTML = "";
+  sel.replaceChildren();
   const best = document.createElement("option");
   best.value = "best"; best.textContent = t("qualityBest");
   sel.appendChild(best);
@@ -209,7 +210,7 @@ async function showPicker() {
   setLive(false);
   view("picker");
   castQualityUrl = ""; activeQuality = "best";   // reset casting-view dropdown tracking
-  deviceMap.clear(); elMap.clear(); $("devices").innerHTML = "";
+  deviceMap.clear(); elMap.clear(); $("devices").replaceChildren();
   selectedId = (await browser.storage.local.get("lastDevice")).lastDevice || null;
   const tb = await activeTab();
   activeUrl = tb.url || "";
@@ -251,9 +252,10 @@ function mergeDevices(found) {
 function addDeviceEl(d) {
   const lab = document.createElement("label");
   lab.className = "dev"; lab.dataset.id = d.id;
-  lab.innerHTML = `<input type="radio" name="dev"><span class="name"></span><span class="model"></span>`;
-  lab.querySelector(".name").textContent = d.name;
-  lab.querySelector(".model").textContent = d.model || "";
+  const radio = document.createElement("input"); radio.type = "radio"; radio.name = "dev";
+  const name = document.createElement("span"); name.className = "name"; name.textContent = d.name;
+  const model = document.createElement("span"); model.className = "model"; model.textContent = d.model || "";
+  lab.append(radio, name, model);
   lab.addEventListener("click", () => selectDevice(d.id));
   $("devices").appendChild(lab);
   elMap.set(d.id, lab);

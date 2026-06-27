@@ -16,7 +16,7 @@ the Firefox extension. The install is per-user and needs no `sudo`.
     `sudo dnf install python3` (Fedora), `sudo pacman -S python` (Arch).
   - macOS: `brew install python` (Homebrew), or `xcode-select --install` (note: that one can be older
     than 3.10, so Homebrew is the safer bet).
-- **Firefox 128+**.
+- **Firefox 140+**.
 - A **DLNA/UPnP renderer** on the same network (most smart TVs, many AV receivers / media players).
 - *Optional:* **ffmpeg**. Only a few streams (the ones with separate audio and video tracks) need it.
   Linux: `sudo apt install ffmpeg` (or `dnf` / `pacman`). macOS: `brew install ffmpeg`. The installer
