@@ -51,10 +51,9 @@ Returns a signed `.xpi`. For auto-updates, add `browser_specific_settings.gecko.
 manifest pointing at an `updates.json` you host.
 
 ## 4. Before the first submission: decisions to lock in
-- **Extension id** (`browser_specific_settings.gecko.id`): currently `lancast@local`. It works, but it
-  is permanent for the listing and cannot be changed later without a new listing. If you own a
-  domain, prefer something like `streaming-lan-cast@yourdomain`. (Changing it now resets the locally
-  stored helper token and granted optional permission, so you'd re-enter the token once.)
+- **Extension id** (`browser_specific_settings.gecko.id`): set to
+  `streaming-lan-cast@fabriziosantidev.github.io`. It is permanent for the listing and cannot be changed
+  later without a new listing.
 - **`version`**: bump it (`manifest.json`) for every update you submit.
 - **`homepage_url`** (optional): add it once you have a repo/landing page.
 

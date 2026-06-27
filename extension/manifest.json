@@ -8,7 +8,7 @@
   "homepage_url": "https://fabriziosantidev.github.io/streaming-lan-cast/",
   "browser_specific_settings": {
     "gecko": {
-      "id": "lancast@local",
+      "id": "streaming-lan-cast@fabriziosantidev.github.io",
       "strict_min_version": "128.0",
       "data_collection_permissions": {
         "required": ["none"]
