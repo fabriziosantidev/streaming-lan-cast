@@ -1,8 +1,8 @@
 # Third-party software
 
 Streaming LAN Cast itself is licensed under the PolyForm Noncommercial License 1.0.0 (see `LICENSE`):
-it is free for any noncommercial use, and commercial use (including selling it) is not permitted. The source
-repo bundles no third-party code. On Linux and macOS the user installs the dependencies below into an isolated
+it is free for any noncommercial use, and commercial use (including selling it) is not permitted. The only third-party code committed to the repo is the extension's `browser-polyfill.js` (see Extension
+dependencies). The helper's dependencies are not committed: on Linux and macOS the user installs them into an isolated
 virtual environment (`pip install streamlink pychromecast static-ffmpeg`); the Windows PyInstaller `.exe`
 bundles streamlink, pychromecast, zeroconf, and static-ffmpeg. Each dependency keeps its own license.
 
@@ -47,5 +47,14 @@ bundles streamlink, pychromecast, zeroconf, and static-ffmpeg. Each dependency k
   urllib, subprocess, secrets, etc.). License: PSF License.
 
 ## Extension dependencies
-None. The WebExtension is plain HTML/CSS/JS using only the WebExtensions (`browser.*`) APIs provided
-by Firefox. It uses no third-party libraries and is not bundled or minified.
+
+### webextension-polyfill
+- Role: a small compatibility shim that exposes the standard promise-based `browser.*` API in Chromium
+  browsers (Chrome, Edge, Brave), which natively provide only the callback-based `chrome.*` API, so the
+  extension can share one codebase across Firefox and Chrome. It ships as `extension/browser-polyfill.js`,
+  loaded by a script tag in the popup and options pages and by `importScripts` in the Chrome service worker.
+- Version: 0.12.0 (unmodified).
+- License: Mozilla Public License 2.0.
+- Project: https://github.com/mozilla/webextension-polyfill
+
+The rest of the WebExtension is plain HTML/CSS/JS, not bundled or minified.

@@ -68,4 +68,4 @@ say "  removed $DATA_DIR"
 rm -rf "$TOKEN_DIR"
 say "  removed $TOKEN_DIR"
 
-say "${GRN}Done. The browser extension can be removed from Firefox separately.${RST}"
+say "${GRN}Done. The browser extension can be removed from your browser separately.${RST}"

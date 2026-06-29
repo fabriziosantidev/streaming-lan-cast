@@ -20,7 +20,7 @@
   "host_permissions": ["http://127.0.0.1:9988/*"],
   "optional_host_permissions": ["<all_urls>"],
   "background": {
-    "scripts": ["background.js"]
+    "scripts": ["browser-polyfill.js", "background.js"]
   },
   "action": {
     "default_title": "Streaming LAN Cast",

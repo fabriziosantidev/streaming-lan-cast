@@ -45,7 +45,7 @@ address, so it never leaves your computer). This is why the only required host
 permission is `http://127.0.0.1:9988/*`; the optional `<all_urls>` host permission is
 requested only if you turn on source detection.
 
-Nothing is ever sent to the extension's developer, to Mozilla, to any analytics
+Nothing is ever sent to the extension's developer, to Mozilla or Google, to any analytics
 service, or to any remote server. There is no telemetry, no tracking, no
 advertising, and no fingerprinting.
 

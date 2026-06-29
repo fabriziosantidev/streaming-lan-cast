@@ -1,8 +1,11 @@
-# Packaging & signing: Streaming LAN Cast (Firefox AMO)
+# Packaging & signing: Streaming LAN Cast (Firefox AMO & Chrome Web Store)
 
-The extension is plain HTML/CSS/JS/JSON: no build step, no bundler, not minified.
-"Packaging" is just zipping `extension/`. That also means AMO does not require a separate
-source-code upload (that's only for minified or bundled add-ons).
+The extension is plain HTML/CSS/JS/JSON, no bundler and nothing minified. The code under
+`extension/` is shared across browsers; it uses the bundled `webextension-polyfill` so `browser.*`
+works in both. The only per-browser difference is the manifest's background key (Firefox uses an
+event page, Chrome a service worker), so a small build step (`build/build-extension.sh`) copies the
+shared source and swaps in the right manifest. Because nothing is bundled or minified, neither store
+requires a separate source-code upload.
 
 ## 0. Prerequisites
 - Node.js LTS (https://nodejs.org).
@@ -20,11 +23,14 @@ web-ext lint -s extension
 Fix any errors. Warnings about the loopback host permission or optional `<all_urls>` are expected,
 not bugs; explain them in your "Notes for reviewers" at submission time.
 
-## 2. Build the package (.zip)
+## 2. Build the packages (.zip)
 ```
-web-ext build -s extension -a dist
+build/build-extension.sh            # needs only python3 and zip
 ```
-Produces `dist/streaming_lan_cast-0.2.0.zip`. That zip is what you upload to AMO.
+Produces, under `dist/`: `streaming-lan-cast-firefox-<v>.zip` (event-page background, for AMO) and
+`streaming-lan-cast-chrome-<v>.zip` (service-worker background, for the Chrome Web Store / Edge), plus
+unpacked `dist/firefox/` and `dist/chrome/` for loading during development. Upload the matching zip to
+each store. (`web-ext build -s extension -a dist` still works for a Firefox-only zip if you prefer.)
 
 ## 3. Get it signed / published
 
@@ -50,6 +56,16 @@ web-ext sign -s extension --channel unlisted --api-key <KEY> --api-secret <SECRE
 Returns a signed `.xpi`. For auto-updates, add `browser_specific_settings.gecko.update_url` to the
 manifest pointing at an `updates.json` you host.
 
+### Chrome Web Store (Chrome / Edge)
+1. Register once at the Chrome Web Store Developer Dashboard
+   (https://chrome.google.com/webstore/devconsole) and pay the one-time developer fee.
+2. Click "Add new item" and upload `dist/streaming-lan-cast-chrome-<v>.zip`.
+3. Fill in the store listing, add the same "Notes for reviewers" about the local helper and the opt-in
+   `<all_urls>` permission, and set the Privacy Policy to your hosted URL (see §5).
+4. Submit for review. Broad host permissions usually mean a longer review; once it passes, Google
+   publishes it and users install and auto-update from the store. (Edge reuses the same zip on the
+   separate Microsoft Edge Add-ons dashboard.)
+
 ## 4. Before the first submission: decisions to lock in
 - **Extension id** (`browser_specific_settings.gecko.id`): set to
   `streaming-lan-cast@fabriziosantidev.github.io`. It is permanent for the listing and cannot be changed
@@ -58,7 +74,7 @@ manifest pointing at an `updates.json` you host.
 - **`homepage_url`** (optional): add it once you have a repo/landing page.
 
 ## 5. Hosting the privacy policy
-AMO needs a URL (or pasted text). `PRIVACY.md` is ready. Easiest options:
+AMO needs a URL (or pasted text) and the Chrome Web Store needs a hosted URL. `PRIVACY.md` is ready. Easiest options:
 - Push this repo to GitHub and use the raw URL of `PRIVACY.md`, or
 - Enable GitHub Pages and link the rendered page, or
 - Paste it into a public gist and use its URL.
@@ -100,3 +116,6 @@ web-ext build -s extension -a dist         # zip
 web-ext sign  -s extension --channel listed --api-key K --api-secret S   # sign/submit
 web-ext run   -s extension                 # launch a temp Firefox with it loaded (dev)
 ```
+
+For Chrome / Edge there is no CLI loader: open `chrome://extensions`, enable Developer mode, and use
+"Load unpacked" on `dist/chrome/`.

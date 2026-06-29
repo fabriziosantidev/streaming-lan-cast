@@ -1,7 +1,7 @@
 # Installing Streaming LAN Cast (Linux and macOS)
 
 A step-by-step guide to install the helper (a small local background service) and pair it with
-the Firefox extension. The install is per-user and needs no `sudo`.
+the browser extension. The install is per-user and needs no `sudo`.
 
 > On **Windows** the helper ships as a self-contained `.exe` (Python and streamlink are bundled in,
 > so nothing else is needed). Use the Inno Setup installer instead, see the project README.
@@ -16,7 +16,7 @@ the Firefox extension. The install is per-user and needs no `sudo`.
     `sudo dnf install python3` (Fedora), `sudo pacman -S python` (Arch).
   - macOS: `brew install python` (Homebrew), or `xcode-select --install` (note: that one can be older
     than 3.10, so Homebrew is the safer bet).
-- **Firefox 140+**.
+- **Firefox 140+**, or a Chromium browser (Chrome / Edge / Brave) **102+**.
 - A **DLNA/UPnP renderer** on the same network (most smart TVs, many AV receivers / media players).
 - *Optional:* **ffmpeg**. Only a few streams (the ones with separate audio and video tracks) need it.
   Linux: `sudo apt install ffmpeg` (or `dnf` / `pacman`). macOS: `brew install ffmpeg`. The installer
@@ -54,9 +54,9 @@ Copy that token. (You can re-read it any time with `cat ~/.streaming-lan-cast/to
 
 ---
 
-## 2. Install the Firefox extension
+## 2. Install the browser extension
 
-Published (recommended, once listed): install from addons.mozilla.org. The token is the only setup
+Published (recommended, once listed): install from addons.mozilla.org (Firefox) or the Chrome Web Store (Chrome / Edge / Brave). The token is the only setup
 step and it persists across restarts.
 
 Temporary (development, or before it's listed):
@@ -67,6 +67,15 @@ Temporary (development, or before it's listed):
 > A *temporary* add-on is removed when you restart Firefox, and reloading it resets the optional
 > "source detection" permission (a Firefox rule for temporary add-ons). The published version
 > doesn't have these limits.
+
+Temporary on **Chrome, Edge or Brave** (development, or before it's listed on the Chrome Web Store):
+
+1. Open `chrome://extensions`.
+2. Turn on **Developer mode** (top right).
+3. Click **Load unpacked** and select the `dist/chrome/` folder.
+
+> An unpacked extension stays loaded across restarts (unlike a Firefox temporary add-on), but it
+> goes away if you delete the folder or remove it from `chrome://extensions`.
 
 ---
 
@@ -150,7 +159,7 @@ It removes the autostart service (systemd or launchd), the venv, and the token d
   macOS `launchctl unload ~/Library/LaunchAgents/com.fabriziosantidev.streaming-lan-cast.plist`.
 - From a checkout, you can also run `./installer/unix/uninstall.sh`.
 
-Remove the extension from Firefox separately (`about:addons`).
+Remove the extension from your browser separately (Firefox: `about:addons`; Chrome / Edge / Brave: `chrome://extensions`).
 
 ---
 

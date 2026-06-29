@@ -20,7 +20,7 @@ Google Cast (--cast, Chromecast / Android TV): ffmpeg remuxes the source into
 local 2s HLS segments that we serve to the Cast receiver, driven over the Cast
 protocol via pychromecast. Same live behaviour, plus a buffer/latency knob.
 
-The control server (--serve) is what the Firefox extension talks to: it discovers
+The control server (--serve) is what the browser extension talks to: it discovers
 both kinds of renderer and launches the matching path per cast.
 
 Usage:
@@ -1259,7 +1259,7 @@ def _inject_live_start(body, offset):
 
 
 # --- Control server for the browser extension --------------------------------
-# Control server: lets the Firefox extension trigger casting WITHOUT native
+# Control server: lets the browser extension trigger casting WITHOUT native
 # messaging. The extension just does fetch("http://127.0.0.1:9988/cast?url=").
 # Runs in the background; on each /cast it launches a normal --proxy cast.
 def serve_control(port):
@@ -1995,7 +1995,7 @@ def main():
     ap.add_argument("--cast-uuid", default="", help=argparse.SUPPRESS)
     ap.add_argument("--cast-name", default="", help=argparse.SUPPRESS)
     ap.add_argument("--cast-model", default="", help=argparse.SUPPRESS)
-    ap.add_argument("--serve", action="store_true", help="run the local control server for the Firefox extension")
+    ap.add_argument("--serve", action="store_true", help="run the local control server for the browser extension")
     ap.add_argument("--control-port", type=int, default=9988, help="control server port (localhost)")
     args = ap.parse_args()
     if args.low_latency:

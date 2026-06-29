@@ -2,7 +2,7 @@
 
 Cast the live video playing in your current browser tab to a DLNA/UPnP media renderer (a smart TV, an
 AV receiver, or a media player) or a Google Cast device (Chromecast, Android TV, Google TV) on your
-local network, straight from Firefox.
+local network, straight from your browser.
 
 Everything stays on your own machine and LAN: nothing about what you watch is ever sent to a server we
 control. There's no tracking, no analytics, no account.
@@ -19,7 +19,7 @@ Streaming LAN Cast is two pieces that talk over your machine's loopback address:
 ```
                                             ┌─ DLNA/UPnP ──▶  smart TV / AV receiver
                                             │  (streamlink live MPEG-TS over your LAN)
-  Firefox extension ─HTTP─▶ local helper ───┤
+  browser extension ─HTTP─▶ local helper ───┤
   (picks device,           (127.0.0.1:9988) │
    sends the tab URL)                       └─ Google Cast ──▶  Chromecast / Android TV
                                                (ffmpeg HLS remux via pychromecast)
@@ -42,7 +42,7 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
 
 ## Requirements
 
-- **Firefox 140+**
+- **Firefox 140+**, or **Chrome / Edge / Brave 102+**
 - **Python 3.10+** (the Linux/macOS installer builds an isolated venv with streamlink, pychromecast,
   and ffmpeg for you; the Windows `.exe` bundles them all, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**
@@ -97,7 +97,10 @@ Keep this running while you cast. To start it automatically at login:
 **Development (unsigned):** open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** →
 select `extension/manifest.json`.
 
-**Published:** install from addons.mozilla.org *(link once listed)*.
+On **Chrome / Edge / Brave**, run `build/build-extension.sh`, then open `chrome://extensions` → enable
+**Developer mode** → **Load unpacked** → select `dist/chrome/`.
+
+**Published:** install from addons.mozilla.org *(link once listed)*. On **Chrome / Edge / Brave**, install from the Chrome Web Store *(link once listed)*.
 
 Then open the toolbar popup:
 - If it says **"Helper not detected"**, start the helper (step 1).
@@ -134,20 +137,20 @@ are sent only to the local helper on `127.0.0.1`. Full policy: [`PRIVACY.md`](PR
 
 ## Building & publishing
 
-The extension is plain HTML/CSS/JS/JSON with no build step. [`PACKAGING.md`](PACKAGING.md) covers
-packaging, linting, and signing (`web-ext lint` → `web-ext build` → `web-ext sign`).
+The extension is plain HTML/CSS/JS/JSON (no bundler or transpiler); a small step packages the Firefox and Chrome variants. [`PACKAGING.md`](PACKAGING.md) covers
+packaging, linting, and signing (`web-ext lint` → `web-ext build` → `web-ext sign`), and the matching steps for building the Chrome/Edge package and submitting it to the Chrome Web Store.
 
 ## Repository layout
 
 ```
-extension/            the Firefox WebExtension (popup, options, background sniffer, _locales, icons)
+extension/            the cross-browser WebExtension (popup, options, background sniffer, _locales, icons)
 helper/               the Python casting helper (streaming-lan-cast-helper.py)
 requirements.txt      the helper's Python runtime dependencies (pip install -r)
 installer/            per-OS helper installers (unix/ for Linux+macOS, windows/)
 build/                the PyInstaller spec for the Windows helper bundle (work output gitignored)
 README.md             this file
 PRIVACY.md            privacy policy
-PACKAGING.md          web-ext lint/build/sign steps
+PACKAGING.md          packaging, signing, and store submission steps
 THIRD-PARTY.md        third-party licenses (streamlink, etc.)
 LICENSE               PolyForm Noncommercial 1.0.0
 ```

@@ -4,6 +4,11 @@
 // used (Referer/Origin/User-Agent/Cookie) so the helper can replay them.
 // Gated behind the OPTIONAL webRequest + <all_urls> permission (enabled from the popup).
 
+// In Chrome the background is a service worker (no <script> tags), so the polyfill is loaded here
+// for browser.* and promise-returning onMessage. In Firefox it is an event page and the polyfill is
+// already loaded via the manifest's background.scripts, so importScripts is absent and this is skipped.
+if (typeof importScripts === "function") importScripts("browser-polyfill.js");
+
 // Headers the sniffer captures to replay. Keep in sync with the helper's _REPLAY_HEADERS
 // (helper/streaming-lan-cast-helper.py). That set is the security boundary; this must be a subset.
 const WANT = ["referer", "origin", "user-agent", "cookie"];
@@ -84,8 +89,14 @@ function cleanup(d) { hdrStash.delete(d.requestId); }
 function installListeners() {
   if (installed || !browser.webRequest) return;
   const f = { urls: ["<all_urls>"] };
+  // Chrome hides Cookie/Referer/Origin/User-Agent from webRequest unless "extraHeaders" is requested;
+  // Firefox exposes them with "requestHeaders" alone and has no such option. Add it only where it
+  // exists so the same code captures the replay headers in both browsers.
+  const reqSpec = ["requestHeaders"];
+  const obsh = browser.webRequest.OnBeforeSendHeadersOptions;
+  if (obsh && obsh.EXTRA_HEADERS) reqSpec.push("extraHeaders");
   browser.webRequest.onBeforeRequest.addListener(onBeforeRequest, f);
-  browser.webRequest.onBeforeSendHeaders.addListener(onBeforeSendHeaders, f, ["requestHeaders"]);
+  browser.webRequest.onBeforeSendHeaders.addListener(onBeforeSendHeaders, f, reqSpec);
   browser.webRequest.onHeadersReceived.addListener(onHeadersReceived, f, ["responseHeaders"]);
   browser.webRequest.onCompleted.addListener(cleanup, f);
   browser.webRequest.onErrorOccurred.addListener(cleanup, f);

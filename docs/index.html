@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Streaming LAN Cast</title>
-<meta name="description" content="Cast the live video in your browser tab to a DLNA or Google Cast device on your own network, straight from Firefox. Private and local.">
+<meta name="description" content="Cast the live video in your browser tab to a DLNA or Google Cast device on your own network, straight from your browser. Private and local.">
 <link rel="canonical" href="https://fabriziosantidev.github.io/streaming-lan-cast/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Streaming LAN Cast">
-<meta property="og:description" content="Cast the live video in your browser tab to a DLNA or Google Cast device on your own network, straight from Firefox. Private and local.">
+<meta property="og:description" content="Cast the live video in your browser tab to a DLNA or Google Cast device on your own network, straight from your browser. Private and local.">
 <meta property="og:url" content="https://fabriziosantidev.github.io/streaming-lan-cast/">
 <meta property="og:image" content="https://fabriziosantidev.github.io/streaming-lan-cast/icon-128.png">
 <meta name="twitter:card" content="summary">
@@ -67,9 +67,10 @@
     <img src="icon-128.png" alt="Streaming LAN Cast">
     <h1>Streaming LAN Cast</h1>
     <p class="tag">Cast the live video in your browser tab to a DLNA or Google Cast device on your
-    own network, straight from Firefox. Private and local: nothing about what you watch leaves your machine.</p>
+    own network, straight from your browser. Private and local: nothing about what you watch leaves your machine.</p>
     <div class="badges">
       <span class="badge">Firefox 140+</span>
+      <span class="badge">Chrome 102+</span>
       <span class="badge">DLNA / UPnP</span>
       <span class="badge">Google Cast</span>
       <span class="badge">No account</span>
@@ -82,6 +83,7 @@
          EDIT THE DOWNLOAD LINKS BELOW:
            - Windows: upload Setup.exe to a GitHub Release; releases/latest then resolves to it.
            - Firefox: replace the AMO href once the add-on is listed.
+           - Chrome: replace the CWS href once the extension is listed.
          =================================================================== -->
     <h2>1. Install the helper</h2>
     <p class="note" style="margin-top:-6px">A small local program that does the casting. Pick your OS.</p>
@@ -105,15 +107,20 @@
     <p class="note" style="margin-top:14px">On Linux or macOS, one command sets it all up:</p>
     <pre>curl -fsSL https://raw.githubusercontent.com/fabriziosantidev/streaming-lan-cast/main/installer/unix/install.sh | bash</pre>
 
-    <h2>2. Add the Firefox extension</h2>
+    <h2>2. Add the browser extension</h2>
     <div class="cards">
       <div class="card" data-os="any">
         <h3>Firefox add-on</h3>
         <div class="os">The toolbar button you cast from</div>
         <a class="btn" href="https://addons.mozilla.org/firefox/addon/streaming-lan-cast/">Get the add-on</a>
       </div>
+      <div class="card" data-os="any">
+        <h3>Chrome extension</h3>
+        <div class="os">Chrome, Edge, or Brave</div>
+        <a class="btn" href="https://chromewebstore.google.com/detail/streaming-lan-cast">Get the extension</a>
+      </div>
     </div>
-    <p class="note" style="margin-top:14px">After installing, open the add-on's options once and paste the
+    <p class="note" style="margin-top:14px">After installing, open the extension's options once and paste the
     token the helper printed (or click <strong>Paste</strong>). That pairs the extension with your helper.</p>
 
     <h2>How it works</h2>

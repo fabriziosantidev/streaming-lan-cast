@@ -17,7 +17,7 @@ async function save() {
   // Don't clobber a working stored token with one the helper explicitly REJECTED. A network
   // error (helper offline) still saves, so first-time setup works before the helper is running.
   // SECURITY: keep this in storage.local (per-device, origin-isolated). NEVER storage.sync,
-  // which would upload the per-install secret to Mozilla's servers and off-device.
+  // which would upload the per-install secret to the browser vendor's servers and off-device.
   if (!rejected) await browser.storage.local.set({ token: tok });
   const s = $("saved");
   s.textContent = ok ? (browser.i18n.getMessage("saved") || "Saved ✓")
@@ -34,7 +34,7 @@ async function pasteToken() {
     const t = (await navigator.clipboard.readText()).trim();
     if (t) $("token").value = t;
   } catch (e) {
-    // clipboard read blocked (older Firefox / missing permission) -> the user can still Ctrl+V
+    // clipboard read blocked (older browser / missing permission) -> the user can still Ctrl+V
   }
   $("token").focus();
 }

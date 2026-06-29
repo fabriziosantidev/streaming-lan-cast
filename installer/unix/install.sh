@@ -4,7 +4,7 @@
 # Installs the local helper into an isolated Python venv and autostarts it:
 #   - Linux: a systemd --user service
 #   - macOS: a launchd LaunchAgent
-# The helper is a loopback control server the Firefox extension talks to; pair
+# The helper is a loopback control server the browser extension talks to; pair
 # them with the token printed at the end.
 #
 # Usage:  ./install.sh        (run as your normal user, never with sudo)
