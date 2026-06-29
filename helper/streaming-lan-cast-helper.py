@@ -86,7 +86,7 @@ FROZEN = getattr(sys, "frozen", False)    # True inside the PyInstaller bundle (
 
 # --- Process spawning and shared helpers -------------------------------------
 # On Linux, ask the kernel to kill our long-running children (ffmpeg/streamlink) if THIS process
-# dies by any means -- even SIGKILL or a crash, which run no Python cleanup. Without this an ffmpeg
+# dies by any means, even SIGKILL or a crash, which run no Python cleanup. Without this an ffmpeg
 # that writes to files (not a pipe) never notices the helper died and leaks as an orphan.
 try:
     import ctypes
@@ -150,7 +150,7 @@ def _install_safe_url_opener():
               urllib.request.HTTPRedirectHandler(), urllib.request.HTTPErrorProcessor(),
               urllib.request.HTTPDefaultErrorHandler(),
               # carry cookies across fetches: a tokenized HLS playlist often sets a session cookie
-              # that its segments need -- without this the segments 404/403 (the cast HLS proxy
+              # that its segments need. Without this the segments 404/403 (the cast HLS proxy
               # fetches them itself, unlike the DLNA path where streamlink keeps the session).
               urllib.request.HTTPCookieProcessor()):
         opener.add_handler(h)
@@ -180,7 +180,7 @@ def _read_pidfile():
 
 def _write_pidfile(pid):
     """Record the casting proxy's pid. The CONTROL SERVER writes this synchronously the instant
-    it spawns the proxy (under its state lock), so proxy_alive() is true immediately -- closing
+    it spawns the proxy (under its state lock), so proxy_alive() is true immediately, closing
     the window where state says 'casting' but the pidfile is still empty (a /status poll there
     used to read 'stopped' and tear the fresh cast down)."""
     try:
@@ -191,7 +191,7 @@ def _write_pidfile(pid):
 
 
 def _remove_pidfile():
-    """Remove PIDFILE, but only if it still names THIS process -- so a proxy exiting late can't
+    """Remove PIDFILE, but only if it still names THIS process, so a proxy exiting late can't
     delete the pidfile of a newer proxy the control server already started."""
     pid = _read_pidfile()
     if pid is not None and pid != os.getpid():
@@ -235,7 +235,7 @@ def _pid_cmdline(pid):
 
 
 def _pid_is_proxy(pid):
-    """True only if `pid` is alive AND is one of OUR cast proxies -- not merely a process that
+    """True only if `pid` is alive AND is one of OUR cast proxies, not merely a process that
     reused the recorded PID. Without this an old crash-leaked pidfile + PID reuse would make us
     report a phantom cast and (in kill_previous_proxy) signal an unrelated process."""
     if pid is None:
@@ -693,8 +693,8 @@ def _safe_unlink(path):
 
 def _write_header_config(headers):
     """Write replay headers to a PRIVATE (0600) streamlink --config file and return its path
-    ('' if none). Credentials (Cookie) then reach streamlink via the config file instead of argv
-    -- argv is world-readable via /proc/<pid>/cmdline, a config file is owner-only."""
+    ('' if none). Credentials (Cookie) then reach streamlink via the config file instead of argv:
+    argv is world-readable via /proc/<pid>/cmdline, a config file is owner-only."""
     if not headers:
         return ""
     try:
@@ -708,7 +708,7 @@ def _write_header_config(headers):
 
 
 def _redact_url(url):
-    """A URL with its query string stripped, for logging -- signed/tokenised query params don't
+    """A URL with its query string stripped, for logging. Signed/tokenised query params don't
     belong in the (shared-temp-dir) log even though it's now created owner-only."""
     return (url or "").split("?", 1)[0]
 
@@ -942,7 +942,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
     def handle_error(self, request, client_address):
         # TVs/Chromecasts reset connections constantly (closing keep-alives, seeking); those are
-        # benign -- don't spew a traceback for them. Real handler errors are logged via log().
+        # benign, so don't spew a traceback for them. Real handler errors are logged via log().
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionResetError, BrokenPipeError,
                             ConnectionAbortedError, TimeoutError)):
@@ -952,7 +952,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 # --- Google Cast (Chromecast / Android TV) -----------------------------------
 # Cast speaks a TLS+protobuf protocol (not DLNA/SOAP) and its receiver plays HLS, not raw
-# MPEG-TS -- so cast targets get the HLS proxy below instead of the live.ts server. pychromecast
+# MPEG-TS, so cast targets get the HLS proxy below instead of the live.ts server. pychromecast
 # (+ zeroconf) is imported lazily so a DLNA-only install never needs it.
 def discover_cast_devices(timeout=2.0):
     """mDNS browse for _googlecast._tcp devices. Returns device dicts (kind='cast'); [] if
@@ -1019,7 +1019,7 @@ def discover_cast_devices(timeout=2.0):
 def discover_all_devices():
     """DLNA (SSDP) + Cast (mDNS) renderers, discovered in parallel and merged. If one physical
     device exposes BOTH protocols (e.g. an Android TV with a DLNA app + Chromecast built-in), keep
-    the DLNA entry -- the MPEG-TS/SOAP path is more reliable there than re-muxing HLS for Cast."""
+    the DLNA entry: the MPEG-TS/SOAP path is more reliable there than re-muxing HLS for Cast."""
     from concurrent.futures import ThreadPoolExecutor
     devs = []
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -1045,7 +1045,7 @@ def discover_all_devices():
 
 def _tcp_open(host, port, timeout=4):
     """True if a TCP connect to host:port succeeds. The Cast service (:8009) stops listening when
-    the TV is in standby/off (it still answers ping), so we check this before connecting -- else
+    the TV is in standby/off (it still answers ping), so we check this before connecting. Otherwise
     pychromecast retries the connection forever and the cast hangs showing 'casting' with a blank TV."""
     try:
         with socket.create_connection((host, int(port or 8009)), timeout=timeout):
@@ -1078,7 +1078,7 @@ _CAST_RECEIVER_APP = "CC1AD845"
 
 def cast_quit(host, port, uuid, model, name):
     """Stop playback on a cast device (back to home). Only quits if OUR media receiver is still
-    the running app -- quitting an already-idle device just relaunches its splash screen."""
+    the running app. Quitting an already-idle device just relaunches its splash screen."""
     try:
         cc = _cast_connect(host, port, uuid, model, name, timeout=8)
         if getattr(cc, "app_id", None) == _CAST_RECEIVER_APP:
@@ -1091,8 +1091,8 @@ def cast_quit(host, port, uuid, model, name):
 
 # Google Cast HLS: ffmpeg reads the source HLS DIRECTLY at the live edge (handling its tokens and
 # headers itself) and re-muxes it into small 2s segments in a temp dir. We serve those LOCAL files
-# to the Cast receiver. Robust the way the DLNA path is -- no re-fetching source segments that
-# expire (no 404s) -- and low-latency (2s chunks regardless of the source's segment size).
+# to the Cast receiver. Robust the way the DLNA path is: no re-fetching source segments that
+# expire (no 404s), and low-latency (2s chunks regardless of the source's segment size).
 _HLS_MASTER = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nmedia.m3u8\n"
 
 
@@ -1154,7 +1154,7 @@ class FfmpegHls:
                                      preexec_fn=_PDEATHSIG)   # die with the helper, never orphan
 
     def ready(self):
-        # one segment is enough to LOAD -- the receiver buffers as ffmpeg keeps adding. Waiting for
+        # one segment is enough to LOAD: the receiver buffers as ffmpeg keeps adding. Waiting for
         # more just delays playback (badly for large-GOP sources where each segment takes seconds).
         try:
             with open(os.path.join(self.workdir, "media.m3u8")) as f:
@@ -1299,7 +1299,7 @@ def serve_control(port):
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="", buffer=5):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
-        NOT here -- they ride in the env (see launch). --managed = control server owns kill+pidfile."""
+        NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
         extra = [u, ("--cast" if kind == "cast" else "--proxy"), "--low-latency", "--managed"]
         if d:
             extra += ["--tv", d]
@@ -1654,7 +1654,7 @@ def run_stop(args):
     target = int(args.kill_pid) if args.kill_pid.isdigit() else 0
     managed = bool(args.kill_pid)
     # DLNA: tell the TV to Stop (clean) BEFORE killing the proxy. Cast targets are NOT
-    # pre-quit here -- the proxy's own (guarded) atexit quits the receiver when we kill it;
+    # pre-quit here. The proxy's own (guarded) atexit quits the receiver when we kill it;
     # a second quit on an already-idle device would spuriously relaunch its splash. Only act
     # if our proxy is still the live one (a quick re-cast may have replaced it).
     if (not args.cast) and ((not managed) or (target and _pid_is_proxy(target))):
@@ -1729,7 +1729,7 @@ def _cast_monitor(cc, mc, fh, m3u8, cast_title, stop_evt, stop_why):
                         break
                 continue
             # --- resilient steady state: a small buffer that drains, or a brief control-socket
-            # blip, should recover -- tolerate it and re-LOAD up to MAX_RETRIES times before
+            # blip, should recover, so tolerate it and re-LOAD up to MAX_RETRIES times before
             # tearing down, instead of cutting out on the first stall. A genuine stop (the user
             # exiting on the TV) leaves a distinct trail -> we still bail fast for those, so a
             # retry never resurrects a stream the user deliberately closed.
@@ -1746,7 +1746,7 @@ def _cast_monitor(cc, mc, fh, m3u8, cast_title, stop_evt, stop_why):
                         log(f"cast: not reconnected after {MAX_RETRIES} retries; shutting down")
                         break
                     retries += 1; trouble = 0
-                    log(f"cast: reconnecting to the TV -- retry {retries}/{MAX_RETRIES}")
+                    log(f"cast: reconnecting to the TV (retry {retries}/{MAX_RETRIES})")
                     try:
                         cc.wait(timeout=8)
                     except Exception:
@@ -1772,7 +1772,7 @@ def _cast_monitor(cc, mc, fh, m3u8, cast_title, stop_evt, stop_why):
                     log(f"cast: still buffering after {MAX_RETRIES} retries; shutting down")
                     break
                 retries += 1; trouble = 0
-                log(f"cast: buffering -- reload retry {retries}/{MAX_RETRIES}")
+                log(f"cast: buffering (reload retry {retries}/{MAX_RETRIES})")
                 try:
                     mc.play_media(m3u8, "application/vnd.apple.mpegurl", title=cast_title, stream_type="LIVE")
                     try:
@@ -1831,7 +1831,7 @@ def run_cast(args):
     m3u8 = f"http://{ip}:{args.port}/live.m3u8"
     log(f"HLS (ffmpeg remux) at {m3u8} -> cast to {args.cast_name or args.tv}")
     if not _tcp_open(args.tv, args.cast_port):
-        log(f"cast: {args.tv}:{args.cast_port} not reachable -- is the TV on (not in standby)?")
+        log(f"cast: {args.tv}:{args.cast_port} not reachable. Is the TV on (not in standby)?")
         httpd.shutdown(); fh.stop(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
     try:
         cc = _cast_connect(args.tv, args.cast_port, args.cast_uuid, args.cast_model, args.cast_name)
@@ -1944,7 +1944,7 @@ def run_proxy(args):
                         log(f"DLNA: renderer unreachable after {DLNA_MAX_RETRIES} retries; shutting down")
                         break
                     retries += 1; gone = 0
-                    log(f"DLNA: renderer unreachable -- re-push retry {retries}/{DLNA_MAX_RETRIES}")
+                    log(f"DLNA: renderer unreachable (re-push retry {retries}/{DLNA_MAX_RETRIES})")
                     try:
                         set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}")
                     except Exception:

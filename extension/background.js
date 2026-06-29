@@ -116,7 +116,7 @@ function removeListeners() {
 
 // Register webRequest listeners SYNCHRONOUSLY at top-level eval (browser.webRequest exists iff the
 // optional "webRequest" permission is granted). A non-persistent MV3 event page is only woken for
-// events whose listeners were added during top-level evaluation -- adding them later from a Promise
+// events whose listeners were added during top-level evaluation. Adding them later from a Promise
 // means a navigation after a suspend wouldn't wake the sniffer and sources would be silently missed.
 rehydrate();
 if (browser.webRequest) installListeners();
@@ -127,7 +127,7 @@ browser.tabs.onRemoved.addListener((tabId) => { perTab.delete(tabId); persistTab
 browser.runtime.onMessage.addListener((msg, sender) => {
   if (!msg) return;
   // fail CLOSED: serve ONLY our own privileged extension pages (popup/options). Reject a missing
-  // sender, a foreign extension id, and any content-script / tab sender -- this protects the
+  // sender, a foreign extension id, and any content-script / tab sender. This protects the
   // captured Cookie/header data from being read by a web page or another extension.
   if (!sender || sender.id !== browser.runtime.id || sender.tab) return;
   if (msg.cmd === "getDetected") {
