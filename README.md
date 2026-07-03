@@ -22,7 +22,7 @@ Streaming LAN Cast is two pieces that talk over your machine's loopback address:
   browser extension ─HTTP─▶ local helper ───┤
   (picks device,           (127.0.0.1:9988) │
    sends the tab URL)                       └─ Google Cast ──▶  Chromecast / Android TV
-                                               (ffmpeg HLS remux via pychromecast)
+                                               (authenticating HLS proxy via pychromecast)
 ```
 
 - The **extension** (MV3 WebExtension) is the UI: it discovers both DLNA (SSDP) and Google Cast (mDNS,
@@ -33,9 +33,10 @@ Streaming LAN Cast is two pieces that talk over your machine's loopback address:
   stream and re-serves it as a non-seekable live MPEG-TS feed over your LAN, pushed to the device via
   UPnP AVTransport. For a **Google Cast** device it connects with
   [pychromecast](https://github.com/home-assistant-libs/pychromecast) and tells the Default Media
-  Receiver what to play; because cast receivers need a stable HLS source, the helper runs ffmpeg to
-  remux the live source into a local short-segment (~2s) HLS playlist served on your LAN with CORS,
-  so token-gated, expiring-segment live streams keep playing reliably.
+  Receiver what to play; the helper runs an authenticating HLS reverse-proxy that re-serves the source
+  playlist over your LAN with CORS, injecting the headers and token the CDN needs, so token-gated,
+  expiring-segment live streams keep playing reliably. Sites that aren't a direct playlist (Twitch and
+  other streamlink-supported sites) are resolved to their HLS first.
 
 The extension only ever connects to `http://127.0.0.1:9988` (your own computer), authenticated with a
 per-install token. See [`PRIVACY.md`](PRIVACY.md).
@@ -47,10 +48,10 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
   and ffmpeg for you; the Windows `.exe` bundles them all, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**
   device (Chromecast, Android TV, Google TV) on the same network
-- **ffmpeg** for the Google Cast path, where the helper uses it to remux the stream to HLS (DLNA streams
-  that carry separate audio and video tracks may use it too). The installer handles this for you: on
-  Linux/macOS via a static build (the `static-ffmpeg` package), and on Windows bundled into the `.exe`.
-  If you already have a system ffmpeg, the installer uses that instead.
+- **ffmpeg** so streamlink can mux streams that carry separate audio and video tracks (common on the
+  DLNA path). The installer handles this for you: on Linux/macOS via a static build (the
+  `static-ffmpeg` package), and on Windows bundled into the `.exe`. If you already have a system
+  ffmpeg, the installer uses that instead.
 
 ## Install
 
@@ -110,9 +111,8 @@ Then open the toolbar popup:
 ## Usage
 
 1. Open a tab with a live stream and click the **Streaming LAN Cast** toolbar button.
-2. Pick a device, optionally choose a quality and, for Google Cast devices, a buffer (latency) level,
-   then **Cast**. You can change the quality and the buffer while casting; a larger buffer starts
-   playback further behind the live edge, trading latency for stability.
+2. Pick a device, optionally choose a quality, then **Cast**. You can change the quality while
+   casting.
 3. Stop from the popup, or from the TV's own remote (the popup notices and resets).
 
 ### Casting from arbitrary sites (optional "source detection")
@@ -145,6 +145,7 @@ packaging, linting, and signing (`web-ext lint` → `web-ext build` → `web-ext
 ```
 extension/            the cross-browser WebExtension (popup, options, background sniffer, _locales, icons)
 helper/               the Python casting helper (streaming-lan-cast-helper.py)
+receiver/             optional branded Google Cast receiver (hosted over HTTPS, see receiver/README.md)
 requirements.txt      the helper's Python runtime dependencies (pip install -r)
 installer/            per-OS helper installers (unix/ for Linux+macOS, windows/)
 build/                the PyInstaller spec for the Windows helper bundle (work output gitignored)
