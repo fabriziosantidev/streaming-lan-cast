@@ -145,10 +145,10 @@ packaging, linting, and signing (`web-ext lint` → `web-ext build` → `web-ext
 ```
 extension/            the cross-browser WebExtension (popup, options, background sniffer, _locales, icons)
 helper/               the Python casting helper (streaming-lan-cast-helper.py)
-receiver/             optional branded Google Cast receiver (hosted over HTTPS, see receiver/README.md)
 requirements.txt      the helper's Python runtime dependencies (pip install -r)
 installer/            per-OS helper installers (unix/ for Linux+macOS, windows/)
 build/                the PyInstaller spec for the Windows helper bundle (work output gitignored)
+docs/                 GitHub Pages site: landing page and the branded Cast receiver (docs/receiver/)
 README.md             this file
 PRIVACY.md            privacy policy
 PACKAGING.md          packaging, signing, and store submission steps
