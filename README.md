@@ -44,14 +44,13 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
 ## Requirements
 
 - **Firefox 140+**, or **Chrome / Edge / Brave 102+**
-- **Python 3.10+** (the Linux/macOS installer builds an isolated venv with streamlink, pychromecast,
-  and ffmpeg for you; the Windows `.exe` bundles them all, so Windows needs nothing extra)
+- **Python 3.10+** (the Linux/macOS installer builds an isolated venv with streamlink and pychromecast
+  for you; the Windows `.exe` bundles those, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**
   device (Chromecast, Android TV, Google TV) on the same network
-- **ffmpeg** so streamlink can mux streams that carry separate audio and video tracks (common on the
-  DLNA path). The installer handles this for you: on Linux/macOS via a static build (the
-  `static-ffmpeg` package), and on Windows bundled into the `.exe`. If you already have a system
-  ffmpeg, the installer uses that instead.
+- **ffmpeg (optional)** only for streams that carry separate audio and video tracks, which streamlink
+  muxes with it. Install a system ffmpeg if you hit one (Linux `apt install ffmpeg`, macOS `brew
+  install ffmpeg`, Windows: add it to PATH). Most live streams are a single muxed track and need none.
 
 ## Install
 
@@ -77,7 +76,7 @@ Uninstall any time with `~/.local/share/streaming-lan-cast/uninstall.sh`, or the
 `curl -fsSL .../installer/unix/uninstall.sh | bash` one-liner.
 
 **Windows:** run the Inno Setup installer (`installer/windows/streaming-lan-cast.iss` over a PyInstaller
-bundle). Python, streamlink, pychromecast, and ffmpeg are bundled into the `.exe`, so you need nothing else; it autostarts
+bundle). Python, streamlink, and pychromecast are bundled into the `.exe`, so you need nothing else; it autostarts
 the helper and shows the token on the final page. See [`PACKAGING.md`](PACKAGING.md).
 
 **Manual / other platforms:**

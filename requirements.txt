@@ -3,4 +3,3 @@
 # The Linux/macOS installer and the Windows PyInstaller build install this same set.
 streamlink       # resolve and pull the live stream from the page
 pychromecast     # Google Cast (Chromecast / Android TV) targets; pulls in zeroconf for mDNS discovery
-static-ffmpeg    # provides an ffmpeg binary used to remux HLS for Cast

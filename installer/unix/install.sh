@@ -165,16 +165,12 @@ else
     bootstrap_pip "$VENV"
   fi
 fi
-say "  installing streamlink + pychromecast + ffmpeg (this downloads a few MB)"
+say "  installing streamlink + pychromecast (this downloads a few MB)"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-# streamlink resolves the stream; pychromecast drives Google Cast / Android TV targets;
-# static-ffmpeg provides a bundled ffmpeg used to remux HLS into a Cast-friendly low-latency feed
-# (a system ffmpeg, if present, is preferred). ffmpeg is only needed for casting to Cast devices.
+# streamlink resolves the stream; pychromecast drives Google Cast / Android TV targets.
 # Canonical runtime list lives in requirements.txt; keep this in sync (installed inline so the
 # curl | bash one-liner needs no checkout).
-"$VENV/bin/python" -m pip install --quiet --upgrade streamlink pychromecast static-ffmpeg
-# pre-fetch the static ffmpeg binary so the first cast isn't delayed by a download
-"$VENV/bin/python" -c "import static_ffmpeg.run as r; r.get_or_fetch_platform_executables_else_raise()" >/dev/null 2>&1 || true
+"$VENV/bin/python" -m pip install --quiet --upgrade streamlink pychromecast
 say "  ${DIM}$("$VENV/bin/python" -m streamlink --version 2>/dev/null || echo streamlink)${RST}"
 
 # --- helper ------------------------------------------------------------------

@@ -86,7 +86,6 @@ launch, ship a per-OS helper installer and have the "helper not detected" state 
   Per-user install, autostart via HKCU Run, token shown on the final page. Sign with Azure Trusted Signing.
   Build the bundle the wizard packages (run from `streaming-lan-cast/`):
   ```
-  python -c "import static_ffmpeg.run as r; r.get_or_fetch_platform_executables_else_raise()"   # pre-fetch the static ffmpeg binary
   pyinstaller build/streaming-lan-cast-helper.spec --workpath build/work --distpath dist
   ```
   `--workpath build/work` keeps the intermediates inside the gitignored `build/work/`.

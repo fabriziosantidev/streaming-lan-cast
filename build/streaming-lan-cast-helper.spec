@@ -14,10 +14,6 @@ tmp_ret = collect_all('pychromecast')   # Google Cast / Android TV support
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('zeroconf')        # mDNS discovery for cast devices
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('static_ffmpeg')   # bundled ffmpeg (HLS->Cast remux). Pre-fetch the binary
-# the helper only calls ffmpeg; drop the unused ffprobe (~95 MB) from the frozen build.
-_no_ffprobe = lambda lst: [t for t in lst if not str(t[0]).lower().endswith(('ffprobe.exe', 'ffprobe'))]
-datas += _no_ffprobe(tmp_ret[0]); binaries += _no_ffprobe(tmp_ret[1]); hiddenimports += tmp_ret[2]  # before building (see PACKAGING.md §6)
 
 
 a = Analysis(

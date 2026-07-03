@@ -1294,50 +1294,6 @@ def cast_quit(host, port, uuid, model, name):
         log(f"cast quit failed: {type(e).__name__}: {str(e)[:80]}")
 
 
-# Google Cast HLS: ffmpeg reads the source HLS DIRECTLY at the live edge (handling its tokens and
-# headers itself) and re-muxes it into small 1s segments in a temp dir (keyframe-bound, so a
-# large-GOP source yields GOP-sized chunks). We serve those LOCAL files to the Cast receiver.
-# Robust the way the DLNA path is: no re-fetching source segments that expire (no 404s), and
-# low-latency (small chunks regardless of the source's segment size). Twitch pages swap the
-# direct read for a streamlink --twitch-low-latency pipe (see run_cast).
-_HLS_MASTER = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nmedia.m3u8\n"
-
-
-def _find_ffmpeg():
-    """An ffmpeg binary path: a system ffmpeg if present, else the bundled static-ffmpeg."""
-    p = shutil.which("ffmpeg")
-    if p:
-        return p
-    try:
-        import static_ffmpeg.run as _r
-        # locate static-ffmpeg's ffmpeg directly: get_or_fetch also requires the unused ffprobe, which
-        # the frozen build no longer ships, and a missing ffprobe would trigger a runtime download.
-        binroot = os.path.join(os.path.dirname(_r.__file__), "bin")
-        name = "ffmpeg.exe" if IS_WIN else "ffmpeg"
-        for root, _dirs, files in os.walk(binroot):
-            if name in files:
-                return os.path.join(root, name)
-        return _r.get_or_fetch_platform_executables_else_raise()[0]   # not pre-fetched -> fetch it
-    except Exception:
-        return ""
-
-
-def _ffmpeg_input_opts(headers):
-    """ffmpeg -user_agent / -headers for the replay headers, so a Referer/Cookie-gated source loads."""
-    ua, hdr = "", []
-    for k, v in (headers or {}).items():
-        if k.lower() == "user-agent":
-            ua = v
-        else:
-            hdr.append(f"{k}: {v}")
-    opts = []
-    if ua:
-        opts += ["-user_agent", ua]
-    if hdr:
-        opts += ["-headers", "".join(h + "\r\n" for h in hdr)]
-    return opts
-
-
 def serve_control(port):
     self_script = os.path.abspath(__file__)
     TOKEN = load_or_create_token()

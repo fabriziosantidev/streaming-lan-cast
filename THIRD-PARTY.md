@@ -3,8 +3,8 @@
 Streaming LAN Cast itself is licensed under the PolyForm Noncommercial License 1.0.0 (see `LICENSE`):
 it is free for any noncommercial use, and commercial use (including selling it) is not permitted. The only third-party code committed to the repo is the extension's `browser-polyfill.js` (see Extension
 dependencies). The helper's dependencies are not committed: on Linux and macOS the user installs them into an isolated
-virtual environment (`pip install streamlink pychromecast static-ffmpeg`); the Windows PyInstaller `.exe`
-bundles streamlink, pychromecast, zeroconf, and static-ffmpeg. Each dependency keeps its own license.
+virtual environment (`pip install streamlink pychromecast`); the Windows PyInstaller `.exe`
+bundles streamlink, pychromecast, and zeroconf. Each dependency keeps its own license.
 
 ## Helper runtime dependencies
 
@@ -26,21 +26,6 @@ bundles streamlink, pychromecast, zeroconf, and static-ffmpeg. Each dependency k
   pulled in as a dependency of pychromecast.
 - License: LGPL-2.1-or-later.
 - Project: https://github.com/python-zeroconf/python-zeroconf
-
-### static-ffmpeg
-- Role: a Python wrapper that provides an ffmpeg binary. On Linux and macOS the installer uses it to
-  fetch a static ffmpeg when no system ffmpeg is available. The wrapper is MIT licensed, but the
-  ffmpeg binary it ships is a GPL/LGPL build (see FFmpeg below).
-- License: MIT License (the wrapper).
-- Project: https://github.com/cdgriffith/static_ffmpeg
-
-### FFmpeg
-- Role: the helper calls `ffmpeg` directly to remux the live source into a local short-segment HLS
-  playlist for Google Cast devices, and DLNA streams that carry separate audio and video tracks may
-  use it as well. On Linux and macOS the installer pulls a static ffmpeg through the static-ffmpeg
-  package, or uses a system ffmpeg if one is present; the Windows `.exe` bundles it.
-- License: LGPL-2.1+ or GPL depending on the build.
-- Project: https://ffmpeg.org
 
 ### Python standard library
 - Role: the helper is built entirely on the Python standard library otherwise (http.server, socket,
