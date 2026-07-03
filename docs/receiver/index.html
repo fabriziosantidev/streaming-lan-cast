@@ -24,7 +24,7 @@
   <cast-media-player></cast-media-player>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = 'native-6';
+    const RX_VERSION = 'native-7';
     const stats = { stalls: 0, reconnects: 0, lastError: null };
     window.__stats = stats;
 
@@ -95,6 +95,17 @@
       if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
+
+    // BACK/exit: some TV remotes deliver the back key to the receiver as a keydown. Surface whatever
+    // key fires in the telemetry (err=key:...), and end the session on a back key so a short press
+    // exits (the platform otherwise only force-exits on a long hold).
+    window.addEventListener('keydown', (e) => {
+      stats.lastError = 'key:' + (e.keyCode || 0) + '/' + (e.key || '');
+      const k = e.keyCode | 0, key = (e.key || '').toLowerCase();
+      if (k === 8 || k === 4 || k === 461 || k === 10009 || key === 'backspace' || key === 'goback' || key === 'browserback') {
+        try { context.stop(); } catch (x) {}
+      }
+    });
 
     const options = new cast.framework.CastReceiverOptions();
     options.useShakaForHls = true;   // play HLS with Shaka (not CAF's legacy player) so the tolerant
