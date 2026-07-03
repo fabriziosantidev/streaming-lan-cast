@@ -1,4 +1,4 @@
-# Custom Google Cast receiver (prototype)
+# Custom Google Cast receiver
 
 A branded Google Cast receiver for Streaming LAN Cast. When a cast device runs this receiver, the
 stream plays with the Streaming LAN Cast logo and player instead of the plain Default Media
@@ -9,8 +9,7 @@ Files: `index.html` (the receiver) and `icon-256.png` (splash/logo).
 
 ## What it needs (one-time)
 
-1. HTTPS hosting for this `receiver/` folder (Google requires HTTPS). Options that keep the
-   public repo untouched:
+1. HTTPS hosting for this `receiver/` folder (Google requires HTTPS). Some options:
    - a separate dev repo's GitHub Pages,
    - Netlify or Cloudflare Pages (free static hosting),
    - a quick tunnel for testing: `cloudflared tunnel --url http://localhost:8000` while serving this
@@ -49,4 +48,3 @@ Then cast a tab as usual. On a Cast device the stream now loads inside the brand
 - No effect on DLNA-only renderers.
 - Unregistered receivers only load on devices you registered as test devices; publish the receiver
   in the console to reach everyone.
-- This is a prototype on a local dev branch. Nothing here is pushed to the public repo.
