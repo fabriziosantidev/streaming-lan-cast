@@ -24,7 +24,7 @@
   <cast-media-player></cast-media-player>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = 'native-5';
+    const RX_VERSION = 'native-6';
     const stats = { stalls: 0, reconnects: 0, lastError: null };
     window.__stats = stats;
 
@@ -65,6 +65,11 @@
         m.contentType = 'application/x-mpegurl';
         m.streamType = cast.framework.messages.StreamType.LIVE;
         // Let Shaka autodetect the segment format (don't force hlsSegmentFormat).
+        // Stable sources (Twitch/Kick/YouTube) are tagged ll=1: ride closer to the live edge with a
+        // shallower buffer for lower latency. The flaky pirate HLS keeps the deeper, safer default.
+        const lowLat = (m.contentUrl || '').indexOf('ll=1') !== -1;
+        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = lowLat ? 3 : 10;
+        playbackConfig.shakaConfig.streaming.bufferingGoal = lowLat ? 12 : 30;
         stats.lastError = 'loading:' + (m.contentUrl || '').slice(0, 40);
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;

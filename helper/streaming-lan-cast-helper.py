@@ -1773,17 +1773,21 @@ def run_cast(args):
     # (Twitch gives its low-latency HLS); a direct .m3u8 is proxied directly. If a listed site can't be
     # resolved, fall back to proxying the given URL.
     _page = args.url or ""
+    _low_latency = False
     if any(site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
         resolved = _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
         if resolved:
             log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
             source_url = resolved
+            _low_latency = True   # these sources are stable enough to ride closer to the live edge
         else:
             log(f"cast: could not resolve {_page[:48]} via streamlink; proxying {source_url[:36]} as-is")
 
     httpd = ThreadingHTTPServer((ip, args.port), make_hls_proxy(source_url, hdr_map, tv=args.tv))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    hls_url = f"http://{ip}:{args.port}/live.m3u8"
+    # ?ll=1 asks the receiver to sit closer to the live edge (lower delay) for these stable sources;
+    # the flaky pirate HLS keeps the deeper default. The proxy matches on /live.m3u8, ignoring the query.
+    hls_url = f"http://{ip}:{args.port}/live.m3u8" + ("?ll=1" if _low_latency else "")
     log(f"HLS proxy at {hls_url} -> cast (native player) to {args.cast_name or args.tv}")
 
     if not _tcp_open(args.tv, args.cast_port):
@@ -1831,6 +1835,17 @@ def run_cast(args):
             pass
     atexit.register(_quit)
 
+    # Fetch the stream's OWN title (streamlink metadata) in the background while the receiver app
+    # launches below, so it reaches the LOAD with no added latency. Falls back to the sender's tab
+    # title when streamlink has no title for the source (e.g. a raw HLS URL).
+    _stitle = {"t": ""}
+    _title_src = args.url or source_url
+    _title_thr = None
+    if _title_src:
+        _title_thr = threading.Thread(
+            target=lambda: _stitle.__setitem__("t", fetch_stream_title(_title_src) or ""), daemon=True)
+        _title_thr.start()
+
     # launch the branded receiver and wait for it to come to the foreground
     if getattr(cc, "app_id", None) != _CAST_RECEIVER_APP:
         try:
@@ -1846,8 +1861,11 @@ def run_cast(args):
         log("cast: receiver app did not launch")
         httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
 
-    # title for the receiver's native UI (from the sender's tab title; never the raw CDN host)
-    _title = (getattr(args, "title", "") or "").strip() or "En vivo"
+    # title for the receiver's native UI: the stream's own title (fetched above) if streamlink found
+    # one, else the sender's tab title, else a generic label (never the raw CDN host)
+    if _title_thr:
+        _title_thr.join(timeout=4)   # usually already finished (it overlapped the app launch above)
+    _title = _stitle["t"] or (getattr(args, "title", "") or "").strip() or "En vivo"
     # Standard CAF media LOAD -> the receiver's native player (Shaka) plays the proxied HLS, so the
     # native UI + TV-remote/phone controls + BACK/exit all work. The receiver's shakaConfig keeps
     # playback tolerant of segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer).
