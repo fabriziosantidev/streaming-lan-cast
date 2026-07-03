@@ -11,7 +11,6 @@ let activeUrl = "";
 let themeMode = "auto";
 let suppressUntil = 0;   // ignore casting:false during a quality re-cast (brief proxy gap)
 let activeQuality = "best";   // quality currently being cast (to skip no-op changes)
-let bufferVal = 5;            // cast buffer/latency setting (seconds behind live)
 let castQualityUrl = "";      // url the casting-view dropdown was populated for
 let authToken = "";           // per-install secret shared with the helper (set in options)
 const deviceMap = new Map();
@@ -95,7 +94,6 @@ function view(name) {
 function setLive(on) { $("title").classList.toggle("live", on); }
 function setSpin(on) { $("spin").classList.toggle("on", on); }
 function setQSpin(on) { $("castQSpin").classList.toggle("on", on); }
-function setBSpin(on) { $("castBSpin").classList.toggle("on", on); }
 function castEnabled() { $("castBtn").disabled = !selectedId; }
 async function activeTab() {
   const [tb] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -107,7 +105,7 @@ async function init() {
   catch (e) { stopAll(); setLive(false); return view(e && e.unauthorized ? "needToken" : "noHelper"); }
   let status = {};
   try { status = await call("/status"); } catch {}
-  if (status.casting) showCasting(status.name || status.device || "", whatOf(status), status.url, status.quality, status.buffer);
+  if (status.casting) showCasting(status.name || status.device || "", whatOf(status), status.url, status.quality);
   else await showPicker();
   startStatusPoll();
 }
@@ -118,7 +116,7 @@ function startStatusPoll() {
   statusTimer = setInterval(async () => {
     let s; try { s = await call("/status"); } catch { return; }
     const inCasting = !$("castingView").hidden;
-    if (s.casting && !inCasting) showCasting(s.name || s.device || "", whatOf(s), s.url, s.quality, s.buffer);
+    if (s.casting && !inCasting) showCasting(s.name || s.device || "", whatOf(s), s.url, s.quality);
     else if (!s.casting && inCasting) { if (Date.now() < suppressUntil) return; showPicker(); }
     else if (s.casting && inCasting) {
       $("castingName").textContent = s.name || s.device || "";
@@ -130,13 +128,12 @@ function startStatusPoll() {
 }
 function stopStatusPoll() { if (statusTimer) { clearInterval(statusTimer); statusTimer = null; } }
 
-function showCasting(name, what, url, quality, buffer) {
+function showCasting(name, what, url, quality) {
   stopScan();
   setLive(true);
   $("castingName").textContent = name;
   $("castingTitle").textContent = what || "";
   populateCastQuality(url || "", quality || "best");
-  if (buffer) { bufferVal = Number(buffer); $("castBuffer").value = String(bufferVal); }
   view("casting");
 }
 
@@ -190,20 +187,6 @@ async function changeCastQuality() {
   try { await call("/quality?value=" + encodeURIComponent(val)); }
   catch { notify(t("errNoHelper"), "err"); }
   setTimeout(() => { sel.disabled = false; setQSpin(false); }, RECAST_REENABLE_MS);  // proxy is up by then
-}
-
-// change buffer/latency while casting -> helper re-casts with the new offset (cast targets only)
-async function changeCastBuffer() {
-  const sel = $("castBuffer");
-  const val = Number(sel.value) || 5;
-  if (val === bufferVal) return;                  // no change -> don't cut the TV
-  bufferVal = val;
-  browser.storage.local.set({ buffer: val });
-  sel.disabled = true; setBSpin(true);
-  suppressUntil = Date.now() + RECAST_SUPPRESS_MS;             // cover the helper's ~10s relaunch grace
-  try { await call("/buffer?value=" + encodeURIComponent(val)); }
-  catch { notify(t("errNoHelper"), "err"); }
-  setTimeout(() => { sel.disabled = false; setBSpin(false); }, RECAST_REENABLE_MS);
 }
 
 async function showPicker() {
@@ -355,10 +338,9 @@ async function castCurrentTab() {
       `url=${encodeURIComponent(url)}&device=${encodeURIComponent(dev.host)}` +
       `&name=${encodeURIComponent(dev.name)}&title=${encodeURIComponent(what)}` +
       `&quality=${encodeURIComponent(quality)}&kind=${encodeURIComponent(dev.kind || "dlna")}` +
-      `&buffer=${encodeURIComponent($("buffer").value || bufferVal)}` +
       (media ? `&media=${encodeURIComponent(media)}&headers=${encodeURIComponent(headers)}` : ``);
     const r = await call("/cast", { method: "POST", body });
-    if (r.ok) showCasting(r.name || dev.name, whatOf(r) || what, r.url || url, r.quality || quality, bufferVal);
+    if (r.ok) showCasting(r.name || dev.name, whatOf(r) || what, r.url || url, r.quality || quality);
     else { castEnabled(); notify(castFailMsg(r), "err"); }
   } catch (e) {
     castEnabled(); notify(e && e.unauthorized ? t("needTokenHint") : t("errNoHelper"), "err");
@@ -369,11 +351,6 @@ async function stopCast() { try { await call("/stop"); } catch {} await showPick
 
 $("castBtn").addEventListener("click", castCurrentTab);
 $("castQuality").addEventListener("change", changeCastQuality);
-$("castBuffer").addEventListener("change", changeCastBuffer);
-$("buffer").addEventListener("change", () => {     // picker: persist for the next cast
-  bufferVal = Number($("buffer").value) || 5;
-  browser.storage.local.set({ buffer: bufferVal });
-});
 $("enableDetect").addEventListener("click", enableDetection);
 $("stopBtn").addEventListener("click", stopCast);
 $("retryHelper").addEventListener("click", init);
@@ -385,10 +362,7 @@ $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTi
 localize();
 initTheme();
 (async () => {
-  const st = await browser.storage.local.get(["token", "buffer"]);
+  const st = await browser.storage.local.get(["token"]);
   authToken = st.token || "";
-  bufferVal = Number(st.buffer) || 5;
-  $("buffer").value = String(bufferVal);
-  $("castBuffer").value = String(bufferVal);
   init();
 })();

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streaming LAN Cast Receiver</title>
+<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #14161a; overflow: hidden; }
+  /* Native player (Shaka) so the TV remote, phone and Google Home controls and BACK/exit all work
+     (CAFv3 drives these through its own player). shakaConfig keeps playback tolerant of the source's
+     segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer). */
+  cast-media-player {
+    --splash-image: url('icon-256.png');
+    --splash-size: 132px;
+    --background-color: #14161a;
+    --progress-color: #e30f0f;
+    --title-color: #ffffff;
+    --theme-hue: 220;
+  }
+</style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <script>
+    const NS = 'urn:x-cast:slc';
+    const RX_VERSION = 'native-5';
+    const stats = { stalls: 0, reconnects: 0, lastError: null };
+    window.__stats = stats;
+
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+
+    // Tolerant Shaka config: survive the source's segment 404s, stalls and discontinuities.
+    // Merged over CAF's Shaka defaults.
+    const playbackConfig = new cast.framework.PlaybackConfig();
+    playbackConfig.segmentRequestRetryLimit = 10;     // don't give up on a 404'd segment after 3
+    playbackConfig.autoResumeDuration = 2;            // resume quickly after an auto-pause
+    playbackConfig.autoResumeNumberOfSegments = 1;
+    playbackConfig.shakaConfig = {
+      streaming: {
+        retryParameters: { maxAttempts: 8, baseDelay: 400, backoffFactor: 1.5, fuzzFactor: 0.5,
+                           timeout: 9000, stallTimeout: 5000, connectionTimeout: 6000 },
+        bufferingGoal: 30,          // buffer deep so bursty delivery + stalls don't starve playback
+        rebufferingGoal: 2,
+        bufferBehind: 30,
+        stallEnabled: true,         // detect a frozen playhead...
+        stallThreshold: 1,
+        stallSkip: 0.1,             // ...and nudge across it (crosses small PTS holes)
+        gapDetectionThreshold: 0.5, // jump gaps left by dropped segments
+        ignoreTextStreamFailures: true,
+      },
+      manifest: {
+        retryParameters: { maxAttempts: 8, baseDelay: 400, backoffFactor: 1.5, timeout: 9000 },
+        defaultPresentationDelay: 10,   // sit ~10s behind live (stable, not the raw edge)
+      },
+    };
+
+    // LOAD: tell Shaka it's a live MPEG-TS HLS. (Headers/token are injected by the helper's proxy,
+    // so Shaka just fetches our CORS-enabled proxy - no per-request auth needed here.)
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (req) => {
+      try {
+        const m = req.media || {};
+        m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; Shaka loads contentUrl
+        m.contentType = 'application/x-mpegurl';
+        m.streamType = cast.framework.messages.StreamType.LIVE;
+        // Let Shaka autodetect the segment format (don't force hlsSegmentFormat).
+        stats.lastError = 'loading:' + (m.contentUrl || '').slice(0, 40);
+      } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
+      return req;
+    });
+
+    // telemetry so the helper log shows whether Shaka plays or chokes (and why)
+    const EV = cast.framework.events.EventType;
+    playerManager.addEventListener(EV.ERROR, (e) => {
+      // capture the internal Shaka error (category.code + data) so the log shows exactly what was
+      // rejected (network / manifest / media / codec).
+      let d = 'shaka/' + (e && e.detailedErrorCode);
+      try {
+        const er = e && (e.error || (e.errorInfo && e.errorInfo.error));
+        if (er) d += ' [' + (er.category != null ? er.category : '?') + '.' + (er.code != null ? er.code : '?') + ' ' + JSON.stringify(er.data || []).slice(0, 80) + ']';
+      } catch (x) {}
+      stats.lastError = d;
+    });
+    playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
+    setInterval(() => {
+      const v = document.getElementsByTagName('video')[0];
+      let st = 'idle', t = 0, buf = 0;
+      try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
+      if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
+    }, 2000);
+
+    const options = new cast.framework.CastReceiverOptions();
+    options.useShakaForHls = true;   // play HLS with Shaka (not CAF's legacy player) so the tolerant
+                                     // shakaConfig above applies and the native controls work.
+    options.playbackConfig = playbackConfig;
+    options.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
+    options.maxInactivity = 3600;
+    context.start(options);
+  </script>
+</body>
+</html>

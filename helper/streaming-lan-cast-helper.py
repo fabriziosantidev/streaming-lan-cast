@@ -16,9 +16,9 @@ the TV sees a true LIVE, non-seekable stream:
   - each TV (re)connect launches a FRESH streamlink at the live edge -> pause &
     reconnect resyncs to live automatically
 
-Google Cast (--cast, Chromecast / Android TV): ffmpeg remuxes the source into
-local 2s HLS segments that we serve to the Cast receiver, driven over the Cast
-protocol via pychromecast. Same live behaviour, plus a buffer/latency knob.
+Google Cast (--cast, Chromecast / Android TV): an authenticating HLS reverse-proxy
+serves the source to a branded Cast receiver, whose native player handles playback,
+driven over the Cast protocol via pychromecast.
 
 The control server (--serve) is what the browser extension talks to: it discovers
 both kinds of renderer and launches the matching path per cast.
@@ -73,6 +73,7 @@ DMR_PORT = 9197
 AVT = "urn:schemas-upnp-org:service:AVTransport:1"
 PIDFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy.pid")
 STATEFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-state.json")  # survives --serve restarts
+PROXY_LOG = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-cast.log")  # last cast proxy's output (debug)
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
 LOGFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast.log")   # caster diagnostics (pythonw has no console)
@@ -182,7 +183,7 @@ def _write_pidfile(pid):
     """Record the casting proxy's pid. The CONTROL SERVER writes this synchronously the instant
     it spawns the proxy (under its state lock), so proxy_alive() is true immediately, closing
     the window where state says 'casting' but the pidfile is still empty (a /status poll there
-    used to read 'stopped' and tear the fresh cast down)."""
+    would read 'stopped' and tear the fresh cast down)."""
     try:
         with open(PIDFILE, "w", encoding="utf-8") as f:
             f.write(str(pid))
@@ -284,12 +285,12 @@ def proxy_alive():
 # --- Cast-state persistence --------------------------------------------------
 # Single source of truth for the cast-state shape: the fields a /status or /cast snapshot
 # returns, and the empty/default record. Defined once so adding a field is a one-line edit.
-_CAST_SNAP_FIELDS = ("url", "device", "name", "title", "quality", "buffer")
+_CAST_SNAP_FIELDS = ("url", "device", "name", "title", "quality")
 
 
 def _empty_cast_state():
     return {"url": "", "device": "", "name": "", "title": "", "quality": "best",
-            "media": "", "headers": [], "epoch": 0, "kind": "dlna", "cast": {}, "buffer": 5}
+            "media": "", "headers": [], "epoch": 0, "kind": "dlna", "cast": {}}
 
 
 def save_cast_state(d, grace_until=0.0):
@@ -302,7 +303,6 @@ def save_cast_state(d, grace_until=0.0):
         rec["headers"] = d.get("headers", []) or []
         rec["kind"] = d.get("kind", "dlna")      # dlna (SOAP) vs cast (Chromecast) target
         rec["cast"] = d.get("cast") or {}        # cast device details (port/uuid/name/model)
-        rec["buffer"] = int(d.get("buffer", 5) or 5)   # latency/stability knob (seconds behind live)
         rec["grace_until"] = grace_until   # survive a restart that lands mid quality-recast
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(rec, f)
@@ -673,15 +673,6 @@ def _safe_quality(value):
     return value if (value and _QUALITY_RE.match(value)) else "best"
 
 
-def _safe_buffer(value, default=5):
-    """Buffer/latency target in seconds (how far behind live the cast starts). Clamped to a sane
-    range. Lower = less delay but more rebuffer risk; higher = more delay but steadier."""
-    try:
-        return max(2, min(20, int(float(value))))
-    except (TypeError, ValueError):
-        return default
-
-
 def _safe_unlink(path):
     if not path:
         return
@@ -857,7 +848,12 @@ def transport_state(control_url):
 
 # --- Live MPEG-TS HTTP server (DLNA push) ------------------------------------
 # Live HTTP server: serves the stream as non-seekable live, fresh per connect.
-def make_handler(target, quality, sl_flags, extra_sl=(), tv=""):
+def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_ref=None):
+    # hold_ref, if given, is a 1-element list whose value the adaptive monitor mutates at runtime;
+    # the writer reads it each iteration so the hold-delay depth can grow/shrink live. Falls back
+    # to the fixed `hold` when absent (e.g. the DLNA path).
+    def _hold():
+        return hold_ref[0] if hold_ref is not None else hold
     class LiveHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # no Content-Length needed; close = EOF
 
@@ -870,6 +866,9 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv=""):
             self.send_header("transferMode.dlna.org", "Streaming")
             self.send_header("contentFeatures.dlna.org", DLNA_LIVE_CF)
             self.send_header("Accept-Ranges", "none")
+            # the TS-mode Cast receiver pulls this with fetch() from its https origin, which
+            # enforces CORS (DLNA players don't care; the header is inert for them)
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Connection", "close")
             self.end_headers()
 
@@ -889,51 +888,249 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv=""):
                 log(f"proxy: refused {self.client_address[0]} (not the cast target {tv})")
                 self.send_error(403)
                 return
-            log(f"TV connected ({self.client_address[0]}) -> streamlink target: {_redact_url(target)}")
+            log(f"TV connected ({self.client_address[0]}) -> streamlink target: {_redact_url(target)} "
+                f"(continuous live, hold={_hold():.0f}s)")
             self._send_live_headers()
             cmd = _streamlink_cmd(*sl_flags, *extra_sl, "--stdout", "--", target, quality)
-            errf = tempfile.TemporaryFile()
-            sl = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, creationflags=NO_WINDOW)
-            total = 0
+            # DLNA-faithful robustness, in two parts:
+            #  (1) ONE HTTP response kept open indefinitely; a READER thread RESPAWNS streamlink
+            #      across its restarts instead of ending the response when the source hiccups.
+            #      (Ending it made the player rebuild from scratch on every blip:
+            #      currentTime reset to 0 and stuck on "loading".)
+            #  (2) a server-side HOLD buffer (the set-top box's reservoir): the WRITER releases
+            #      only bytes that arrived >= `hold` seconds ago, so during a source outage it
+            #      keeps feeding the client from the reserve and the receiver never underruns.
+            #      hold=0 -> release immediately.
+            import collections
+            Q = collections.deque()          # (arrival_monotonic, chunk)
+            qlock = threading.Lock()
+            done = threading.Event()          # set when the source is dead OR the client left
+            MAXQ = 64 * 1024 * 1024
+            state = {"grand": 0, "gen": 0, "reader_bytes": 0}
+
+            def reader():
+                duds = 0
+                while not done.is_set():
+                    state["gen"] += 1
+                    errf = tempfile.TemporaryFile()
+                    try:
+                        sl = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
+                                              creationflags=NO_WINDOW)
+                    except Exception as e:
+                        log(f"proxy: streamlink spawn failed: {type(e).__name__}: {str(e)[:80]}")
+                        break
+                    seg = 0
+                    try:
+                        while not done.is_set():
+                            chunk = sl.stdout.read(188 * 350)
+                            if not chunk:
+                                break                     # streamlink ended -> respawn at live edge
+                            with qlock:
+                                Q.append((time.monotonic(), chunk))
+                                state["reader_bytes"] += len(chunk)
+                                over = state["reader_bytes"]  # trim if the queue balloons
+                                while Q and over > MAXQ:
+                                    over -= len(Q.popleft()[1])
+                                state["reader_bytes"] = over
+                            seg += len(chunk)
+                    finally:
+                        try:
+                            sl.terminate()
+                            try:
+                                sl.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                sl.kill(); sl.wait()
+                        except Exception:
+                            pass
+                        try:
+                            if sl.stdout:
+                                sl.stdout.close()
+                        except Exception:
+                            pass
+                        if seg < 100000:
+                            try:
+                                errf.seek(0)
+                                err = errf.read().decode("utf-8", "replace").strip()[-400:]
+                                log(f"proxy: streamlink run {state['gen']} produced {seg}B (source hiccup) {err[-160:]}")
+                            except Exception:
+                                pass
+                        try:
+                            errf.close()
+                        except Exception:
+                            pass
+                    if done.is_set():
+                        break
+                    duds = duds + 1 if seg < 100000 else 0
+                    if duds >= 40:            # source dead for a long stretch -> stop
+                        log("proxy: source not delivering; ending stream")
+                        break
+                    time.sleep(0.25 if duds else 0.05)    # brief pause, then respawn at live edge
+                done.set()
+
+            rt = threading.Thread(target=reader, daemon=True)
+            rt.start()
+            # HOLD-DELAY (DVR-style time-shift): release only bytes that arrived >= `hold` seconds
+            # ago. In steady state this just delivers the stream `hold` seconds late (so the
+            # receiver sits ~hold behind the true live edge, reading already-settled content like a
+            # PC player does). The payoff is during a SOURCE STALL: no new bytes arrive, but the
+            # "arrived >= hold ago" cutoff keeps advancing through the reserve already in Q, so the
+            # server KEEPS FEEDING the receiver and it never underruns for stalls shorter than hold.
+            # No receiver-side seeking needed (that fought mpegts and caused reload storms).
             try:
                 while True:
-                    chunk = sl.stdout.read(188 * 350)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    total += len(chunk)
+                    cutoff = time.monotonic() - _hold()
+                    out = []
+                    with qlock:
+                        while Q and (Q[0][0] <= cutoff or done.is_set()):
+                            out.append(Q.popleft()[1])
+                            if len(out) >= 64:
+                                break
+                    if out:
+                        for c in out:
+                            self.wfile.write(c)
+                            state["grand"] += len(c)
+                    elif done.is_set():
+                        break                 # source dead and reserve drained
+                    else:
+                        time.sleep(0.03)      # nothing aged past the hold window yet
             except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+                pass                          # the receiver/TV closed the connection
             finally:
-                try:
-                    sl.terminate()
-                    try:
-                        sl.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        sl.kill()       # streamlink ignored terminate -> force it
-                        sl.wait()
-                except Exception:
-                    pass
-                try:
-                    if sl.stdout:
-                        sl.stdout.close()   # release the pipe; also unblocks streamlink if mid-write
-                except Exception:
-                    pass
-                if total < 100000:   # streamlink barely produced anything -> likely failed; log why
-                    try:
-                        errf.seek(0)
-                        err = errf.read().decode("utf-8", "replace").strip()[-1500:]
-                        log(f"streamlink sent only {total}B (likely FAILED) for {_redact_url(target)}\nstderr: {err}")
-                    except Exception:
-                        pass
-                else:
-                    log(f"TV disconnected; streamlink stopped (sent {total} bytes)")
-                try:
-                    errf.close()
-                except Exception:
-                    pass
+                done.set()                    # stop the reader
+            log(f"proxy: stream ended (sent {state['grand']} bytes over {state['gen']} streamlink runs)")
 
     return LiveHandler
+
+
+def make_hls_proxy(source_url, hdr_map, tv=""):
+    """Authenticating HLS reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
+    requires, rewrites every playlist URL to route back through here (so segments and nested media
+    playlists inherit those headers + CORS), and adds Access-Control-Allow-Origin so the https
+    receiver can fetch this http LAN endpoint."""
+    HDRS = dict(hdr_map or {})
+    HDRS.setdefault("User-Agent", "Mozilla/5.0")
+
+    # Keep-alive session: reuse CDN connections so each segment doesn't pay a fresh TLS handshake
+    # (per-segment handshakes add latency that can stall playback). Falls back to urllib if the
+    # requests library is unavailable.
+    class _UpstreamError(Exception):
+        def __init__(self, code): self.code = code
+    try:
+        import requests
+        _sess = requests.Session()
+
+        class _Resp:
+            def __init__(self, r): self.headers = r.headers; self._r = r; self._it = None
+            def read(self, n=-1):
+                if n is None or n < 0:
+                    return self._r.content
+                if self._it is None:
+                    self._it = self._r.iter_content(chunk_size=65536)
+                try:
+                    return next(self._it)
+                except StopIteration:
+                    return b""
+
+        def _fetch(url, timeout=10):
+            r = _sess.get(url, headers=HDRS, stream=True, timeout=timeout)
+            if r.status_code >= 400:
+                code = r.status_code; r.close(); raise _UpstreamError(code)
+            return _Resp(r)
+    except ImportError:
+        def _fetch(url, timeout=10):
+            try:
+                return urllib.request.urlopen(urllib.request.Request(url, headers=HDRS), timeout=timeout)
+            except urllib.error.HTTPError as e:
+                raise _UpstreamError(e.code)
+
+    def _rewrite(text, base):
+        # point every URL (segment, variant, key, map) at /p?u=<absolute> so it stays proxied
+        out = []
+        for ln in text.splitlines():
+            s = ln.rstrip("\r")
+            if not s.strip():
+                out.append(s); continue
+            if s.startswith("#"):
+                m = re.search(r'URI="([^"]+)"', s)
+                if m:
+                    au = urllib.parse.urljoin(base, m.group(1))
+                    s = s[:m.start(1)] + "/p?u=" + urllib.parse.quote(au, safe="") + s[m.end(1):]
+                out.append(s); continue
+            au = urllib.parse.urljoin(base, s.strip())
+            out.append("/p?u=" + urllib.parse.quote(au, safe=""))
+        return "\n".join(out) + "\n"
+
+    dbg = {"m3u8": False, "seg": False, "refused": False}   # log the first of each event only once
+
+    class HlsProxy(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        def _foreign(self):
+            return self.client_address[0] not in (tv, "127.0.0.1")
+        def _cors(self, extra=()):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Cache-Control", "no-store")
+            for k, v in extra:
+                self.send_header(k, v)
+        def do_OPTIONS(self):
+            self.send_response(204); self._cors(); self.send_header("Content-Length", "0"); self.end_headers()
+        def _serve_m3u8(self, text, base):
+            body = _rewrite(text, base).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self._cors([("Content-Length", str(len(body))), ("Connection", "close")]); self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            if self._foreign():
+                if not dbg["refused"]:
+                    dbg["refused"] = True
+                    log(f"proxy: REFUSED {self.client_address[0]} (cast target is {tv}) - client can't reach the stream")
+                self.send_error(403); return
+            p = self.path.split("?", 1)[0]
+            try:
+                if p == "/live.m3u8":
+                    r = _fetch(source_url)
+                    text = r.read().decode("utf-8", "replace")
+                    if not dbg["m3u8"]:
+                        dbg["m3u8"] = True
+                        log(f"proxy: receiver fetched /live.m3u8 (client {self.client_address[0]})")
+                    self._serve_m3u8(text, source_url)
+                    return
+                if p == "/p":
+                    if not dbg["seg"]:
+                        dbg["seg"] = True
+                        log("proxy: receiver fetched first segment/sub-playlist")
+                    q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                    u = (q.get("u") or [""])[0]
+                    if not u:
+                        self.send_error(400); return
+                    r = _fetch(u)
+                    ctype = r.headers.get("Content-Type", "")
+                    if u.split("?")[0].endswith(".m3u8") or "mpegurl" in ctype:
+                        self._serve_m3u8(r.read().decode("utf-8", "replace"), u)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype or "video/mp2t")
+                    self._cors([("Connection", "close")]); self.end_headers()
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                    return
+                self.send_error(404)
+            except _UpstreamError as e:
+                try: self.send_error(e.code)     # propagate the CDN's 404/etc so the player retries correctly
+                except Exception: pass
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            except Exception as e:
+                try:
+                    log(f"proxy: HLS fetch failed ({p}): {type(e).__name__}: {str(e)[:80]}")
+                    self.send_error(502)
+                except Exception:
+                    pass
+    return HlsProxy
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -1029,6 +1226,7 @@ def discover_all_devices():
                 devs += f.result()
             except Exception:
                 pass
+    prefer_cast = os.environ.get("SLC_PREFER_CAST") == "1"   # flip the default DLNA preference
     by_host, extras = {}, []
     for d in devs:
         h = d.get("host")
@@ -1036,8 +1234,14 @@ def discover_all_devices():
             extras.append(d)
             continue
         cur = by_host.get(h)
-        if cur is None or (cur.get("kind") == "cast" and d.get("kind") == "dlna"):
-            by_host[h] = d          # prefer DLNA when the same host appears under both protocols
+        # Normally prefer DLNA when a host exposes both protocols; SLC_PREFER_CAST prefers Cast, so a
+        # custom branded receiver (SLC_CAST_APP_ID) is used instead of the plain DLNA player.
+        if prefer_cast:
+            take = cur is None or (cur.get("kind") == "dlna" and d.get("kind") == "cast")
+        else:
+            take = cur is None or (cur.get("kind") == "cast" and d.get("kind") == "dlna")
+        if take:
+            by_host[h] = d
     devs = list(by_host.values()) + extras
     devs.sort(key=lambda d: d["name"].lower())
     return devs
@@ -1070,10 +1274,11 @@ def _cast_connect(host, port, uuid, model, name, timeout=15):
     return cc
 
 
-# The Default Media Receiver app id. Quitting it returns the device to its home screen, BUT
-# calling quit on a device that's already idle spuriously RELAUNCHES it (showing the receiver
-# splash), so every quit below is guarded by checking this is still the running app.
-_CAST_RECEIVER_APP = "CC1AD845"
+# The Cast receiver app id: the Default Media Receiver, or a custom branded receiver when
+# SLC_CAST_APP_ID is set. Quitting it returns the device to its home screen, BUT calling quit on a
+# device that's already idle spuriously RELAUNCHES it (showing the receiver splash), so every quit
+# below is guarded by checking this is still the running app.
+_CAST_RECEIVER_APP = os.environ.get("SLC_CAST_APP_ID", "CC1AD845")
 
 
 def cast_quit(host, port, uuid, model, name):
@@ -1090,9 +1295,11 @@ def cast_quit(host, port, uuid, model, name):
 
 
 # Google Cast HLS: ffmpeg reads the source HLS DIRECTLY at the live edge (handling its tokens and
-# headers itself) and re-muxes it into small 2s segments in a temp dir. We serve those LOCAL files
-# to the Cast receiver. Robust the way the DLNA path is: no re-fetching source segments that
-# expire (no 404s), and low-latency (2s chunks regardless of the source's segment size).
+# headers itself) and re-muxes it into small 1s segments in a temp dir (keyframe-bound, so a
+# large-GOP source yields GOP-sized chunks). We serve those LOCAL files to the Cast receiver.
+# Robust the way the DLNA path is: no re-fetching source segments that expire (no 404s), and
+# low-latency (small chunks regardless of the source's segment size). Twitch pages swap the
+# direct read for a streamlink --twitch-low-latency pipe (see run_cast).
 _HLS_MASTER = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nmedia.m3u8\n"
 
 
@@ -1131,137 +1338,6 @@ def _ffmpeg_input_opts(headers):
     return opts
 
 
-class FfmpegHls:
-    """Remux a source HLS URL into a local 2s-segment HLS in a temp dir via ffmpeg. last_hit tracks
-    renderer liveness (the renderer pulling our files == the cast is alive)."""
-    def __init__(self, src, headers, ffmpeg, buffer=5):
-        self.workdir = tempfile.mkdtemp(prefix="slc-cast-")
-        self.last_hit = time.time()
-        self.buffer = max(2, int(buffer))         # seconds behind live the receiver should start
-        # keep enough 2s segments in the playlist to cover the start offset + a little history
-        list_size = max(6, self.buffer // 2 + 4)
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error",
-               # start muxing fast: cap the input probe so ffmpeg doesn't spend seconds analysing.
-               "-fflags", "+genpts", "-analyzeduration", "2000000", "-probesize", "3000000",
-               *_ffmpeg_input_opts(headers), "-i", src,
-               "-c", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", str(list_size),
-               "-hls_flags", "delete_segments+omit_endlist+independent_segments",
-               "-hls_segment_type", "mpegts",
-               "-hls_segment_filename", os.path.join(self.workdir, "s%05d.ts"),
-               os.path.join(self.workdir, "media.m3u8")]
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
-                                     preexec_fn=_PDEATHSIG)   # die with the helper, never orphan
-
-    def ready(self):
-        # one segment is enough to LOAD: the receiver buffers as ffmpeg keeps adding. Waiting for
-        # more just delays playback (badly for large-GOP sources where each segment takes seconds).
-        try:
-            with open(os.path.join(self.workdir, "media.m3u8")) as f:
-                return f.read().count("#EXTINF") >= 1
-        except OSError:
-            return False
-
-    def alive(self):
-        return self.proc.poll() is None
-
-    def touch(self):
-        self.last_hit = time.time()
-
-    def idle_secs(self):
-        return time.time() - self.last_hit
-
-    def file_path(self, name):
-        """Path inside the workdir for media.m3u8 or s*.ts only (no traversal)."""
-        if "/" in name or ".." in name:
-            return None
-        if name == "media.m3u8" or (name.startswith("s") and name.endswith(".ts")):
-            return os.path.join(self.workdir, name)
-        return None
-
-    def stop(self):
-        try:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=2)
-            except Exception:
-                self.proc.kill()
-        except Exception:
-            pass
-        shutil.rmtree(self.workdir, ignore_errors=True)
-
-
-def make_ffmpeg_hls_handler(fh, tv=""):
-    class HlsHandler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *a):
-            pass
-
-        def _foreign(self):
-            return bool(tv) and self.client_address[0] not in (tv, "127.0.0.1")
-
-        def _serve(self, body, ctype):
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Access-Control-Allow-Origin", "*")   # Cast/Shaka enforces CORS on HLS
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except OSError:
-                pass
-
-        def do_GET(self):
-            if self._foreign():
-                self.send_error(403)
-                return
-            fh.touch()   # the renderer is actively pulling -> the cast is alive
-            name = urllib.parse.urlparse(self.path).path.lstrip("/")
-            if name == "live.m3u8":
-                self._serve(_HLS_MASTER, "application/vnd.apple.mpegurl")   # master -> media.m3u8
-                return
-            fp = fh.file_path(name)
-            if not fp:
-                self.send_error(404)
-                return
-            try:
-                with open(fp, "rb") as f:
-                    body = f.read()
-            except OSError:
-                self.send_error(404)
-                return
-            if name == "media.m3u8":
-                # tell the receiver to start `buffer` seconds behind live (its default is ~3x the
-                # target duration); this is the user's latency/stability knob.
-                body = _inject_live_start(body, fh.buffer)
-            self._serve(body, "application/vnd.apple.mpegurl" if name.endswith(".m3u8") else "video/mp2t")
-
-    return HlsHandler
-
-
-def _inject_live_start(body, offset):
-    """Insert an #EXT-X-START tag into a media playlist so the receiver starts `offset` seconds
-    behind the live edge (lower offset = less latency). No-op if already present."""
-    try:
-        text = body.decode("utf-8", "replace")
-    except Exception:
-        return body
-    if offset <= 0 or "#EXT-X-START" in text:
-        return body
-    out, done = [], False
-    for ln in text.splitlines():
-        if not done and ln.startswith("#EXTINF"):
-            out.append(f"#EXT-X-START:TIME-OFFSET=-{int(offset)},PRECISE=YES")
-            done = True
-        out.append(ln)
-    return ("\n".join(out) + "\n").encode("utf-8") if done else body
-
-
-# --- Control server for the browser extension --------------------------------
-# Control server: lets the browser extension trigger casting WITHOUT native
-# messaging. The extension just does fetch("http://127.0.0.1:9988/cast?url=").
-# Runs in the background; on each /cast it launches a normal --proxy cast.
 def serve_control(port):
     self_script = os.path.abspath(__file__)
     TOKEN = load_or_create_token()
@@ -1296,7 +1372,7 @@ def serve_control(port):
     else:
         clear_cast_state()   # stale state from a proxy that already exited
 
-    def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="", buffer=5):
+    def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title=""):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -1309,8 +1385,6 @@ def serve_control(port):
             extra += ["--media-url", media]
         if title:
             extra += ["--title", title]      # shown on the renderer instead of the raw URL
-        if kind == "cast":
-            extra += ["--buffer", str(buffer)]   # latency/stability knob
         if kind == "cast" and cast:
             if cast.get("port"):
                 extra += ["--cast-port", str(cast["port"])]
@@ -1327,8 +1401,12 @@ def serve_control(port):
         # run the current interpreter on this file. Replay headers ride in the environment
         # (SLC_HEADERS), not argv, so credentials stay out of /proc/<pid>/cmdline.
         cmd = ([sys.executable] + extra) if FROZEN else [_child_python(), self_script] + extra
-        kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                  stderr=subprocess.DEVNULL, close_fds=True)
+        try:
+            out = open(PROXY_LOG, "w")   # capture the proxy's [cast] logs (retries, restarts, stop reason)
+        except OSError:
+            out = subprocess.DEVNULL
+        kw = dict(stdin=subprocess.DEVNULL, stdout=out,
+                  stderr=subprocess.STDOUT, close_fds=True)
         if headers:
             env = os.environ.copy()
             env["SLC_HEADERS"] = "\n".join(headers)
@@ -1337,7 +1415,10 @@ def serve_control(port):
             kw["creationflags"] = 0x00000008 | NO_WINDOW   # DETACHED_PROCESS | CREATE_NO_WINDOW
         else:
             kw["start_new_session"] = True                 # detach on macOS/Linux
-        return subprocess.Popen(cmd, **kw)
+        proc = subprocess.Popen(cmd, **kw)
+        if out is not subprocess.DEVNULL:
+            out.close()                  # child keeps its own dup; we don't need ours
+        return proc
 
     def _spawn_proxy(extra, headers):
         """Stop the current proxy and start a new one, recording its pid SYNCHRONOUSLY so
@@ -1347,9 +1428,9 @@ def serve_control(port):
         _write_pidfile(proc.pid)
         return proc.pid
 
-    def relaunch_current(u, d, qy, media, headers, kind="dlna", cast=None, title="", buffer=5):
+    def relaunch_current(u, d, qy, media, headers, kind="dlna", cast=None, title=""):
         """Re-cast the given stream at quality qy (snapshot args, not live state reads)."""
-        return _spawn_proxy(build_cast_args(u, d, qy, media, kind, cast, title, buffer), headers)
+        return _spawn_proxy(build_cast_args(u, d, qy, media, kind, cast, title), headers)
 
     class CtrlHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # no keep-alive: each request closes cleanly
@@ -1417,7 +1498,6 @@ def serve_control(port):
                 "/devices": self._devices,
                 "/qualities": self._qualities,
                 "/quality": self._quality,
-                "/buffer": self._buffer,
                 "/stop": self._stop,
                 "/status": self._status,
                 "/ping": self._ping,
@@ -1493,8 +1573,7 @@ def serve_control(port):
             if kind == "cast":
                 cinfo = {"port": (dev or {}).get("port", 8009), "uuid": (dev or {}).get("uuid", ""),
                          "name": (dev or {}).get("name", name), "model": (dev or {}).get("model", "")}
-            buffer = _safe_buffer(q.get("buffer", [""])[0])
-            extra = build_cast_args(url, device, quality, media, kind, cinfo, title, buffer)
+            extra = build_cast_args(url, device, quality, media, kind, cinfo, title)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -1506,8 +1585,7 @@ def serve_control(port):
                     this_epoch = epoch["n"]
                     grace["until"] = time.time() + 10   # cover the child's startup window
                     state.update(url=url, device=device, name=name, title=title, quality=quality,
-                                 media=media, headers=headers, epoch=this_epoch, kind=kind, cast=cinfo,
-                                 buffer=buffer)
+                                 media=media, headers=headers, epoch=this_epoch, kind=kind, cast=cinfo)
                     save_cast_state(state, grace["until"])
             if already is not None:
                 self._json({"ok": True, "already": True, **already})
@@ -1537,7 +1615,7 @@ def serve_control(port):
 
         def _relaunch_locked(self, **changes):
             """Apply state changes and re-cast the current stream (caller holds _state_lock).
-            Returns the response dict. Shared by /quality and /buffer."""
+            Returns the response dict. Used by /quality."""
             if not state["url"]:
                 state.update(changes)
                 return {"ok": True, "casting": False}
@@ -1545,12 +1623,12 @@ def serve_control(port):
             u2, d2 = state["url"], state["device"]
             m2, h2 = state["media"], state["headers"]
             k2, c2 = state.get("kind", "dlna"), state.get("cast") or {}
-            t2, b2 = state.get("title", ""), state.get("buffer", 5)
+            t2 = state.get("title", "")
             epoch["n"] += 1
             state["epoch"] = epoch["n"]
             grace["until"] = time.time() + 10        # tolerate the brief proxy gap during relaunch
             save_cast_state(state, grace["until"])
-            relaunch_current(u2, d2, state["quality"], m2, h2, k2, c2, t2, b2)
+            relaunch_current(u2, d2, state["quality"], m2, h2, k2, c2, t2)
             return {"ok": True, "casting": True}
 
         def _quality(self, q):
@@ -1561,16 +1639,6 @@ def serve_control(port):
                 else:
                     resp = self._relaunch_locked(quality=val)
                 resp["quality"] = val
-            self._json(resp)
-
-        def _buffer(self, q):
-            val = _safe_buffer(q.get("value", [""])[0])
-            with _state_lock:
-                if state["url"] and val == state.get("buffer", 5):
-                    resp = {"ok": True, "buffer": val, "casting": True, "unchanged": True}  # no-op
-                else:
-                    resp = self._relaunch_locked(buffer=val)
-                resp["buffer"] = val
             self._json(resp)
 
         def _stop(self, q):
@@ -1688,105 +1756,45 @@ def run_stop(args):
     return
 
 
-def _cast_monitor(cc, mc, fh, m3u8, cast_title, stop_evt, stop_why):
-    """Steady-state cast watchdog: tolerate buffering/blips, re-LOAD a few times, and
-    return when the cast should be torn down (TV stopped, source ended, unrecoverable)."""
-    POLL = 1.5
-    MAX_RETRIES, STALL_POLLS = 3, 3   # ~4.5s of trouble -> re-LOAD; give up only after 3 tries
-    played, startup, trouble, retries = False, 0, 0, 0
+def _resolve_hls_url(page_url, quality, hdr_map):
+    """Resolve a page URL to the source's own HLS playlist URL with streamlink, so the native Shaka
+    player (which needs HLS, not a TS pipe) can play sites that aren't a fetchable .m3u8 - Twitch, Kick,
+    YouTube, etc. Twitch resolves to its low-latency HLS. Returns '' if streamlink can't resolve the
+    stream. Only asks for the URL (--stream-url); it does not stream or transcode."""
+    opts = ["--stream-url"]
+    if "twitch.tv" in page_url:
+        opts += ["--twitch-low-latency"]          # Twitch's native LL-HLS = the low latency we want
+    cfg = _write_header_config([f"{k}={v}" for k, v in (hdr_map or {}).items()])
+    if cfg:
+        opts += ["--config", cfg]
     try:
-        while True:
-            if stop_evt.wait(POLL):      # receiver PUSHED a stop -> react immediately
-                log(f"cast: stopped on the TV ({stop_why[0]}); shutting down")
-                break
-            if not fh.alive():           # ffmpeg/source ended -> stop
-                log("cast: remux ended (source stopped); shutting down")
-                break
-            try:
-                connected = bool(cc.socket_client and cc.socket_client.is_connected)
-            except Exception:
-                connected = True
-            app = getattr(cc, "app_id", None)
-            idle = fh.idle_secs()
-            st = ""
-            if app == _CAST_RECEIVER_APP:
-                try:
-                    mc.update_status()
-                    st = mc.status.player_state if mc.status else ""
-                except Exception:
-                    st = ""
-            if not played:
-                if st == "PLAYING" or idle < 6:
-                    log("cast: playing")
-                    played = True
-                elif idle > 12:
-                    log(f"cast: failed to start ({int(idle)}s); shutting down")
-                    break
-                else:
-                    startup += 1
-                    if startup >= 24:
-                        log("cast: never started; shutting down")
-                        break
-                continue
-            # --- resilient steady state: a small buffer that drains, or a brief control-socket
-            # blip, should recover, so tolerate it and re-LOAD up to MAX_RETRIES times before
-            # tearing down, instead of cutting out on the first stall. A genuine stop (the user
-            # exiting on the TV) leaves a distinct trail -> we still bail fast for those, so a
-            # retry never resurrects a stream the user deliberately closed.
-            if not connected:
-                # the cast CONTROL socket dropped (the TV may still be pulling segments over HTTP).
-                # reconnect a few times; don't re-LOAD here so we never interrupt a stream that's
-                # actually still playing on a transient blip.
-                trouble += 1
-                if trouble >= STALL_POLLS:
-                    if idle > 10:          # control lost AND the TV stopped pulling -> really gone
-                        log(f"cast: connection lost and TV idle ({int(idle)}s); shutting down")
-                        break
-                    if retries >= MAX_RETRIES:
-                        log(f"cast: not reconnected after {MAX_RETRIES} retries; shutting down")
-                        break
-                    retries += 1; trouble = 0
-                    log(f"cast: reconnecting to the TV (retry {retries}/{MAX_RETRIES})")
-                    try:
-                        cc.wait(timeout=8)
-                    except Exception:
-                        pass
-                continue
-            if app != _CAST_RECEIVER_APP:   # our player is no longer foreground -> user exited / another app
-                log(f"cast: receiver no longer active on the TV (app={app}); shutting down")
-                break
-            if st == "PLAYING":
-                trouble, retries = 0, 0      # healthy playback refreshes the retry budget
-                continue
-            if st == "IDLE":                # the receiver reports the media stopped -> user stopped
-                log("cast: media stopped on the TV; shutting down")
-                break
-            if idle > 8:                    # not playing AND the TV stopped pulling -> it left the
-                log(f"cast: TV stopped pulling ({int(idle)}s) and not playing; shutting down")
-                break                       # stream (a buffer drain keeps pulling, so this isn't one)
-            # connected, our player, still pulling, but BUFFERING/stalled (e.g. a small buffer
-            # drained) -> give it a moment, then nudge it with a fresh LOAD before giving up.
-            trouble += 1
-            if trouble >= STALL_POLLS:
-                if retries >= MAX_RETRIES:
-                    log(f"cast: still buffering after {MAX_RETRIES} retries; shutting down")
-                    break
-                retries += 1; trouble = 0
-                log(f"cast: buffering (reload retry {retries}/{MAX_RETRIES})")
-                try:
-                    mc.play_media(m3u8, "application/vnd.apple.mpegurl", title=cast_title, stream_type="LIVE")
-                    try:
-                        mc.block_until_active(timeout=8)
-                    except Exception:
-                        pass
-                    fh.touch()
-                except Exception:
-                    pass
-    except KeyboardInterrupt:
-        pass
+        out = subprocess.run(_streamlink_cmd(*opts, "--", page_url, quality or "best"),
+                             capture_output=True, text=True, timeout=25)
+        url = ""
+        for ln in (out.stdout or "").splitlines():   # --stream-url prints the resolved URL on stdout
+            ln = ln.strip()
+            if ln.startswith("http"):
+                url = ln
+        if not url:
+            log(f"cast: streamlink could not resolve a stream ({(out.stderr or '').strip()[-120:]})")
+        return url
+    except Exception as e:
+        log(f"cast: streamlink resolve error: {type(e).__name__}: {str(e)[:80]}")
+        return ""
+    finally:
+        if cfg:
+            _safe_unlink(cfg)
 
 
 def run_cast(args):
+    """Cast a live HLS stream to the branded receiver. The helper runs an authenticating HLS
+    reverse-proxy (make_hls_proxy: injects the sniffed headers/token + CORS, rewrites playlist URLs
+    to stay proxied); the receiver's native player handles playback - adaptive sync, gap-jumping,
+    fragment/playlist retries and discontinuity handling. Sources that aren't a direct playlist
+    (Twitch, etc.) are resolved to their HLS with streamlink first."""
+    import pychromecast
+    from pychromecast.controllers import BaseController
+
     if not args.managed:
         kill_previous_proxy()
     _arm_pidfile_cleanup()
@@ -1798,50 +1806,66 @@ def run_cast(args):
         if "=" in h:
             k, v = h.split("=", 1)
             hdr_map[k] = v
-    ffmpeg = _find_ffmpeg()
-    if not ffmpeg:
-        log("cast: ffmpeg not found (needed to remux HLS for Chromecast). pip install static-ffmpeg")
+
+    source_url = args.media_url or args.url
+    if not source_url:
+        log("cast: no source URL to proxy")
         _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-    # source HLS URL: the sniffed media URL directly, else resolve the page via streamlink.
-    if args.media_url:
-        src = args.media_url
-    else:
-        cfg = _write_header_config([f"{k}={v}" for k, v in hdr_map.items()])
-        try:
-            out = subprocess.run(_streamlink_cmd("--stream-url", *(["--config", cfg] if cfg else []),
-                                                 "--", args.url, args.quality),
-                                 capture_output=True, text=True, creationflags=NO_WINDOW)
-        finally:
-            _safe_unlink(cfg)
-        src = (out.stdout or "").strip()
-        if not src:
-            log(f"cast: streamlink could not resolve {_redact_url(args.url)}")
-            _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-    fh = FfmpegHls(src, hdr_map, ffmpeg, buffer=args.buffer)
-    atexit.register(fh.stop)           # backstop: SIGTERM (-> SystemExit) / normal exit kill ffmpeg
-    for _ in range(50):                # wait up to ~25s for ffmpeg to produce a couple segments
-        if fh.ready() or not fh.alive():
-            break
-        time.sleep(0.5)
-    if not fh.ready():
-        log("cast: ffmpeg produced no playable output (dead/offline source?)")
-        fh.stop(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-    httpd = ThreadingHTTPServer((ip, args.port), make_ffmpeg_hls_handler(fh, tv=args.tv))
+
+    # Sites like Twitch/Kick/YouTube aren't a fetchable .m3u8: their stream URL is resolved fresh from
+    # the page each time (a sniffed Twitch playlist URL expires quickly). Resolve those with streamlink
+    # (Twitch gives its low-latency HLS); a direct .m3u8 is proxied directly. If a listed site can't be
+    # resolved, fall back to proxying the given URL.
+    _page = args.url or ""
+    if any(site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
+        resolved = _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
+        if resolved:
+            log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
+            source_url = resolved
+        else:
+            log(f"cast: could not resolve {_page[:48]} via streamlink; proxying {source_url[:36]} as-is")
+
+    httpd = ThreadingHTTPServer((ip, args.port), make_hls_proxy(source_url, hdr_map, tv=args.tv))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    m3u8 = f"http://{ip}:{args.port}/live.m3u8"
-    log(f"HLS (ffmpeg remux) at {m3u8} -> cast to {args.cast_name or args.tv}")
+    hls_url = f"http://{ip}:{args.port}/live.m3u8"
+    log(f"HLS proxy at {hls_url} -> cast (native player) to {args.cast_name or args.tv}")
+
     if not _tcp_open(args.tv, args.cast_port):
         log(f"cast: {args.tv}:{args.cast_port} not reachable. Is the TV on (not in standby)?")
-        httpd.shutdown(); fh.stop(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+        httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
     try:
         cc = _cast_connect(args.tv, args.cast_port, args.cast_uuid, args.cast_model, args.cast_name)
     except Exception as e:
         log(f"cast connect failed: {type(e).__name__}: {str(e)[:80]}")
-        httpd.shutdown(); fh.stop(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+        httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+
+    class _SlcChannel(BaseController):
+        """Private receiver channel: sends play/stop, receives {type:'status'} pushes."""
+        def __init__(self):
+            super().__init__("urn:x-cast:slc")
+            self.last = {}
+            self.last_at = 0.0
+
+        def receive_message(self, _message, data):
+            if isinstance(data, dict) and data.get("type") == "status":
+                self.last = data
+                self.last_at = time.time()
+                return True
+            return False
+
+    slc = _SlcChannel()
+    try:
+        cc.register_handler(slc)
+    except AttributeError:
+        cc.socket_client.register_handler(slc)
 
     def _quit():
         try:
-            if getattr(cc, "app_id", None) == _CAST_RECEIVER_APP:   # only if OUR receiver is up
+            if getattr(cc, "app_id", None) == _CAST_RECEIVER_APP:
+                try:
+                    slc.send_message({"type": "stop"})
+                except Exception:
+                    pass
                 cc.quit_app()
         except Exception:
             pass
@@ -1850,45 +1874,116 @@ def run_cast(args):
         except Exception:
             pass
     atexit.register(_quit)
+
+    # launch the branded receiver and wait for it to come to the foreground
+    if getattr(cc, "app_id", None) != _CAST_RECEIVER_APP:
+        try:
+            cc.start_app(_CAST_RECEIVER_APP)
+        except Exception as e:
+            log(f"cast: start_app failed: {type(e).__name__}: {str(e)[:80]}")
+            httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+    for _ in range(30):
+        if getattr(cc, "app_id", None) == _CAST_RECEIVER_APP:
+            break
+        time.sleep(0.5)
+    if getattr(cc, "app_id", None) != _CAST_RECEIVER_APP:
+        log("cast: receiver app did not launch")
+        httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+
+    # title for the receiver's native UI (from the sender's tab title; never the raw CDN host)
+    _title = (getattr(args, "title", "") or "").strip() or "En vivo"
+    # Standard CAF media LOAD -> the receiver's native player (Shaka) plays the proxied HLS, so the
+    # native UI + TV-remote/phone controls + BACK/exit all work. The receiver's shakaConfig keeps
+    # playback tolerant of segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer).
     mc = cc.media_controller
-    # Listen for the receiver's PUSH notifications so we react INSTANTLY when the user stops on
-    # the TV (idle_reason CANCELLED/FINISHED) instead of waiting for the slow poll-based checks.
-    stop_evt = threading.Event()
-    stop_why = [""]
-
-    class _MediaListener:
-        def new_media_status(self, status):
-            ps = getattr(status, "player_state", "") or ""
-            ir = getattr(status, "idle_reason", None)
-            if ps == "IDLE" and ir in ("CANCELLED", "FINISHED", "INTERRUPTED"):
-                stop_why[0] = f"media {ir}"
-                stop_evt.set()
-
-        def load_media_failed(self, item, error_code):
-            stop_why[0] = "load failed"
-            stop_evt.set()
-
     try:
-        mc.register_status_listener(_MediaListener())
-    except Exception:
-        pass
-    cast_title = args.title or args.cast_name or "Streaming LAN Cast"
-    mc.play_media(m3u8, "application/vnd.apple.mpegurl", title=cast_title, stream_type="LIVE")
-    try:
-        mc.block_until_active(timeout=12)
-    except Exception:
-        pass
-    log("cast: LOAD sent")
-    fh.last_hit = time.time()   # start the "TV is pulling" clock NOW (not at ffmpeg launch, which
-    #                             can take seconds to produce the first segment on slow sources)
-    _cast_monitor(cc, mc, fh, m3u8, cast_title, stop_evt, stop_why)
+        mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type="LIVE")
+        try:
+            mc.block_until_active(timeout=10)
+        except Exception:
+            pass
+        log("cast: LOAD sent (native Shaka player, tolerant config)")
+    except Exception as e:
+        log(f"cast: LOAD failed: {type(e).__name__}: {str(e)[:80]}")
+
+    # ---- steady state, DLNA-simple: the receiver self-heals (reconnect loop); we only tear down
+    # when the user leaves (app change / stop) or the control connection is truly gone. ----
+    POLL = 1.5
+    played = False
+    reconnect_tries = 0
+    tele = 0                       # telemetry heartbeat (log latency/buffer every ~10s)
+    last_stalls = 0
+    last_err = None
+    load_attempts = 1              # the initial play_media above is attempt 1
+    last_load_at = time.monotonic()
+    gave_up = False
+    MAX_LOAD_ATTEMPTS = 5          # if the receiver reports a load error before playback starts, the
+                                   # session just sits idle; re-send the LOAD ourselves up to this many
+                                   # times (a source that's slow to start often succeeds on a later try)
+    while True:
+        time.sleep(POLL)
+        app = getattr(cc, "app_id", None)
+        if app != _CAST_RECEIVER_APP:
+            log(f"cast: receiver no longer active on the TV (app={app}); shutting down")
+            break
+        try:
+            connected = bool(cc.socket_client and cc.socket_client.is_connected)
+        except Exception:
+            connected = True
+        if not connected:
+            reconnect_tries += 1
+            if reconnect_tries > 5:
+                log("cast: control connection lost; shutting down")
+                break
+            log(f"cast: reconnecting to the TV ({reconnect_tries}/5)")
+            try:
+                cc.wait(timeout=8)
+            except Exception:
+                pass
+            continue
+        reconnect_tries = 0
+        st = slc.last.get("state") if slc.last else None
+        if st == "playing" and not played:
+            played = True
+            log(f"cast: playing (receiver rx={slc.last.get('ver')})")
+        # surface the receiver's err/state changes in the log as they happen
+        err = slc.last.get("err") if slc.last else None
+        if err and err != last_err:
+            log(f"cast: receiver err -> {err}")
+            last_err = err
+        # Auto-retry a failed initial LOAD: if the receiver reports a load error before playback starts,
+        # re-send the LOAD. It hits the same warm proxy for a fresh live playlist, so a source that's
+        # slow to start usually catches on a later attempt. Bounded and cooled down so a lingering error
+        # (or a genuinely dead source) can't storm.
+        if not played and err and err.startswith("shaka/"):
+            if load_attempts < MAX_LOAD_ATTEMPTS and (time.monotonic() - last_load_at) > 4:
+                load_attempts += 1
+                log(f"cast: load failed ({err}); auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
+                try:
+                    mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type="LIVE")
+                    last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: auto-retry LOAD send failed: {type(e).__name__}: {str(e)[:60]}")
+            elif load_attempts >= MAX_LOAD_ATTEMPTS and not gave_up:
+                gave_up = True
+                log(f"cast: still failing after {MAX_LOAD_ATTEMPTS} loads ({err}); source may be down "
+                    f"or too slow to start - re-cast to retry")
+        if slc.last:
+            stalls = int(slc.last.get("stalls") or 0)
+            if stalls > last_stalls:
+                log(f"cast: receiver stall (#{stalls}, state {st})")
+                last_stalls = stalls
+            tele += 1
+            if tele >= 7:          # ~ every 10s
+                tele = 0
+                log(f"cast: telemetry rx={slc.last.get('ver')} state={st} buf={slc.last.get('buf')}s "
+                    f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}")
+
     _quit()
     httpd.shutdown()
-    fh.stop()
     _safe_unlink(PIDFILE)
     clear_cast_state()
     os._exit(0)
-
 
 def run_proxy(args):
     control_url = discover_control_url(args.tv, DMR_PORT)
@@ -1984,7 +2079,6 @@ def main():
     ap.add_argument("--stop", action="store_true", help="just stop playback on the TV")
     ap.add_argument("--media-url", default="", help="direct media URL (HLS/DASH/file) to cast instead of resolving the page")
     ap.add_argument("--title", default="", help="title to show on the renderer (defaults to the URL)")
-    ap.add_argument("--buffer", type=int, default=5, help="cast: seconds behind live to start (lower = less delay)")
     ap.add_argument("--add-header", action="append", default=[], metavar="NAME=VALUE",
                     help="extra HTTP header for streamlink, repeatable (e.g. Referer=..., Cookie=...)")
     ap.add_argument("--insecure", action="store_true", help="don't verify TLS for the media fetch")
