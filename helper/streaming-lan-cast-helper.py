@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.3.2"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.3.3"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
