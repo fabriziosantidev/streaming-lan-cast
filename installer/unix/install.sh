@@ -248,8 +248,11 @@ WantedBy=default.target
 EOF
   say "  wrote $UNIT_FILE"
   systemctl --user daemon-reload || warn "daemon-reload returned nonzero; continuing"
-  if systemctl --user enable --now "${SERVICE}.service"; then
-    say "  service enabled and started"
+  # Enable for autostart, then restart so re-running the installer picks up an updated helper (a plain
+  # start is a no-op when the service is already running). KillMode=process leaves any in-flight cast
+  # proxy alive, so restarting the control server here won't cut a cast that's playing.
+  if systemctl --user enable "${SERVICE}.service" 2>/dev/null && systemctl --user restart "${SERVICE}.service"; then
+    say "  service enabled and (re)started"
   else
     warn "could not start the service automatically (no active user session bus, or it failed to launch)."
     warn "  after logging into your desktop session, run: systemctl --user enable --now ${SERVICE}.service"
