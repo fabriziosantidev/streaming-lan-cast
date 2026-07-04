@@ -24,7 +24,7 @@
   <cast-media-player></cast-media-player>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = 'native-8';
+    const RX_VERSION = '1.0';
     const stats = { stalls: 0, reconnects: 0, lastError: null };
     window.__stats = stats;
 
@@ -96,20 +96,14 @@
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
-    // BACK/exit: some TV remotes deliver the back key to the receiver as a keydown. Surface whatever
-    // key fires in the telemetry (err=key:...), and end the session on a back key so a short press
-    // exits (the platform otherwise only force-exits on a long hold).
-    // BACK: with the controls VISIBLE it should just hide them (CAF's default); with them already
-    // HIDDEN it should exit. CAF shows the controls on any remote key and auto-hides them a few
-    // seconds later, so use "time since the last key" as a proxy for the controls being visible.
-    // Capture phase so we decide before <cast-media-player> consumes the key. (err=key:... is logged
-    // so we can see what the remote actually sends.)
+    // BACK: with the player controls visible, a back press just hides them (CAF's default); with them
+    // already hidden it exits. CAF shows the controls on any remote key and auto-hides them a few
+    // seconds later, so "time since the last key" stands in for the controls being visible. Capture
+    // phase, so this runs before <cast-media-player> consumes the key.
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
-      const k = e.keyCode | 0, key = (e.key || '').toLowerCase();
-      const isBack = (k === 8 || k === 4 || k === 27 || k === 461 || k === 10009 ||
-                      key === 'backspace' || key === 'escape' || key === 'goback' || key === 'browserback');
-      stats.lastError = 'key:' + k + '/' + (e.key || '') + (isBack ? '(back)' : '');
+      const key = (e.key || '').toLowerCase();
+      const isBack = (e.keyCode === 166 || key === 'browserback' || key === 'goback');
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
       if (isBack) {
         if (controlsVisible) {
