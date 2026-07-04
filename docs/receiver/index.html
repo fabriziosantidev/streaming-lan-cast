@@ -18,6 +18,15 @@
     --title-color: #ffffff;
     --theme-hue: 220;
   }
+  /* Branded loading screen. CAF's own --splash-image only shows in the idle state, not during the gap
+     while a stream is still loading, so show our logo over that gap and hide it once playback starts. */
+  #splash {
+    position: fixed; inset: 0; z-index: 20; background: #14161a;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px;
+  }
+  #splash img { width: 168px; height: 168px; }
+  #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
+  #splash.gone { display: none; }
   /* On-screen key readout for debugging remote input; hidden until toggled from the remote. */
   #keydbg {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999; display: none;
@@ -29,15 +38,17 @@
 </head>
 <body>
   <cast-media-player></cast-media-player>
+  <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.1';
+    const RX_VERSION = '1.2';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
+    const splash = document.getElementById('splash');   // branded loading overlay (hidden once playing)
 
     // Tolerant Shaka config: survive the source's segment 404s, stalls and discontinuities.
     // Merged over CAF's Shaka defaults.
@@ -101,6 +112,7 @@
       let st = 'idle', t = 0, buf = 0;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
+      splash.classList.toggle('gone', t > 0.1);   // hide the loading logo once the video is actually playing
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
     }, 2000);
 
