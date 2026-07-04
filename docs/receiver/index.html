@@ -24,7 +24,7 @@
   <cast-media-player></cast-media-player>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = 'native-7';
+    const RX_VERSION = 'native-8';
     const stats = { stalls: 0, reconnects: 0, lastError: null };
     window.__stats = stats;
 
@@ -99,13 +99,29 @@
     // BACK/exit: some TV remotes deliver the back key to the receiver as a keydown. Surface whatever
     // key fires in the telemetry (err=key:...), and end the session on a back key so a short press
     // exits (the platform otherwise only force-exits on a long hold).
+    // BACK: with the controls VISIBLE it should just hide them (CAF's default); with them already
+    // HIDDEN it should exit. CAF shows the controls on any remote key and auto-hides them a few
+    // seconds later, so use "time since the last key" as a proxy for the controls being visible.
+    // Capture phase so we decide before <cast-media-player> consumes the key. (err=key:... is logged
+    // so we can see what the remote actually sends.)
+    let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
-      stats.lastError = 'key:' + (e.keyCode || 0) + '/' + (e.key || '');
       const k = e.keyCode | 0, key = (e.key || '').toLowerCase();
-      if (k === 8 || k === 4 || k === 461 || k === 10009 || key === 'backspace' || key === 'goback' || key === 'browserback') {
-        try { context.stop(); } catch (x) {}
+      const isBack = (k === 8 || k === 4 || k === 27 || k === 461 || k === 10009 ||
+                      key === 'backspace' || key === 'escape' || key === 'goback' || key === 'browserback');
+      stats.lastError = 'key:' + k + '/' + (e.key || '') + (isBack ? '(back)' : '');
+      const controlsVisible = (Date.now() - lastKeyAt) < 4500;
+      if (isBack) {
+        if (controlsVisible) {
+          lastKeyAt = 0;                          // controls hide now; a later BACK (hidden) will exit
+        } else {
+          e.preventDefault(); e.stopPropagation();
+          try { context.stop(); } catch (x) {}    // controls already hidden -> exit the receiver
+        }
+      } else {
+        lastKeyAt = Date.now();                    // any other remote key shows the controls
       }
-    });
+    }, true);
 
     const options = new cast.framework.CastReceiverOptions();
     options.useShakaForHls = true;   // play HLS with Shaka (not CAF's legacy player) so the tolerant
