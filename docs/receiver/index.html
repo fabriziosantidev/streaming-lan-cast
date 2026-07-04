@@ -86,7 +86,7 @@
         m.streamType = cast.framework.messages.StreamType.LIVE;
         // Let Shaka autodetect the segment format (don't force hlsSegmentFormat).
         // Stable sources (Twitch/Kick/YouTube) are tagged ll=1: ride closer to the live edge with a
-        // shallower buffer for lower latency. The flaky pirate HLS keeps the deeper, safer default.
+        // shallower buffer for lower latency. Everything else keeps the deeper, safer default.
         const lowLat = (m.contentUrl || '').indexOf('ll=1') !== -1;
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay = lowLat ? 3 : 10;
         playbackConfig.shakaConfig.streaming.bufferingGoal = lowLat ? 12 : 30;

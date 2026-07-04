@@ -1788,7 +1788,7 @@ def run_cast(args):
     httpd = ThreadingHTTPServer((ip, args.port), make_hls_proxy(source_url, hdr_map, tv=args.tv))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     # ?ll=1 asks the receiver to sit closer to the live edge (lower delay) for these stable sources;
-    # the flaky pirate HLS keeps the deeper default. The proxy matches on /live.m3u8, ignoring the query.
+    # everything else keeps the deeper default. The proxy matches on /live.m3u8, ignoring the query.
     hls_url = f"http://{ip}:{args.port}/live.m3u8" + ("?ll=1" if _low_latency else "")
     log(f"HLS proxy at {hls_url} -> cast (native player) to {args.cast_name or args.tv}")
 
