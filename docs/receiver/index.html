@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.2';
+    const RX_VERSION = '1.3';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -80,6 +80,7 @@
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (req) => {
       try {
         const m = req.media || {};
+        splash.classList.remove('gone');   // show the loading logo while the new stream loads
         m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; Shaka loads contentUrl
         m.contentType = 'application/x-mpegurl';
         m.streamType = cast.framework.messages.StreamType.LIVE;
@@ -107,12 +108,13 @@
       stats.lastError = d;
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
+    playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
     setInterval(() => {
       const v = document.getElementsByTagName('video')[0];
       let st = 'idle', t = 0, buf = 0;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
-      splash.classList.toggle('gone', t > 0.1);   // hide the loading logo once the video is actually playing
+      if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
     }, 2000);
 
