@@ -1853,9 +1853,10 @@ def run_cast(args):
         try:
             cc.start_app(_CAST_RECEIVER_APP)
         except Exception as e:
-            log(f"cast: start_app failed: {type(e).__name__}: {str(e)[:80]}")
-            httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-    for _ in range(30):
+            # a slow cold launch can outlast the ~10s start_app timeout; the app is still coming up,
+            # so wait for it below
+            log(f"cast: start_app slow ({type(e).__name__}); waiting for the receiver to foreground")
+    for _ in range(40):
         if getattr(cc, "app_id", None) == _CAST_RECEIVER_APP:
             break
         time.sleep(0.5)
