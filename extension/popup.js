@@ -369,8 +369,7 @@ $("retryHelper").addEventListener("click", init);
 $("getHelper").addEventListener("click", () => browser.tabs.create({ url: SITE_URL }));
 $("openOptions").addEventListener("click", () => browser.runtime.openOptionsPage());
 $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTimeout(noticeTimer); });
-$("updateHelperLink").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL }); });
-$("helperOld").addEventListener("click", (e) => { if (e.target.id !== "updateHelperLink") $("helperOld").hidden = true; });
+$("helperOld").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL + "#update" }); });
 
 // boot
 localize();

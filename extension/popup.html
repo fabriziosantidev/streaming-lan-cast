@@ -75,7 +75,8 @@
             font-size:12px; line-height:1.45; word-break:break-word; white-space:pre-line;
             background:var(--card); border:1px solid var(--border); color:var(--fg); cursor:pointer; }
   .notice.err { border-color:var(--danger); }
-  #helperOld a { color:var(--accent); font-weight:600; white-space:nowrap; }
+  #helperOld { white-space:normal; }
+  #helperOld a { display:inline-block; margin-top:4px; color:var(--accent); font-weight:600; }
   [hidden] { display:none !important; }   /* a class display rule must not override the hidden attribute */
   .linkbtn { display:block; width:100%; margin-top:6px; padding:6px; background:none; border:0;
              color:var(--muted); font-size:12px; cursor:pointer; text-decoration:underline; font-weight:500; }
@@ -102,8 +103,8 @@
 
   <!-- helper older than the extension: nudge to update it (click to dismiss) -->
   <div id="helperOld" class="notice" hidden>
-    <span data-i18n="helperOutdated">Your helper app is out of date.</span>
-    <a id="updateHelperLink" href="#" data-i18n="updateHelper">Update the helper</a>
+    <div data-i18n="helperOutdated">A new helper version is available.</div>
+    <a id="updateHelperLink" href="#" data-i18n="updateHelper">Update it</a>
   </div>
 
   <!-- helper not detected -->
