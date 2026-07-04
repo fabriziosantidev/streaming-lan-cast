@@ -101,13 +101,25 @@ async function activeTab() {
 }
 
 async function init() {
-  try { await call("/ping"); }
+  let ping;
+  try { ping = await call("/ping"); }
   catch (e) { stopAll(); setLive(false); return view(e && e.unauthorized ? "needToken" : "noHelper"); }
+  checkHelperVersion(ping);
   let status = {};
   try { status = await call("/status"); } catch {}
   if (status.casting) showCasting(status.name || status.device || "", whatOf(status), status.url, status.quality);
   else await showPicker();
   startStatusPoll();
+}
+
+// warn if the local helper is behind the extension: the two ship together, so an older helper misses
+// fixes and can reject newer requests. Compares major.minor (a patch bump alone doesn't nag); a helper
+// too old to report a version at all counts as behind.
+function checkHelperVersion(ping) {
+  const mm = (v) => { const p = String(v || "").split("."); return (Number(p[0]) || 0) * 1000 + (Number(p[1]) || 0); };
+  const helper = ping && ping.version;
+  const behind = !helper || mm(helper) < mm(browser.runtime.getManifest().version);
+  $("helperOld").hidden = !behind;
 }
 function stopAll() { stopScan(); stopStatusPoll(); }
 
@@ -357,6 +369,8 @@ $("retryHelper").addEventListener("click", init);
 $("getHelper").addEventListener("click", () => browser.tabs.create({ url: SITE_URL }));
 $("openOptions").addEventListener("click", () => browser.runtime.openOptionsPage());
 $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTimeout(noticeTimer); });
+$("updateHelperLink").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL }); });
+$("helperOld").addEventListener("click", (e) => { if (e.target.id !== "updateHelperLink") $("helperOld").hidden = true; });
 
 // boot
 localize();
