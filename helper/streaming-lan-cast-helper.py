@@ -67,6 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
+HELPER_VERSION = "0.3.2"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -1084,7 +1085,7 @@ def make_hls_proxy(source_url, hdr_map, tv=""):
             if self._foreign():
                 if not dbg["refused"]:
                     dbg["refused"] = True
-                    log(f"proxy: REFUSED {self.client_address[0]} (cast target is {tv}) - client can't reach the stream")
+                    log(f"proxy: REFUSED {self.client_address[0]} (cast target is {tv}): client can't reach the stream")
                 self.send_error(403); return
             p = self.path.split("?", 1)[0]
             try:
@@ -1215,8 +1216,9 @@ def discover_cast_devices(timeout=2.0):
 
 def discover_all_devices():
     """DLNA (SSDP) + Cast (mDNS) renderers, discovered in parallel and merged. If one physical
-    device exposes BOTH protocols (e.g. an Android TV with a DLNA app + Chromecast built-in), keep
-    the DLNA entry: the MPEG-TS/SOAP path is more reliable there than re-muxing HLS for Cast."""
+    device exposes BOTH protocols (e.g. an Android TV or a modern TV with Chromecast built-in), keep
+    the Cast entry: it drives the branded receiver (own title, tolerant playback, remote exit) over a
+    plain HLS proxy. Set SLC_PREFER_DLNA=1 to keep the DLNA (MPEG-TS/SOAP) entry instead."""
     from concurrent.futures import ThreadPoolExecutor
     devs = []
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -1226,7 +1228,7 @@ def discover_all_devices():
                 devs += f.result()
             except Exception:
                 pass
-    prefer_cast = os.environ.get("SLC_PREFER_CAST") == "1"   # flip the default DLNA preference
+    prefer_dlna = os.environ.get("SLC_PREFER_DLNA") == "1"   # opt back into the plain DLNA player
     by_host, extras = {}, []
     for d in devs:
         h = d.get("host")
@@ -1234,12 +1236,12 @@ def discover_all_devices():
             extras.append(d)
             continue
         cur = by_host.get(h)
-        # Normally prefer DLNA when a host exposes both protocols; SLC_PREFER_CAST prefers Cast, so a
-        # custom branded receiver (SLC_CAST_APP_ID) is used instead of the plain DLNA player.
-        if prefer_cast:
-            take = cur is None or (cur.get("kind") == "dlna" and d.get("kind") == "cast")
-        else:
+        # When a host exposes both protocols, prefer Cast: it drives the branded receiver instead of
+        # the plain DLNA player. SLC_PREFER_DLNA=1 keeps DLNA (e.g. a source Cast plays back poorly).
+        if prefer_dlna:
             take = cur is None or (cur.get("kind") == "cast" and d.get("kind") == "dlna")
+        else:
+            take = cur is None or (cur.get("kind") == "dlna" and d.get("kind") == "cast")
         if take:
             by_host[h] = d
     devs = list(by_host.values()) + extras
@@ -1274,11 +1276,11 @@ def _cast_connect(host, port, uuid, model, name, timeout=15):
     return cc
 
 
-# The Cast receiver app id: the Default Media Receiver, or a custom branded receiver when
-# SLC_CAST_APP_ID is set. Quitting it returns the device to its home screen, BUT calling quit on a
-# device that's already idle spuriously RELAUNCHES it (showing the receiver splash), so every quit
-# below is guarded by checking this is still the running app.
-_CAST_RECEIVER_APP = os.environ.get("SLC_CAST_APP_ID", "CC1AD845")
+# The Cast receiver app id: our branded receiver by default, overridable via SLC_CAST_APP_ID (e.g.
+# CC1AD845 for Google's Default Media Receiver). Quitting it returns the device to its home screen,
+# BUT calling quit on a device that's already idle spuriously RELAUNCHES it (showing the receiver
+# splash), so every quit below is guarded by checking this is still the running app.
+_CAST_RECEIVER_APP = os.environ.get("SLC_CAST_APP_ID", "C4B6F8FF")
 
 
 def cast_quit(host, port, uuid, model, name):
@@ -1657,7 +1659,7 @@ def serve_control(port):
             self._json({"ok": True, "casting": alive, **snap})
 
         def _ping(self, q):
-            self._json({"ok": True, "pong": True})
+            self._json({"ok": True, "pong": True, "version": HELPER_VERSION})
 
     def _dev_loop():
         while True:
@@ -1714,8 +1716,8 @@ def run_stop(args):
 
 def _resolve_hls_url(page_url, quality, hdr_map):
     """Resolve a page URL to the source's own HLS playlist URL with streamlink, so the native Shaka
-    player (which needs HLS, not a TS pipe) can play sites that aren't a fetchable .m3u8 - Twitch, Kick,
-    YouTube, etc. Twitch resolves to its low-latency HLS. Returns '' if streamlink can't resolve the
+    player (which needs HLS, not a TS pipe) can play sites that aren't a fetchable .m3u8 (Twitch, Kick,
+    YouTube, etc.). Twitch resolves to its low-latency HLS. Returns '' if streamlink can't resolve the
     stream. Only asks for the URL (--stream-url); it does not stream or transcode."""
     opts = ["--stream-url"]
     if "twitch.tv" in page_url:
@@ -1745,7 +1747,7 @@ def _resolve_hls_url(page_url, quality, hdr_map):
 def run_cast(args):
     """Cast a live HLS stream to the branded receiver. The helper runs an authenticating HLS
     reverse-proxy (make_hls_proxy: injects the sniffed headers/token + CORS, rewrites playlist URLs
-    to stay proxied); the receiver's native player handles playback - adaptive sync, gap-jumping,
+    to stay proxied); the receiver's native player handles playback: adaptive sync, gap-jumping,
     fragment/playlist retries and discontinuity handling. Sources that aren't a direct playlist
     (Twitch, etc.) are resolved to their HLS with streamlink first."""
     import pychromecast
@@ -1941,7 +1943,7 @@ def run_cast(args):
             elif load_attempts >= MAX_LOAD_ATTEMPTS and not gave_up:
                 gave_up = True
                 log(f"cast: still failing after {MAX_LOAD_ATTEMPTS} loads ({err}); source may be down "
-                    f"or too slow to start - re-cast to retry")
+                    f"or too slow to start; re-cast to retry")
         if slc.last:
             stalls = int(slc.last.get("stalls") or 0)
             if stalls > last_stalls:

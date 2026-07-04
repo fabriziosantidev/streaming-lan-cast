@@ -22,29 +22,29 @@ Files: `index.html` (the receiver) and `icon-256.png` (splash/logo).
 
 ## Run the helper with it
 
-Two environment variables switch the helper to the branded receiver:
+The helper uses this receiver by default (App ID `C4B6F8FF`) and prefers Cast over DLNA when a device
+exposes both, so casting to a Cast device just works with no configuration.
 
-    SLC_CAST_APP_ID=<your App ID>   # use this receiver instead of the Default Media Receiver
-    SLC_PREFER_CAST=1               # cast via Google Cast to devices that also expose DLNA (the Samsung)
+Overrides (environment variables), for development or a different receiver:
 
-Quick test, running the helper directly:
+    SLC_CAST_APP_ID=XXXXXXXX   # use a different receiver App ID (e.g. CC1AD845 = Default Media Receiver)
+    SLC_PREFER_DLNA=1          # force DLNA (MPEG-TS/SOAP) on devices that also expose Cast
 
-    SLC_CAST_APP_ID=XXXXXXXX SLC_PREFER_CAST=1 python helper/streaming-lan-cast-helper.py --serve
+Quick test with a different receiver, running the helper directly:
 
-For the installed systemd user service, add them as a drop-in:
+    SLC_CAST_APP_ID=XXXXXXXX python helper/streaming-lan-cast-helper.py --serve
+
+For the installed systemd user service, add an override as a drop-in:
 
     systemctl --user edit streaming-lan-cast.service
     #   [Service]
     #   Environment=SLC_CAST_APP_ID=XXXXXXXX
-    #   Environment=SLC_PREFER_CAST=1
     systemctl --user restart streaming-lan-cast.service
-
-Then cast a tab as usual. On a Cast device the stream now loads inside the branded receiver.
 
 ## Notes
 
-- `SLC_PREFER_CAST=1` is only needed for devices that expose both DLNA and Cast (the helper prefers
-  DLNA by default). Cast-only devices use Cast regardless.
-- No effect on DLNA-only renderers.
-- Unregistered receivers only load on devices you registered as test devices; publish the receiver
-  in the console to reach everyone.
+- The helper prefers Cast when a device exposes both DLNA and Cast; `SLC_PREFER_DLNA=1` forces the
+  plain DLNA player instead (e.g. when a source plays back better over DLNA).
+- DLNA-only renderers are not affected; they always use DLNA.
+- A custom receiver only loads on devices you registered as test devices until you publish it in the
+  console; after that, any device can use it.
