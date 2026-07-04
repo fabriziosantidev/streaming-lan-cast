@@ -18,14 +18,22 @@
     --title-color: #ffffff;
     --theme-hue: 220;
   }
+  /* On-screen key readout for debugging remote input; hidden until toggled from the remote. */
+  #keydbg {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999; display: none;
+    padding: 10px 18px; text-align: center;
+    background: rgba(0, 0, 0, 0.72); color: #fff;
+    font: 700 2.6vw/1.3 monospace; letter-spacing: 0.03em;
+  }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
+  <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.0';
-    const stats = { stalls: 0, reconnects: 0, lastError: null };
+    const RX_VERSION = '1.1';
+    const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
     const context = cast.framework.CastReceiverContext.getInstance();
@@ -93,27 +101,66 @@
       let st = 'idle', t = 0, buf = 0;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
-      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
     }, 2000);
 
-    // BACK: with the player controls visible, a back press just hides them (CAF's default); with them
-    // already hidden it exits. CAF shows the controls on any remote key and auto-hides them a few
-    // seconds later, so "time since the last key" stands in for the controls being visible. Capture
-    // phase, so this runs before <cast-media-player> consumes the key.
+    // BACK button. The numeric keyCode for "back" isn't consistent across Cast platforms, so match the
+    // portable event.key name first (Chromecast / Google TV report 'BrowserBack') and fall back to the
+    // known TV back codes: 166 (legacy BrowserBack), 461 (HbbTV / most TV browsers), 10009 (Tizen).
+    // Some Android TV / Google TV builds handle BACK in the system and close the app before this runs.
+    function isBackKey(e) {
+      const key = (e.key || '').toLowerCase();
+      if (key === 'browserback' || key === 'goback' || key === 'back') return true;
+      return e.keyCode === 166 || e.keyCode === 461 || e.keyCode === 10009;
+    }
+
+    // Debug readout: press Up, Up, Down, Down on the remote to toggle an on-screen panel showing the
+    // code/key of each press - handy to read what an unfamiliar device sends for BACK. Off by default,
+    // so normal playback shows nothing. The last key also rides along in the status telemetry above.
+    const keyDbg = document.getElementById('keydbg');
+    let dbgOn = false;
+    const combo = [];
+    function dirOf(e) {
+      const k = (e.key || '').toLowerCase();
+      if (k === 'arrowup' || e.keyCode === 38) return 'up';
+      if (k === 'arrowdown' || e.keyCode === 40) return 'down';
+      return '';
+    }
+    function showKey(e) {
+      stats.lastKey = { code: e.keyCode, key: e.key || '' };
+      if (dbgOn) keyDbg.textContent = 'keyCode ' + e.keyCode + '   key "' + (e.key || '') + '"   back=' + isBackKey(e);
+    }
+    function toggleCheck(e) {
+      const d = dirOf(e);
+      if (!d) return;
+      combo.push(d);
+      if (combo.length > 4) combo.shift();
+      if (combo.join(',') === 'up,up,down,down') {
+        dbgOn = !dbgOn;
+        keyDbg.style.display = dbgOn ? 'block' : 'none';
+        keyDbg.textContent = dbgOn ? 'key debug ON' : '';
+        combo.length = 0;
+      }
+    }
+
+    // With the player controls visible, a back press just hides them (CAF's default); with them already
+    // hidden it exits. CAF shows the controls on any remote key and auto-hides them a few seconds later,
+    // so "time since the last key" stands in for the controls being visible. Capture phase, so this runs
+    // before <cast-media-player> consumes the key.
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
-      const key = (e.key || '').toLowerCase();
-      const isBack = (e.keyCode === 166 || key === 'browserback' || key === 'goback');
+      showKey(e);
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
-      if (isBack) {
+      if (isBackKey(e)) {
         if (controlsVisible) {
-          lastKeyAt = 0;                          // controls hide now; a later BACK (hidden) will exit
+          lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
         } else {
           e.preventDefault(); e.stopPropagation();
-          try { context.stop(); } catch (x) {}    // controls already hidden -> exit the receiver
+          try { context.stop(); } catch (x) {}     // controls already hidden -> exit the receiver
         }
       } else {
         lastKeyAt = Date.now();                    // any other remote key shows the controls
+        toggleCheck(e);
       }
     }, true);
 
