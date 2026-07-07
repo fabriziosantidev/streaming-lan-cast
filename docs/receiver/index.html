@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.3';
+    const RX_VERSION = '1.6';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -75,22 +75,35 @@
       },
     };
 
-    // LOAD: tell Shaka it's a live MPEG-TS HLS. (Headers/token are injected by the helper's proxy,
-    // so Shaka just fetches our CORS-enabled proxy - no per-request auth needed here.)
+    // LOAD: a direct media file (video/*, served with byte-range seeking) or a VOD HLS (tagged ?vod=1)
+    // plays as a seekable BUFFERED stream; a live source stays LIVE. Headers/token are injected by the
+    // helper's proxy, so the player just fetches our CORS-enabled proxy - no per-request auth here.
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (req) => {
       try {
         const m = req.media || {};
         splash.classList.remove('gone');   // show the loading logo while the new stream loads
-        m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; Shaka loads contentUrl
-        m.contentType = 'application/x-mpegurl';
-        m.streamType = cast.framework.messages.StreamType.LIVE;
+        m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
+        const url = m.contentUrl || '';
+        const path = url.split('?')[0];
+        // A direct file plays through CAF's own player; an HLS playlist plays through Shaka. contentType
+        // picks which.
+        if (path.endsWith('.webm')) m.contentType = 'video/webm';
+        else if (path.endsWith('.mp4') || path.endsWith('.m4v') || path.endsWith('.mov')) m.contentType = 'video/mp4';
+        else m.contentType = 'application/x-mpegurl';
+        const isVod = url.indexOf('vod=1') !== -1;
+        m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
+                             : cast.framework.messages.StreamType.LIVE;
         // Let Shaka autodetect the segment format (don't force hlsSegmentFormat).
-        // Stable sources (Twitch/Kick/YouTube) are tagged ll=1: ride closer to the live edge with a
-        // shallower buffer for lower latency. Everything else keeps the deeper, safer default.
-        const lowLat = (m.contentUrl || '').indexOf('ll=1') !== -1;
-        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = lowLat ? 3 : 10;
-        playbackConfig.shakaConfig.streaming.bufferingGoal = lowLat ? 12 : 30;
-        stats.lastError = 'loading:' + (m.contentUrl || '').slice(0, 40);
+        // A live HLS tagged ll=1 (Twitch/Kick/YouTube) rides closer to the edge with a shallower buffer;
+        // a VOD seeks freely and has no live edge, so it drops the presentation delay.
+        const lowLat = url.indexOf('ll=1') !== -1;
+        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 10);
+        playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
+        // Low-latency HLS: fetch the sub-second #EXT-X-PART parts and ride the edge with blocking reloads.
+        // Some hosts deliver ALL media through the parts (the full #EXTINF segments are empty markers), so
+        // without this Shaka fetches empty segments and never fills its buffer.
+        playbackConfig.shakaConfig.streaming.lowLatencyMode = lowLat && !isVod;
+        stats.lastError = 'loading:' + url.slice(0, 40);
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
     });
