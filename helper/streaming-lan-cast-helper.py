@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.0"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.5.1"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -572,7 +572,7 @@ def _youtube_meta(url):
         return None
     try:
         out = subprocess.run(cmd + ["-J", "--no-warnings", "--no-playlist", "--", url],
-                             capture_output=True, text=True, timeout=45)
+                             capture_output=True, text=True, timeout=45, creationflags=NO_WINDOW)
         info = json.loads(out.stdout or "")
     except Exception:
         return None
@@ -2163,7 +2163,7 @@ def _resolve_hls_url(page_url, quality, hdr_map):
         opts += ["--config", cfg]
     try:
         out = subprocess.run(_streamlink_cmd(*opts, "--", page_url, quality or "best"),
-                             capture_output=True, text=True, timeout=25)
+                             capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW)
         url = ""
         for ln in (out.stdout or "").splitlines():   # --stream-url prints the resolved URL on stdout
             ln = ln.strip()
@@ -2628,7 +2628,7 @@ def _resolve_youtube(page_url, max_h=2160, itag=None):
         return None
     try:
         out = subprocess.run(cmd + ["-J", "--no-warnings", "--no-playlist", "--", page_url],
-                             capture_output=True, text=True, timeout=45)
+                             capture_output=True, text=True, timeout=45, creationflags=NO_WINDOW)
         info = json.loads(out.stdout or "")
     except Exception as e:
         log(f"cast: yt-dlp resolve failed: {type(e).__name__}: {str(e)[:80]}")
@@ -2685,7 +2685,7 @@ def _start_youtube_remux(yt, tmpdir):
            "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.m4s"),
            os.path.join(tmpdir, "index.m3u8")]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            preexec_fn=_PDEATHSIG)
+                            creationflags=NO_WINDOW, preexec_fn=_PDEATHSIG)
 
 
 def _make_dir_server(root, tv=""):
