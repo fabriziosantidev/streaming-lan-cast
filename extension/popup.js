@@ -113,11 +113,11 @@ async function init() {
   startStatusPoll();
 }
 
-// warn if the local helper is behind the extension: the two ship together, so an older helper misses
-// fixes and can reject newer requests. Compares major.minor (a patch bump alone doesn't nag); a helper
-// too old to report a version at all counts as behind.
+// warn if the local helper is behind the extension: the two ship together (every release bumps both), so
+// an older helper misses fixes and can reject newer requests. Compares the full major.minor.patch, so a
+// patch-level helper update prompts too; a helper too old to report a version at all counts as behind.
 function checkHelperVersion(ping) {
-  const mm = (v) => { const p = String(v || "").split("."); return (Number(p[0]) || 0) * 1000 + (Number(p[1]) || 0); };
+  const mm = (v) => { const p = String(v || "").split("."); return (Number(p[0]) || 0) * 1e6 + (Number(p[1]) || 0) * 1e3 + (Number(p[2]) || 0); };
   const helper = ping && ping.version;
   const behind = !helper || mm(helper) < mm(browser.runtime.getManifest().version);
   $("helperOld").hidden = !behind;
