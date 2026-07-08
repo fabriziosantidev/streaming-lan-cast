@@ -170,7 +170,7 @@ say "  installing streamlink + pychromecast (this downloads a few MB)"
 # streamlink resolves the stream; pychromecast drives Google Cast / Android TV targets.
 # Canonical runtime list lives in requirements.txt; keep this in sync (installed inline so the
 # curl | bash one-liner needs no checkout).
-"$VENV/bin/python" -m pip install --quiet --upgrade streamlink pychromecast
+"$VENV/bin/python" -m pip install --quiet --upgrade streamlink pychromecast curl_cffi
 say "  ${DIM}$("$VENV/bin/python" -m streamlink --version 2>/dev/null || echo streamlink)${RST}"
 
 # --- helper ------------------------------------------------------------------

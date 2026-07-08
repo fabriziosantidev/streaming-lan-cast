@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.3.3"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.4.0"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -75,6 +75,7 @@ AVT = "urn:schemas-upnp-org:service:AVTransport:1"
 PIDFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy.pid")
 STATEFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-state.json")  # survives --serve restarts
 PROXY_LOG = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-cast.log")  # last cast proxy's output (debug)
+PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-error.json")  # proxy->control: source expired (410/403)
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
 LOGFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast.log")   # caster diagnostics (pythonw has no console)
@@ -550,15 +551,74 @@ def _quality_rank(q):
     return (int(m.group(1)), int(m.group(2) or 0)) if m else (-1, 0)
 
 
+def _yt_codec_family(vc):
+    vc = vc or ""
+    if vc.startswith("av01"):
+        return "AV1"
+    if vc.startswith(("vp9", "vp09")):
+        return "VP9"
+    if vc.startswith("avc"):
+        return "H.264"
+    return (vc.split(".")[0] or "?")[:6]
+
+
+def _youtube_meta(url):
+    """{title, author, qualities, matrix} for a YouTube VOD via yt-dlp (streamlink only sees 360p there).
+    'qualities' is the flat height ladder the classic dropdown consumes; 'matrix' is the full
+    resolution -> fps -> [codec/range/itag/bitrate] tree the cascading quality menu consumes. Returns
+    None for a live stream or on failure, so stream_meta falls back to streamlink (live's own ladder)."""
+    cmd = _ytdlp_cmd()
+    if not cmd:
+        return None
+    try:
+        out = subprocess.run(cmd + ["-J", "--no-warnings", "--no-playlist", "--", url],
+                             capture_output=True, text=True, timeout=45)
+        info = json.loads(out.stdout or "")
+    except Exception:
+        return None
+    if info.get("is_live"):
+        return None
+    tree = {}
+    for f in info.get("formats") or []:
+        if f.get("vcodec") in (None, "none") or f.get("acodec") not in (None, "none"):
+            continue
+        if not (f.get("url") and f.get("protocol") == "https" and f.get("height")):
+            continue
+        rng = "HDR" if "HDR" in (f.get("dynamic_range") or "").upper() else "SDR"
+        tree.setdefault(f["height"], {}).setdefault(int(f.get("fps") or 0), []).append(
+            {"codec": _yt_codec_family(f.get("vcodec")), "range": rng,
+             "itag": f["format_id"], "tbr": round((f.get("tbr") or 0) / 1000, 1)})
+    cr = {"AV1": 2, "H.264": 1, "VP9": 0}
+    matrix = []
+    for h in sorted(tree, reverse=True):
+        fpss = [{"fps": fp, "opts": sorted(tree[h][fp], key=lambda o: (-cr.get(o["codec"], 0), o["range"] != "SDR", -o["tbr"]))}
+                for fp in sorted(tree[h], reverse=True)]
+        matrix.append({"res": h, "fps": fpss})
+    return {"title": (info.get("title") or "").strip(),
+            "author": (info.get("uploader") or "").strip(),
+            "qualities": [f"{r['res']}p" for r in matrix],
+            "matrix": matrix}
+
+
 def stream_meta(url):
     """One `streamlink --json` call: returns {title, author, qualities[]}.
     Cached per-url (~90s) so /qualities and the /cast title worker reuse it.
-    Qualities are real renditions (best/worst aliases dropped), highest first."""
+    Qualities are real renditions (best/worst aliases dropped), highest first.
+    YouTube VODs are resolved with yt-dlp instead (streamlink caps them at 360p)."""
     now = time.time()
     with _meta_lock:
         c = _meta_cache.get(url)
         if c and now - c[0] < 90:
             return c[1]
+    if "youtube.com" in url or "youtu.be" in url:
+        ym = _youtube_meta(url)
+        if ym is not None:
+            with _meta_lock:
+                _meta_cache[url] = (now, ym)
+                _meta_cache.move_to_end(url)
+                while len(_meta_cache) > _META_CACHE_MAX:
+                    _meta_cache.popitem(last=False)
+            return ym
     meta = {"title": "", "author": "", "qualities": []}
     try:
         out = subprocess.run(
@@ -631,6 +691,31 @@ def probe_stream(target, header_cfg=""):
     return False, "unplayable", (err or "streamlink could not resolve the stream")
 
 
+def _source_reachable(url, headers):
+    """True if a small authenticated GET of url succeeds, i.e. the cast's own reverse-proxy could serve
+    it. Used to override a streamlink 'unplayable' verdict for an already-resolved CDN playlist that
+    streamlink's resolver rejects but the proxy fetches fine (some hosts only hand their fragmented-MP4
+    media playlist to a plain GET). headers is the replay list ('Name=Value'); a manifest needs only
+    Referer/Origin/User-Agent, so the Cookie is not sent. A media playlist that declares SAMPLE-AES key
+    delivery is reported unreachable so the DRM rejection stands."""
+    try:
+        h = {}
+        for x in (headers or []):
+            name, sep, value = x.partition("=")
+            if sep and name.lower() in ("referer", "origin", "user-agent"):
+                h[name] = value
+        h.setdefault("User-Agent", "Mozilla/5.0")
+        h["Range"] = "bytes=0-65535"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=6) as r:
+            ct = (r.headers.get("Content-Type") or "").lower()
+            body = r.read(200_000)
+    except Exception:
+        return False
+    if body[:64].lstrip().startswith(b"#EXTM3U"):
+        return b"SAMPLE-AES" not in body          # plain/AES-128 HLS is castable; SAMPLE-AES is DRM
+    return "mpegurl" in ct or ct.startswith("video/")
+
+
 # headers the extension is allowed to replay to streamlink (the ones a player needs to
 # fetch a protected stream). Anything else is dropped: no arbitrary header injection.
 # This set is the SECURITY BOUNDARY; keep it in sync with the extension's WANT list in
@@ -664,14 +749,16 @@ def parse_replay_headers(raw):
 
 
 _QUALITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")   # must start alphanumeric (no leading '-')
+_ITAG_RE = re.compile(r"^itag:[A-Za-z0-9]+$")               # the quality menu picks an exact yt-dlp format id
 
 
 def _safe_quality(value):
     """Quality selector, validated. streamlink takes it as a trailing POSITIONAL, so an
     unvalidated value like '--http-proxy=...' could masquerade as a streamlink option; restrict
-    it to a conservative charset and fall back to 'best'."""
+    it to a conservative charset and fall back to 'best'. 'itag:<id>' is also allowed (the quality menu
+    picks one); run_cast intercepts it before streamlink, so it never reaches streamlink as an arg."""
     value = (value or "").strip()
-    return value if (value and _QUALITY_RE.match(value)) else "best"
+    return value if (value and (_QUALITY_RE.match(value) or _ITAG_RE.match(value))) else "best"
 
 
 def _safe_unlink(path):
@@ -1003,13 +1090,64 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_r
     return LiveHandler
 
 
-def make_hls_proxy(source_url, hdr_map, tv=""):
-    """Authenticating HLS reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
-    requires, rewrites every playlist URL to route back through here (so segments and nested media
-    playlists inherit those headers + CORS), and adds Access-Control-Allow-Origin so the https
-    receiver can fetch this http LAN endpoint."""
+def _proxy_playlist_note(text):
+    """Secret-free one-line description of a playlist the proxy served, to diagnose why a receiver
+    rejects a load (media vs master, low-latency parts, fragmented-MP4, codecs, encryption). No URIs are
+    included, so no signed query strings reach the log."""
+    bits = ["master" if "#EXT-X-STREAM-INF" in text else "media"]
+    if bits[0] == "master":
+        codecs = re.findall(r'CODECS="([^"]+)"', text)
+        if codecs:
+            bits.append("codecs=" + ",".join(sorted({c.strip() for cs in codecs for c in cs.split(",")}))[:48])
+    else:
+        bits.append(f"segs={text.count('#EXTINF')}")
+    if "#EXT-X-PART" in text or "#EXT-X-PRELOAD-HINT" in text:
+        bits.append("LL")
+    if "#EXT-X-MAP" in text:
+        bits.append("fMP4")
+    km = re.search(r"#EXT-X-KEY:[^\n]*METHOD=([A-Z0-9-]+)", text)
+    if km:
+        bits.append("enc=" + km.group(1))
+    if "#EXT-X-ENDLIST" in text:
+        bits.append("VOD")
+    return " ".join(bits)
+
+
+def _ll_fetch_url(source, req_path):
+    """Build the origin URL for a low-latency playlist request: keep the source's own query (token) but
+    drop any stale _HLS_msn/_HLS_part/_HLS_skip baked into it, and append only the receiver's current ones
+    (from req_path). Duplicate _HLS_msn makes the origin replay the sniffed sequence and the stream stalls."""
+    base, _, sq = source.partition("?")
+    keep = "&".join(kv for kv in sq.split("&") if kv and not kv.split("=", 1)[0].startswith("_HLS_"))
+    fwd = ""
+    if "?" in req_path:
+        fwd = "&".join(kv for kv in req_path.split("?", 1)[1].split("&") if kv.split("=", 1)[0].startswith("_HLS_"))
+    q = "&".join(x for x in (keep, fwd) if x)
+    return base + ("?" + q if q else "")
+
+
+def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
+    """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
+    requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
+    endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
+    nested playlists inherit those headers + CORS); 'file' streams a direct media file at /live.<ext>
+    and forwards byte-range requests so the receiver can seek."""
     HDRS = dict(hdr_map or {})
     HDRS.setdefault("User-Agent", "Mozilla/5.0")
+    # Mimic a browser's in-player fetch. Some CDNs hotlink-protect their segments by requiring the
+    # Sec-Fetch-* headers a real player request carries (they 403/decoy anything that looks like a
+    # non-browser fetch), even with no token or cookie. Sec-Fetch-Site must MATCH what a browser sends:
+    # same-origin when the player and the media share a host, else cross-site (a mismatched value can trip
+    # the check). Derive it from the sniffed Referer vs the media host; default same-origin when there's no
+    # Referer (an in-player same-origin fetch, e.g. the player embedded on its own CDN). setdefault -> a
+    # sniffed value still wins.
+    HDRS.setdefault("Accept", "*/*")
+    _ref = next((v for k, v in HDRS.items() if k.lower() == "referer"), "")
+    _mh = urllib.parse.urlsplit(source_url).netloc
+    HDRS.setdefault("Sec-Fetch-Site",
+                    "cross-site" if (_ref and urllib.parse.urlsplit(_ref).netloc != _mh) else "same-origin")
+    HDRS.setdefault("Sec-Fetch-Mode", "cors")
+    HDRS.setdefault("Sec-Fetch-Dest", "empty")
 
     # Keep-alive session: reuse CDN connections so each segment doesn't pay a fresh TLS handshake
     # (per-segment handshakes add latency that can stall playback). Falls back to urllib if the
@@ -1019,30 +1157,74 @@ def make_hls_proxy(source_url, hdr_map, tv=""):
     try:
         import requests
         _sess = requests.Session()
+        # curl_cffi fetches with a real browser's TLS/HTTP2 fingerprint, which a CDN bot-check that 403s a
+        # plain HTTP client accepts. Optional dependency: when it's absent the 403 stands (no retry).
+        try:
+            from curl_cffi import requests as _cffi_requests
+            _cffi_sess = _cffi_requests.Session()
+        except Exception:
+            _cffi_sess = None
 
         class _Resp:
-            def __init__(self, r): self.headers = r.headers; self._r = r; self._it = None
+            # .read() over iter_content (curl_cffi exposes the streamed body only there, not via .content):
+            # read(-1) drains the whole body, read(n>=0) yields the next chunk.
+            def __init__(self, r): self.headers = r.headers; self._it = r.iter_content(chunk_size=65536)
             def read(self, n=-1):
                 if n is None or n < 0:
-                    return self._r.content
-                if self._it is None:
-                    self._it = self._r.iter_content(chunk_size=65536)
+                    return b"".join(self._it)
                 try:
                     return next(self._it)
                 except StopIteration:
                     return b""
 
+        # Headers the browser impersonation sets itself to match its fingerprint - our sniffed values would
+        # desync it, so on the retry keep only the request-specific ones (Referer/Origin/Cookie/...).
+        _IMPERSONATE_OWNS = ("user-agent", "accept", "accept-encoding", "accept-language",
+                             "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest")
+
         def _fetch(url, timeout=10):
             r = _sess.get(url, headers=HDRS, stream=True, timeout=timeout)
+            if r.status_code == 403 and _cffi_sess is not None:
+                r.close()
+                hdrs = {k: v for k, v in HDRS.items() if k.lower() not in _IMPERSONATE_OWNS}
+                r = _cffi_sess.get(url, headers=hdrs, stream=True, timeout=timeout, impersonate="chrome")
             if r.status_code >= 400:
                 code = r.status_code; r.close(); raise _UpstreamError(code)
             return _Resp(r)
+
+        def _fetch_ranged(url, range_hdr, timeout=15):
+            h = dict(HDRS)
+            if range_hdr:
+                h["Range"] = range_hdr
+            r = _sess.get(url, headers=h, stream=True, timeout=timeout)
+            if r.status_code == 403 and _cffi_sess is not None:
+                r.close()
+                ch = {k: v for k, v in h.items() if k.lower() not in _IMPERSONATE_OWNS}
+                r = _cffi_sess.get(url, headers=ch, stream=True, timeout=timeout, impersonate="chrome")
+            return r.status_code, r.headers, r.iter_content(65536)
     except ImportError:
         def _fetch(url, timeout=10):
             try:
                 return urllib.request.urlopen(urllib.request.Request(url, headers=HDRS), timeout=timeout)
             except urllib.error.HTTPError as e:
                 raise _UpstreamError(e.code)
+
+        def _fetch_ranged(url, range_hdr, timeout=15):
+            h = dict(HDRS)
+            if range_hdr:
+                h["Range"] = range_hdr
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+                status = r.getcode() or 200
+            except urllib.error.HTTPError as e:
+                status, r = e.code, e
+            def _it():
+                while True:
+                    c = r.read(65536)
+                    if not c:
+                        break
+                    yield c
+            return status, r.headers, _it()
 
     def _rewrite(text, base):
         # point every URL (segment, variant, key, map) at /p?u=<absolute> so it stays proxied
@@ -1061,7 +1243,13 @@ def make_hls_proxy(source_url, hdr_map, tv=""):
             out.append("/p?u=" + urllib.parse.quote(au, safe=""))
         return "\n".join(out) + "\n"
 
-    dbg = {"m3u8": False, "seg": False, "refused": False}   # log the first of each event only once
+    def _qparam(path, key):
+        """Every value for a query key, unquoted without parse_qs's +->space rule - a proxied segment url
+        can carry a literal '+' in a base64 signature that '+'->space would corrupt into a 404."""
+        qs = path.split("?", 1)[1] if "?" in path else ""
+        return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
+
+    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0}   # log the first of each event only once
 
     class HlsProxy(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1088,31 +1276,72 @@ def make_hls_proxy(source_url, hdr_map, tv=""):
                     log(f"proxy: REFUSED {self.client_address[0]} (cast target is {tv}): client can't reach the stream")
                 self.send_error(403); return
             p = self.path.split("?", 1)[0]
+            res_tail = p                      # what we're serving, for an upstream-error log
             try:
+                if media_kind == "file":
+                    # Direct media file: forward the receiver's Range so it can seek; relay the ranging
+                    # headers (status 206 + Content-Range) the player needs.
+                    status, uh, body_it = _fetch_ranged(source_url, self.headers.get("Range"))
+                    ct = uh.get("Content-Type") or ("video/webm" if p.endswith(".webm") else "video/mp4")
+                    extra = [("Accept-Ranges", "bytes")]
+                    crange, clen = uh.get("Content-Range"), uh.get("Content-Length")
+                    if crange:
+                        extra.append(("Content-Range", crange))
+                    if clen is not None:
+                        extra.append(("Content-Length", clen))
+                    else:
+                        extra.append(("Connection", "close"))
+                    if not dbg["seg"]:
+                        dbg["seg"] = True
+                        log(f"proxy: receiver fetching direct file (status {status}, client {self.client_address[0]})")
+                    self.send_response(status)
+                    self.send_header("Content-Type", ct)
+                    self._cors(extra); self.end_headers()
+                    for chunk in body_it:
+                        if chunk:
+                            self.wfile.write(chunk)
+                    return
                 if p == "/live.m3u8":
-                    r = _fetch(source_url)
+                    # Forward only the receiver's blocking-reload params, dropping the source's stale ones
+                    # (see _ll_fetch_url). The rewrite base stays source_url.
+                    r = _fetch(_ll_fetch_url(source_url, self.path))
                     text = r.read().decode("utf-8", "replace")
                     if not dbg["m3u8"]:
                         dbg["m3u8"] = True
-                        log(f"proxy: receiver fetched /live.m3u8 (client {self.client_address[0]})")
+                        log(f"proxy: receiver fetched /live.m3u8 [{_proxy_playlist_note(text)}] (client {self.client_address[0]})")
                     self._serve_m3u8(text, source_url)
                     return
                 if p == "/p":
                     if not dbg["seg"]:
                         dbg["seg"] = True
                         log("proxy: receiver fetched first segment/sub-playlist")
-                    q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-                    u = (q.get("u") or [""])[0]
+                    u = (_qparam(self.path, "u") or [""])[0]
                     if not u:
                         self.send_error(400); return
-                    r = _fetch(u)
+                    res_tail = _redact_url(u).rsplit("/", 1)[-1] or p
+                    is_pl = u.split("?")[0].endswith(".m3u8")
+                    r = _fetch(_ll_fetch_url(u, self.path) if is_pl else u)   # forward blocking-reload for a nested LL chunklist
                     ctype = r.headers.get("Content-Type", "")
-                    if u.split("?")[0].endswith(".m3u8") or "mpegurl" in ctype:
+                    if is_pl or "mpegurl" in ctype:
                         self._serve_m3u8(r.read().decode("utf-8", "replace"), u)
                         return
+                    first = r.read(65536)
+                    # A segment hidden behind a non-media Content-Type (some sites serve fMP4/TS as
+                    # text/html to dodge adblock/CDN filters) -> label it from its own bytes so the
+                    # receiver's player accepts it (fMP4 starts with an MP4 box; TS with a 0x47 sync byte).
+                    ct = ctype
+                    if (not ct) or "text/html" in ct or "octet-stream" in ct:
+                        if first[4:8] in (b"ftyp", b"styp", b"moof", b"moov", b"sidx", b"mdat"):
+                            ct = "video/mp4"
+                        elif first[:1] == b"\x47":
+                            ct = "video/mp2t"
+                        else:
+                            ct = ct or "video/mp2t"
                     self.send_response(200)
-                    self.send_header("Content-Type", ctype or "video/mp2t")
+                    self.send_header("Content-Type", ct)
                     self._cors([("Connection", "close")]); self.end_headers()
+                    if first:
+                        self.wfile.write(first)
                     while True:
                         chunk = r.read(65536)
                         if not chunk:
@@ -1121,6 +1350,18 @@ def make_hls_proxy(source_url, hdr_map, tv=""):
                     return
                 self.send_error(404)
             except _UpstreamError as e:
+                if dbg["err"] < 4:               # the CDN rejected a segment/playlist -> the receiver can't play it
+                    dbg["err"] += 1
+                    log(f"proxy: upstream {e.code} for {res_tail}")
+                if p == "/live.m3u8" and e.code in (403, 404, 410):
+                    # the MAIN source is gone (a signed url that expired) - flag it so the control server's
+                    # /status can tell the popup the stream expired and to reload the page. A per-segment
+                    # error (the /p path) isn't fatal, so only flag /live.m3u8.
+                    try:
+                        with open(PROXY_ERR_FILE, "w", encoding="utf-8") as _ef:
+                            json.dump({"code": e.code, "ts": time.time()}, _ef)
+                    except Exception:
+                        pass
                 try: self.send_error(e.code)     # propagate the CDN's 404/etc so the player retries correctly
                 except Exception: pass
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -1214,6 +1455,36 @@ def discover_cast_devices(timeout=2.0):
     return list(found.values())
 
 
+CAST_HOSTS_FILE = os.path.join(TOKEN_DIR, "cast-hosts.json")   # hosts confirmed as Cast devices (persisted)
+_known_cast_hosts = None
+
+
+def _cast_hosts():
+    """Hosts known to be Cast devices. A TV's Cast port sleeps in standby, so once a host is seen answering
+    Cast it's remembered (persisted across restarts) and kept on the Cast path rather than demoted to the
+    DLNA player, which can't run the branded receiver."""
+    global _known_cast_hosts
+    if _known_cast_hosts is None:
+        try:
+            with open(CAST_HOSTS_FILE, encoding="utf-8") as f:
+                _known_cast_hosts = set(json.load(f))
+        except Exception:
+            _known_cast_hosts = set()
+    return _known_cast_hosts
+
+
+def _remember_cast_host(host):
+    hosts = _cast_hosts()
+    if host and host not in hosts:
+        hosts.add(host)
+        try:
+            os.makedirs(TOKEN_DIR, exist_ok=True)
+            with open(CAST_HOSTS_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(hosts), f)
+        except Exception:
+            pass
+
+
 def discover_all_devices():
     """DLNA (SSDP) + Cast (mDNS) renderers, discovered in parallel and merged. If one physical
     device exposes BOTH protocols (e.g. an Android TV or a modern TV with Chromecast built-in), keep
@@ -1245,6 +1516,22 @@ def discover_all_devices():
         if take:
             by_host[h] = d
     devs = list(by_host.values()) + extras
+    # A TV with Chromecast built-in advertises Cast (mDNS) unreliably and its Cast port sleeps in standby,
+    # so a Cast device can surface over DLNA only. Drive any host known to be a Cast device over Cast (the
+    # branded receiver) regardless - a port that answers now confirms and remembers it; DLNA can't run the
+    # branded receiver, and when the port is asleep the cast reports "turn the TV on" instead of failing
+    # silently on DLNA. pychromecast connects by host:port and fetches the uuid/model itself.
+    if not prefer_dlna:
+        for d in devs:
+            if d.get("kind") == "cast" and d.get("host"):
+                _remember_cast_host(d["host"])
+        known = _cast_hosts()
+        for d in devs:
+            if d.get("kind") == "dlna" and d.get("host") and \
+               (d["host"] in known or _tcp_open(d["host"], 8009, timeout=1.5)):
+                log(f"discover: {d.get('name', d['host'])} is a Cast device -> using Cast over DLNA")
+                d["kind"] = "cast"; d["port"] = 8009
+                _remember_cast_host(d["host"])
     devs.sort(key=lambda d: d["name"].lower())
     return devs
 
@@ -1330,7 +1617,8 @@ def serve_control(port):
     else:
         clear_cast_state()   # stale state from a proxy that already exited
 
-    def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title=""):
+    def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
+                        src_kind="", src_vod=False, src_ll=False):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -1341,6 +1629,12 @@ def serve_control(port):
             extra += ["--quality", qy]
         if media:
             extra += ["--media-url", media]
+        if src_kind:                          # classifier's verdict -> proxy skips its own source probe
+            extra += ["--src-kind", src_kind]
+            if src_vod:
+                extra += ["--src-vod"]
+            if src_ll:
+                extra += ["--src-ll"]
         if title:
             extra += ["--title", title]      # shown on the renderer instead of the raw URL
         if kind == "cast" and cast:
@@ -1483,6 +1777,8 @@ def serve_control(port):
             q = urllib.parse.parse_qs(body)
             if u.path == "/cast":
                 self._cast(q)
+            elif u.path == "/qualities":       # POST so the page's Cookie (for reading its ladder) stays out of the URL
+                self._qualities(q)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
 
@@ -1492,13 +1788,94 @@ def serve_control(port):
             name = (q.get("name", [""])[0]).strip()        # friendly name (for status)
             title = (q.get("title", [""])[0]).strip()      # stream title (for status)
             quality = _safe_quality(q.get("quality", [""])[0])
-            media = (q.get("media", [""])[0]).strip()      # sniffed direct media URL (optional)
+            media = (q.get("media", [""])[0]).strip()      # a single sniffed media URL (fallback)
+            medias_raw = (q.get("medias", [""])[0]).strip()  # all sniffed HLS URLs (JSON): understand + cast the master
             headers = parse_replay_headers(q.get("headers", [""])[0])
+            media_probed = False
+            src_kind, src_vod, src_ll = "", False, False   # the classifier's verdict -> the proxy skips re-probing
             if not (url.startswith("http://") or url.startswith("https://")):
                 self._json({"ok": False, "error": "invalid URL: " + url[:60]})
                 return
             if media and not (media.startswith("http://") or media.startswith("https://")):
                 media = ""    # ignore a bogus media URL -> fall back to resolving the page
+            # Cast a rendition by its OWN url from the page's ladder (the extension reads it - inline, or
+            # resolved in-page - so it's freshly minted). A numeric pick -> that height; "best"/no pick ->
+            # the highest. This also avoids casting the sniffed VARIANT playlist, whose signed url some hosts
+            # make single-use (a classify probe plus the proxy fetch would then 410) - see probe_media=False.
+            # Empty (no ladder, e.g. a live cam) -> the sniffed path below still runs.
+            picked_url = ""
+            try:
+                _lad = {int(k): v for k, v in (json.loads(q.get("ladder", ["{}"])[0] or "{}")).items()}
+            except Exception:
+                _lad = {}
+            if _lad:
+                _qh = re.match(r"(\d+)", quality or "")
+                _k = int(_qh.group(1)) if _qh else max(_lad)
+                _cand = _lad.get(_k, "")
+                if isinstance(_cand, str) and _cand.startswith(("http://", "https://")):
+                    picked_url = _cand
+            if medias_raw or picked_url:
+                # General path: understand the sniffed HLS stream from its content and cast a media
+                # (variant) playlist. When a quality was picked, try that quality's own url first, and fall
+                # back to the sniffed (playing) quality if it can't be cast - so a stale/unavailable pick
+                # never breaks casting.
+                try:
+                    medias = json.loads(medias_raw) if medias_raw else []
+                except Exception:
+                    medias = []
+                medias = [m for m in medias if isinstance(m, str)] if isinstance(medias, list) else []
+                hmap = _headers_list_to_map(headers)
+                model = None
+                if picked_url:
+                    cand = _classify_stream([picked_url], hmap, probe_media=False)   # picked quality's own stream
+                    if cand["source"] and cand["castable"]:
+                        model = cand
+                        log(f"control: quality {quality} -> its own stream")
+                if model is None and medias:
+                    model = _classify_stream(medias, hmap)          # fallback: the sniffed (playing) quality
+                if model is not None:
+                    if not model["source"] or not model["castable"]:
+                        reason = model["reason"] or "unplayable"
+                        log(f"control: cast rejected ({reason}) {_redact_url(model['source'])[:70]}")
+                        _emsg = {"obfuscated": "this server hides the video inside images - try another server",
+                                 "drm": "this stream is DRM-protected"}
+                        self._json({"ok": False, "reason": reason,
+                                    "error": _emsg.get(reason, f"stream not castable ({reason})")})
+                        return
+                    # Cast the MEDIA (variant) playlist, not the master. The receiver plays a bare media
+                    # playlist reliably but fails to load a proxied master, even a single-variant one. The
+                    # signed URLs are TTL-based (re-fetchable within the window), so casting the variant
+                    # directly is safe. Pick the requested quality (or the highest); a live stream keeps its
+                    # fresh chunklist below.
+                    vs = model["variants"]
+                    pick = next((v for v in vs if v["quality"] == quality), None) or (vs[0] if vs else None)
+                    media = pick["url"] if pick else model["source"]
+                    # A rendition taller than the TV's H.264 decoder cap (_H264_MAXH, ~1088) won't decode -
+                    # a portrait / very-tall video hits this. Drop to the tallest rendition that fits. The
+                    # page ladder is keyed by height, so pick the highest entry <= the cap and cast it.
+                    if pick and pick.get("height", 0) > _H264_MAXH and pick.get("vcodec", "") in ("h264", ""):
+                        try:
+                            _lad = {int(k): u for k, u in (json.loads(q.get("ladder", ["{}"])[0] or "{}")).items()}
+                        except Exception:
+                            _lad = {}
+                        _fit = max((k for k in _lad if k <= _H264_MAXH and isinstance(_lad[k], str)
+                                    and _lad[k].startswith(("http://", "https://"))), default=None)
+                        if _fit is not None:
+                            _alt = _classify_stream([_lad[_fit]], hmap, probe_media=False)
+                            if _alt.get("source") and _alt.get("castable") and _alt.get("variants"):
+                                model, pick = _alt, _alt["variants"][0]
+                                media = pick["url"]
+                                log(f"control: rendition too tall for the decoder -> {pick.get('height', 0)}p")
+                    media_probed = True
+                    # a LIVE stream: cast the fresh media the classifier chose, not a stale/wrong/AV1 variant
+                    if model["live"] and model["source"]:
+                        media = model["source"]
+                    # The classifier already fetched + understood the source (HLS, live/VOD, low-latency),
+                    # so hand the verdict to the proxy: it can skip re-fetching to re-probe (a slow, and on
+                    # single-use hosts wasteful, second look at the same URL before the TV even loads).
+                    src_kind = "hls"
+                    src_vod = not model["live"]
+                    src_ll = model["low_latency"]
             # ignore an in-flight proxy during a Stop window: it's being torn down, so a re-cast
             # should start a fresh one rather than be told it's "already" casting (empty target).
             if proxy_alive() and time.time() >= stopping["until"]:
@@ -1506,15 +1883,19 @@ def serve_control(port):
                     snap = {k: state[k] for k in _CAST_SNAP_FIELDS}
                 self._json({"ok": True, "already": True, **snap})
                 return
-            if media:
-                # pre-flight a sniffed source so a DRM/offline stream fails fast with a clear
-                # message instead of launching a cast that leaves the TV black. Headers (Cookie)
+            if media and not media_probed:
+                # single sniffed URL (older extension / a direct file): pre-flight it so a DRM/offline
+                # stream fails fast with a clear message instead of leaving the TV black. Headers (Cookie)
                 # reach the probe via a private 0600 --config file, not argv.
                 cfg = _write_header_config(headers)
                 try:
                     ok, reason, detail = probe_stream(_proto_target(media), cfg)
                 finally:
                     _safe_unlink(cfg)
+                if not ok and reason == "unplayable" and _source_reachable(media, headers):
+                    # streamlink's resolver can't open some CDN media playlists (fragmented-MP4, a
+                    # .mp4/ path) that the cast's own reverse-proxy serves fine -> trust the proxy.
+                    ok, reason, detail = True, "", ""
                 if not ok:
                     log(f"control: probe rejected ({reason}) {_redact_url(media)[:80]} -> {detail[:120]}")
                     self._json({"ok": False, "reason": reason, "error": detail})
@@ -1531,13 +1912,15 @@ def serve_control(port):
             if kind == "cast":
                 cinfo = {"port": (dev or {}).get("port", 8009), "uuid": (dev or {}).get("uuid", ""),
                          "name": (dev or {}).get("name", name), "model": (dev or {}).get("model", "")}
-            extra = build_cast_args(url, device, quality, media, kind, cinfo, title)
+            extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
+                                    src_kind, src_vod, src_ll)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
                     already = {k: state[k] for k in _CAST_SNAP_FIELDS}
                 else:
                     stopping["until"] = 0  # a fresh cast cancels any pending stop-suppression
+                    _safe_unlink(PROXY_ERR_FILE)         # clear a stale expired-source flag from a prior cast
                     _spawn_proxy(extra, headers)        # kill old (if any) + launch + record pid
                     epoch["n"] += 1
                     this_epoch = epoch["n"]
@@ -1568,8 +1951,50 @@ def serve_control(port):
 
         def _qualities(self, q):
             qurl = (q.get("url", [""])[0]).strip()
+            raw_h = (q.get("h", [""])[0]).strip()          # sniffed source: list the master playlist's variants
+            raw_urls = (q.get("urls", [""])[0]).strip()    # all HLS URLs the tab sniffed (the master is often one)
+            if raw_h or raw_urls:
+                try:
+                    hmap = json.loads(raw_h) if raw_h else {}
+                except Exception:
+                    hmap = {}
+                if not isinstance(hmap, dict):
+                    hmap = {}
+                try:
+                    urls = json.loads(raw_urls) if raw_urls else []
+                except Exception:
+                    urls = []
+                urls = [u for u in urls if isinstance(u, str)] if isinstance(urls, list) else []
+                if not urls and qurl:
+                    urls = [qurl]
+                log("qualities: names=" + ", ".join(u.split("?")[0].rsplit("/", 1)[-1][:44] for u in urls[:24]))
+                # A watch page can inline its whole rendition ladder ({height:url}); only the playing quality
+                # is ever sniffed, so when the page supplied that ladder it is the authoritative list. Prefer
+                # it and skip probing for a master: guessing/fetching master URLs the host doesn't serve is
+                # wasted, slow work once the page has already told us every quality. A live cam room inlines
+                # no ladder, so it still resolves the sniffed master for its variants.
+                raw_lad = (q.get("ladder", [""])[0]).strip()
+                try:
+                    ladder = {int(k): v for k, v in (json.loads(raw_lad) or {}).items()} if raw_lad else {}
+                except Exception:
+                    ladder = {}
+                by_h, vs = {}, []                          # height -> label, richest label kept
+                if not ladder:
+                    _mu, vs, _t = _resolve_sniffed_master(urls, hmap)
+                    for v in vs:
+                        mm = re.match(r"(\d+)", v["quality"])
+                        if mm:
+                            by_h[int(mm.group(1))] = v["quality"]
+                for hgt in ladder:
+                    by_h.setdefault(hgt, f"{hgt}p")
+                quals = [by_h[hgt] for hgt in sorted(by_h, reverse=True)] or [v["quality"] for v in vs]
+                log(f"qualities: sniffed n={len(urls)} hdrs={list(hmap)} -> {len(vs)}"
+                    + (f" +page{sorted(ladder, reverse=True)}" if ladder else "")
+                    + f" [ldiag={(q.get('ldiag', [''])[0])[:130]}]")
+                self._json({"ok": True, "qualities": quals, "matrix": []})
+                return
             m = stream_meta(qurl) if qurl else {"qualities": []}
-            self._json({"ok": True, "qualities": m.get("qualities", [])})
+            self._json({"ok": True, "qualities": m.get("qualities", []), "matrix": m.get("matrix", [])})
 
         def _relaunch_locked(self, **changes):
             """Apply state changes and re-cast the current stream (caller holds _state_lock).
@@ -1600,6 +2025,7 @@ def serve_control(port):
             self._json(resp)
 
         def _stop(self, q):
+            _safe_unlink(PROXY_ERR_FILE)   # the cast is over: clear any expired-source flag so /status stops reporting it
             with _state_lock:
                 dev = state.get("device") or ""               # the casting TV, capture before clearing
                 kind = state.get("kind", "dlna")
@@ -1656,7 +2082,17 @@ def serve_control(port):
                         state.update(_empty_cast_state())
                         clear_cast_state()
                     snap = {k: state[k] for k in _CAST_SNAP_FIELDS}
-            self._json({"ok": True, "casting": alive, **snap})
+            # a fatal proxy error (the source url expired: 410/403) written by the running proxy: surface it
+            # so the popup can tell the user the stream expired and to reload the page.
+            perror = None
+            try:
+                with open(PROXY_ERR_FILE, encoding="utf-8") as _ef:
+                    _pe = json.load(_ef)
+                if time.time() - _pe.get("ts", 0) < 90:
+                    perror = _pe.get("code", 410)
+            except Exception:
+                pass
+            self._json({"ok": True, "casting": alive, **snap, **({"perror": perror} if perror else {})})
 
         def _ping(self, q):
             self._json({"ok": True, "pong": True, "version": HELPER_VERSION})
@@ -1744,12 +2180,533 @@ def _resolve_hls_url(page_url, quality, hdr_map):
             _safe_unlink(cfg)
 
 
+def _hls_is_vod(url, hdr_map):
+    """True if the HLS at url is a finite VOD (it carries #EXT-X-ENDLIST or #EXT-X-PLAYLIST-TYPE:VOD),
+    so it can be cast as a seekable BUFFERED stream instead of LIVE. Follows one master -> variant hop
+    to reach the media playlist. Returns False on any error or when it can't tell, so a live stream is
+    never wrongly marked seekable."""
+    def _peek(u):
+        h = dict(hdr_map or {}); h.setdefault("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=6) as r:
+            return r.read(3_000_000).decode("utf-8", "replace")   # keep original case: signed URLs are case-sensitive
+    def _has_endlist(text):
+        t = text.lower()
+        return "#ext-x-endlist" in t or "#ext-x-playlist-type:vod" in t
+    try:
+        text = _peek(url)
+        if _has_endlist(text):
+            return True
+        if "#ext-x-stream-inf" in text.lower():        # master playlist: the ENDLIST is in the variant
+            for ln in text.splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    return _has_endlist(_peek(urllib.parse.urljoin(url, ln)))   # ln keeps its original case
+        return False
+    except Exception:
+        return False
+
+
+def _fetch_playlist(url, hdr_map, timeout=8):
+    """GET an .m3u8 with the sniffed headers; return its body text, or None on any error (logging the
+    HTTP status so a wrong guessed name (404) reads differently from a signature-locked one (403))."""
+    try:
+        h = dict(hdr_map or {}); h.setdefault("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+            return r.read(2_000_000).decode("utf-8", "replace")
+    except Exception as e:
+        code = getattr(e, "code", None)
+        log(f"variants: fetch {url.split('?')[0][-52:]} -> {('HTTP ' + str(code)) if code else type(e).__name__}")
+        return None
+
+
+def _page_hls_ladder(page_url, hdr_map):
+    """Some players inline the whole quality ladder in the watch-page HTML - a JSON list of {quality, url}
+    HLS renditions - before the player fetches any single one, so the sniffer only ever sees the playing
+    quality's playlist and the menu looks empty/thin. Fetch the page with the page's own headers and read
+    those already-signed per-quality master URLs so the menu is complete. Returns {height:int -> url},
+    header-authenticated and bounded; empty on any failure (never raises)."""
+    if not (page_url or "").startswith(("http://", "https://")):
+        return {}
+    try:
+        h = dict(hdr_map or {}); h.setdefault("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(urllib.request.Request(page_url, headers=h), timeout=6) as r:
+            html = r.read(2_000_000).decode("utf-8", "replace")
+    except Exception:
+        return {}
+    if ".m3u8" not in html:
+        return {}
+    ladder = {}
+    for o in re.findall(r'\{(?:[^{}]|"[^"]*")*\}', html):        # each flat JSON object in the page
+        if ".m3u8" not in o:
+            continue
+        qm = re.search(r'"(?:quality|label|res|height)"\s*:\s*"?(\d{3,4})p?"?', o)
+        um = re.search(r'"(?:videoUrl|url|src|file|manifest)"\s*:\s*"([^"]*\.m3u8[^"]*)"', o)
+        if not (qm and um):
+            continue
+        hgt = int(qm.group(1))
+        if not (100 <= hgt <= 4320):
+            continue
+        try:
+            u = json.loads('"' + um.group(1) + '"')             # unescape the JS string (\/ etc.) safely
+        except Exception:
+            u = um.group(1).replace("\\/", "/")
+        ladder[hgt] = u
+    return ladder
+
+
+def _codec_family(codecs):
+    """Coarse video-codec family from an HLS/DASH CODECS string, for compatibility decisions
+    ('' if none/audio-only)."""
+    c = (codecs or "").lower()
+    if "avc1" in c or "avc3" in c or "h264" in c:
+        return "h264"
+    if "hvc1" in c or "hev1" in c or "hevc" in c or "h265" in c:
+        return "hevc"
+    if "vp09" in c or "vp9" in c:
+        return "vp9"
+    if "av01" in c:
+        return "av1"
+    if "vp08" in c or "vp8" in c:
+        return "vp8"
+    return "other" if any(t and not t.startswith("mp4a") and not t.startswith("ec-3") and not t.startswith("ac-3")
+                          for t in c.split(",")) else ""
+
+
+# H.264 first: the one video codec every Cast receiver decodes. When a master offers a resolution in
+# several codecs, the most broadly castable is picked so the default plays anywhere; a receiver that
+# reports wider support (see stream capabilities) can override this later.
+_VCODEC_ORDER = {"h264": 4, "av1": 3, "hevc": 2, "vp9": 1, "vp8": 1}
+
+# Max frame height a TV's H.264 decoder handles. ~1088 (1920x1088) is the near-universal cap regardless of
+# panel size - 4K/8K TVs still decode H.264 only to ~1080p (they use HEVC/AV1 above that). A taller H.264
+# rendition (a portrait / very-tall video) is auto-dropped to the tallest that fits. Overridable for the
+# rare TV whose H.264 decoder genuinely does 4K (SLC_H264_MAXH=2160).
+try:
+    _H264_MAXH = int(os.environ.get("SLC_H264_MAXH", "1088") or 1088)
+except ValueError:
+    _H264_MAXH = 1088
+
+
+def _parse_master_variants(url, text):
+    """Video variants ([{quality, url, height, bw, codecs, vcodec}] highest-first, one per resolution) of
+    an HLS master playlist body. [] if it carries no #EXT-X-STREAM-INF with a RESOLUTION (i.e. it is a
+    media playlist, not a master). When a resolution is offered in several codecs the most broadly
+    castable (H.264) is kept. Variant URIs are resolved against url."""
+    lines = text.splitlines()
+    out = []
+    for i, ln in enumerate(lines):
+        if not ln.startswith("#EXT-X-STREAM-INF"):
+            continue
+        mres = re.search(r"RESOLUTION=\d+x(\d+)", ln)
+        if not mres:
+            continue                                     # audio-only / no resolution -> not a pickable quality
+        mfps = re.search(r"FRAME-RATE=([\d.]+)", ln)
+        mbw = re.search(r"BANDWIDTH=(\d+)", ln)
+        mcod = re.search(r'CODECS="([^"]+)"', ln)
+        uri = next((s.strip() for s in lines[i + 1:] if s.strip() and not s.strip().startswith("#")), "")
+        if not uri:
+            continue
+        height = int(mres.group(1)); fps = int(round(float(mfps.group(1)))) if mfps else 0
+        codecs = mcod.group(1) if mcod else ""
+        out.append({"quality": f"{height}p" + (str(fps) if fps > 30 else ""),
+                    "url": urllib.parse.urljoin(url, uri), "height": height,
+                    "bw": int(mbw.group(1)) if mbw else 0,
+                    "codecs": codecs, "vcodec": _codec_family(codecs)})
+    best = {}
+    for v in out:
+        cur = best.get(v["quality"])
+        key = (_VCODEC_ORDER.get(v["vcodec"], 0), v["bw"])
+        if cur is None or key > (_VCODEC_ORDER.get(cur["vcodec"], 0), cur["bw"]):
+            best[v["quality"]] = v
+    return sorted(best.values(), key=lambda v: (v["height"], v["bw"]), reverse=True)
+
+
+_MASTER_NAMES = ("index.m3u8", "master.m3u8", "playlist.m3u8")
+
+
+def _master_url_candidates(url):
+    """Sibling- and parent-directory master-playlist URLs to try when a sniffed HLS URL is a media
+    (variant) playlist. A player fetches the master once then rides a variant, so the sniffer usually
+    captures the variant while the master sits beside it or one directory up (some hosts give each
+    rendition its own subdirectory under a shared master). Renditions are commonly named by suffixing the
+    master stem with '-'-joined tags (e.g. index-f3-v1-a1, hls-1080p-<hash>), so progressively dropping
+    trailing '-' groups recovers stem candidates; the conventional index/master/playlist names are also
+    tried, in the same directory first and then the parent. The query string is preserved (hosts sign the
+    whole URL), the sniffed URL itself is excluded, and the list is bounded. Highest-priority first."""
+    sp = urllib.parse.urlsplit(url)
+    # Keep the auth token the host signs into the query, but drop the low-latency blocking-reload params
+    # (_HLS_msn/_HLS_part/_HLS_skip): a master playlist has no parts, so a chunklist's _HLS_ query makes
+    # the host reject the derived master URL.
+    cq = "&".join(kv for kv in sp.query.split("&") if kv and not kv.split("=", 1)[0].lower().startswith("_hls_"))
+    base, _, fname = sp.path.rpartition("/")
+    stem = fname[:-5] if fname.endswith(".m3u8") else fname
+    parts = stem.split("-")
+    stems = [f"{'-'.join(parts[:i])}.m3u8" for i in range(1, len(parts))][:3]   # drop trailing '-' groups
+    mc = re.match(r"chunklist_.*_([a-z]+)$", stem)   # chunklist_N_video_<n>_llhls -> llhls.m3u8 (LL master)
+    if mc:
+        stems.insert(0, mc.group(1) + ".m3u8")
+    dirs = [(base, stems + list(_MASTER_NAMES))]
+    parent = base.rpartition("/")[0]
+    if parent and parent != base:
+        # a rendition can live in its own subdirectory: try the shared master by the conventional names
+        # and by the sniffed file's own name one level up (some packagers reuse the manifest filename).
+        dirs.append((parent, [fname] + [n for n in _MASTER_NAMES if n != fname]))
+    out, seen = [], set()
+    for d, names in dirs:
+        for nm in names:
+            p = f"{d}/{nm}"
+            if p == sp.path or p in seen:                # skip the sniffed URL itself / duplicates
+                continue
+            seen.add(p)
+            out.append(urllib.parse.urlunsplit((sp.scheme, sp.netloc, p, cq, "")))
+    return out[:8]
+
+
+def _playlist_shape(text):
+    """A short, secret-free descriptor of a playlist that didn't parse as a master, for diagnosing a new
+    host from the log. Only #EXT-X-STREAM-INF attribute lines are surfaced; segment/variant URI lines
+    (which carry signed query strings) are never logged."""
+    if not text:
+        return ""
+    if "#EXTM3U" not in text[:64]:
+        return " [not m3u8]"
+    infs = [ln.strip()[18:][:80] for ln in text.splitlines() if ln.startswith("#EXT-X-STREAM-INF")]
+    if infs:
+        return f" [STREAM-INF x{len(infs)}: {' | '.join(infs[:3])}]"
+    if "#EXTINF" in text:
+        return " [media playlist]"
+    return " [no STREAM-INF]"
+
+
+def _headers_list_to_map(headers):
+    """['Referer=...', 'Cookie=...'] (the replay list) -> {'Referer': '...', ...} for a fetch. The first
+    '=' splits, so a value that itself contains '=' (a signed URL) is preserved."""
+    out = {}
+    for h in (headers or []):
+        name, sep, value = h.partition("=")
+        if sep and name:
+            out[name] = value
+    return out
+
+
+def _resolve_sniffed_master(urls, hdr_map):
+    """From the HLS URLs a tab sniffed (newest-first), return (master_url, variants): the URL that is (or
+    leads to) the multi-quality master and its video variants, highest-first. A player fetches the master
+    once then rides a variant, and separate audio/video tracks or low-latency live playback only work when
+    the *master* is cast (so the receiver pairs the tracks and adapts) - yet the sniffer usually reports a
+    variant. So this tries each sniffed URL as a master, then falls back to guessing sibling/parent master
+    URLs from the newest one (see _master_url_candidates), keeping the richest. Returns (newest_url, []) if
+    nothing lists variants. Fetches are time-bounded so an unresponsive host can't stall the caller. Uses
+    the sniffed Referer/Origin the host requires. Returns (master_url, variants, playlist_text): the body
+    is the master's (or the newest sniffed body when no master was found) so a caller can classify it
+    without re-fetching."""
+    urls = [u for u in (urls or []) if u and u.startswith(("http://", "https://"))]
+    if not urls:
+        return "", [], None
+    seen, best_url, best, best_text, first_text = set(), urls[0], [], None, None
+    merged = {}                                          # quality -> variant, unioned across every master
+    deadline = time.monotonic() + 7
+    # A live stream sniffs a dozen media chunklists but usually no master. A chunklist/segment is very
+    # unlikely to BE a master, so probing them first only burns the time budget before the derived
+    # sibling/parent guesses (where a live master like llhls.m3u8 actually is) are reached. Probe the
+    # plausible masters (non-chunklist sniffed URLs) and the derived guesses first, but DEFER the
+    # chunklist-named URLs to the end rather than dropping them, so an unconventionally chunklist-named
+    # master is still tried within the deadline when nothing better was found.
+    def _worth_probing(u):
+        f = u.split("?")[0].rsplit("/", 1)[-1].lower()
+        return not (f.startswith("chunklist") or f.endswith((".ts", ".m4s", ".aac", ".mp4")))
+    likely = [u for u in urls if _worth_probing(u)]
+    deferred = [u for u in urls if not _worth_probing(u)]
+
+    def _probe(seq):
+        nonlocal best_url, best, best_text, first_text
+        for u in seq:
+            if time.monotonic() >= deadline:
+                return True                              # out of the time budget -> stop
+            if u in seen:
+                continue
+            seen.add(u)
+            text = _fetch_playlist(u, hdr_map, timeout=3)
+            if u == urls[0]:
+                first_text = text
+            if text is None:
+                continue
+            vs = _parse_master_variants(u, text)
+            for v in vs:                                 # some hosts split qualities across per-quality masters
+                cur = merged.get(v["quality"])
+                if cur is None or (_VCODEC_ORDER.get(v["vcodec"], 0), v["bw"]) > (_VCODEC_ORDER.get(cur["vcodec"], 0), cur["bw"]):
+                    merged[v["quality"]] = v
+            if len(vs) > len(best):
+                best_url, best, best_text = u, vs, text   # the single richest master = the adaptive cast source
+            if len(best) >= 2:                            # one master already lists the full ladder; stop probing
+                return True
+        return False
+
+    # Probe the sniffed URLs first. Only derive+probe sibling/parent master candidates when NONE of the
+    # sniffed URLs is itself a master: guessing master URLs the host doesn't serve is a slow 404 walk that
+    # burns the time budget (and delays the cast) once we already hold the master. A live stream that
+    # sniffed only chunklists finds no master here, so it still falls through to the guesses + deferred.
+    done = _probe(likely)
+    if not done and not best:
+        _probe(_master_url_candidates(urls[0]) + deferred)
+    variants = sorted(merged.values(), key=lambda v: (v["height"], v["bw"]), reverse=True)
+    if variants:
+        log(f"master: {best_url.split('?')[0][-52:]} -> {len(variants)} ({', '.join(v['quality'] for v in variants)})")
+    else:
+        log(f"master: none for {urls[0].split('?')[0][-52:]}{_playlist_shape(first_text)}")
+    return best_url, variants, (best_text if best else first_text)
+
+
+def _hls_variants(url, hdr_map):
+    """Video variants (highest-first, one per resolution) of the master behind one sniffed URL, or [].
+    Convenience wrapper over _resolve_sniffed_master for callers that hold a single URL."""
+    return _resolve_sniffed_master([url], hdr_map)[1]
+
+
+def _prefer_h264_codec(url):
+    """Request H.264 in place of AV1 when a URL pins the video codec through a query param (e.g. a
+    ...codec...=av1 selector). Cast targets decode H.264 universally but AV1 only spottily, so normalise
+    to the broadly-decodable baseline rather than cast a codec the TV can't decode."""
+    return re.sub(r'([?&][^=&]*codec[^=&]*=)av1(?=&|$)', r'\g<1>h264', url, flags=re.IGNORECASE)
+
+
+def _classify_stream(urls, hdr_map, probe_media=True):
+    """Understand a sniffed HLS stream from its content, not its URL shape. Picks the media playlist to cast
+    (resolving a master to its variants first) and describes the structure the cast path and the user need.
+    Returns:
+      {source, role: 'master'|'media', variants, video_codec, container: 'ts'|'fmp4'|'?',
+       live: bool, low_latency: bool, separate_av: bool, encryption: ''|'aes-128'|'drm',
+       castable: bool, reason: ''|'drm'}
+    Reads at most one extra media playlist (for container/liveness/encryption). Header-authenticated,
+    bounded. This is the general model every delivery type is reduced to."""
+    urls = [_prefer_h264_codec(u) for u in urls]   # cast the broadly-decodable H.264 rendition, not AV1
+    master_url, variants, master_text = _resolve_sniffed_master(urls, hdr_map)
+    # With a real master use it; with no master cast a bare media playlist - but prefer a video/muxed one
+    # over a separate audio-only rendition (a live stream splits video and audio into their own chunklists,
+    # and the newest sniffed one is often the audio track, which alone plays as sound with no picture).
+    # (_resolve_sniffed_master returns urls[0] as master_url even when it found no master, so key on variants.)
+    if variants:
+        src = master_url
+    elif urls:
+        src = next((u for u in urls
+                    if "audio" not in u.split("?")[0].rsplit("/", 1)[-1].lower()), urls[0])
+    else:
+        src = ""
+    model = {"source": src, "role": "master" if variants else "media", "variants": variants,
+             "video_codec": variants[0]["vcodec"] if variants else "", "container": "?",
+             "live": True, "low_latency": False, "separate_av": False, "encryption": "",
+             "castable": bool(src), "reason": ""}
+    # A resolved master tells us the delivery shape: whether audio is a separate rendition and whether it
+    # is low-latency.
+    if master_text and variants:
+        model["separate_av"] = "#EXT-X-MEDIA:TYPE=AUDIO" in master_text
+        if "#EXT-X-PART" in master_text or "PRELOAD-HINT" in master_text:
+            model["low_latency"] = True
+    # The player rides a specific media chunklist - the freshest sniffed non-audio one, distinct from the
+    # master. Probe (and cast) that rather than a master variant: a variant URL parsed from the master can
+    # lack params the host requires on the real chunklist, making it read as VOD/unavailable when it's live.
+    fresh = ""
+    if variants:
+        fresh = next((u for u in urls
+                      if u != master_url
+                      and u.split("?")[0].endswith(".m3u8")
+                      and "audio" not in u.split("?")[0].rsplit("/", 1)[-1].lower()), "")
+    # read one media playlist: the sniffed chunklist the player rides (or the top master variant, or the
+    # source itself when it's already media). Reuse a carried-over body only when it's the media we need;
+    # otherwise fetch it (the sniffed-master resolver skips chunklists, so a bare-media source's body isn't
+    # carried through - without this the container and low-latency flags stay unknown and a live LL stream
+    # is cast without live-edge handling). Drop stale blocking-reload params so the probe fetch can't block.
+    if probe_media:
+        probe = fresh or (variants[0]["url"] if variants else src)
+        probe = re.sub(r"&_HLS_[^&]*", "", probe) if probe else probe
+        mt = master_text if (master_text and not variants) else (_fetch_playlist(probe, hdr_map, timeout=3) if probe else None)
+    else:
+        # Don't fetch the media just to classify it: its signed URL can be single-use (some hosts' per-quality
+        # variant playlist 410s on the 2nd fetch), and the proxy fetches it exactly once when it serves - so a
+        # classify probe here would burn the token and leave the proxy with a 410. This path is only for a
+        # quality picked from a video page's ladder, so it is VOD.
+        mt = master_text if (master_text and not variants) else None
+        model["live"] = False
+    if mt:
+        model["container"] = "fmp4" if ("#EXT-X-MAP" in mt or ".m4s" in mt) else ("ts" if ".ts" in mt else "?")
+        model["live"] = not ("#EXT-X-ENDLIST" in mt or "PLAYLIST-TYPE:VOD" in mt)
+        if "#EXT-X-PART" in mt or "PRELOAD-HINT" in mt:
+            model["low_latency"] = True
+        km = re.search(r"#EXT-X-KEY:[^\n]*METHOD=([A-Z0-9-]+)", mt)
+        if km:
+            meth = km.group(1).upper()
+            model["encryption"] = "drm" if meth.startswith("SAMPLE-AES") else meth.lower()
+        # Segments that are IMAGES (.image/.png/.jpg...) mean the video is steganographically hidden inside
+        # them (an anti-cast trick: the player de-embeds it in obfuscated JS). The receiver can't decode a
+        # picture, so reject with a clear reason. Normal HLS segments are .ts/.m4s/.mp4/.aac, so this never
+        # trips a real stream.
+        _segs = [ln.strip().split("?")[0].lower() for ln in mt.splitlines() if ln.strip() and not ln.startswith("#")]
+        if _segs and sum(s.endswith((".image", ".png", ".jpg", ".jpeg", ".webp", ".gif")) for s in _segs[:5]) >= min(2, len(_segs)):
+            model["castable"], model["reason"] = False, "obfuscated"
+    # For a live master stream, cast the fresh sniffed chunklist probed above rather than a master variant,
+    # which can resolve to a stale or wrong sub-stream (rolled off, or a codec the receiver can't play).
+    # fresh is only set when a master resolved, so the override applies to master streams only.
+    if model["live"] and fresh:
+        model["source"] = fresh
+    if model["encryption"] == "drm":
+        model["castable"], model["reason"] = False, "drm"
+    log(f"stream: {model['role']} {model['container']} {'live' if model['live'] else 'vod'}"
+        f"{' LL' if model['low_latency'] else ''}{' split-av' if model['separate_av'] else ''}"
+        f" vcodec={model['video_codec'] or '?'}{(' enc=' + model['encryption']) if model['encryption'] else ''}"
+        f" src={model['source'].split('?')[0].rsplit('/', 1)[-1][:44]}"
+        f" -> {'cast' if model['castable'] else 'reject:' + model['reason']}")
+    return model
+
+
+def _classify_source(url, hdr_map):
+    """Probe the cast source once. Returns (kind, is_vod, container, low_latency): kind 'file' for a direct
+    media file (served with byte-range seeking) or 'hls' for a playlist (reverse-proxied); container is the
+    extension to expose for a file ('mp4'/'webm'); low_latency marks an LL-HLS media playlist. A direct
+    file is always seekable; an HLS with #EXT-X-ENDLIST is too; a live HLS is not. Falls back to
+    ('hls', False, 'mp4', False) on any error, i.e. the current live behavior."""
+    try:
+        h = dict(hdr_map or {}); h.setdefault("User-Agent", "Mozilla/5.0")
+        h["Range"] = "bytes=0-8191"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=6) as r:
+            ct = (r.headers.get("Content-Type") or "").lower()
+            head = r.read(8192)
+    except Exception:
+        return ("hls", False, "mp4", False)
+    u = url.split("?")[0].lower()
+    if "mpegurl" in ct or u.endswith(".m3u8") or head[:7] == b"#EXTM3U":
+        # a low-latency media playlist (blocking reload / partial segments) has a short live window, so
+        # the cast must ride near the edge with a shallow buffer or Shaka can't find enough to start.
+        ll = b"CAN-BLOCK-RELOAD" in head or b"#EXT-X-PART" in head or b"PRELOAD-HINT" in head
+        return ("hls", _hls_is_vod(url, hdr_map), "mp4", ll)
+    if ct.startswith(("video/", "audio/")) or u.endswith((".mp4", ".webm", ".m4v", ".mov", ".mkv")):
+        return ("file", True, "webm" if ("webm" in ct or u.endswith(".webm")) else "mp4", False)
+    return ("hls", False, "mp4", False)
+
+
+def _ytdlp_cmd():
+    """argv prefix to run yt-dlp (SLC_YTDLP override, else on PATH, else next to the helper/exe), or
+    None if it isn't installed. Used only for YouTube VODs, where streamlink caps at 360p."""
+    cand = os.environ.get("SLC_YTDLP") or shutil.which("yt-dlp")
+    if not cand:
+        for d in (os.path.dirname(sys.executable or ""), os.path.dirname(os.path.abspath(__file__))):
+            p = os.path.join(d, "yt-dlp")
+            if d and os.path.exists(p):
+                cand = p
+                break
+    return [cand] if cand else None
+
+
+def _ffmpeg_bin():
+    """Path to ffmpeg (SLC_FFMPEG override, else on PATH, else /usr/bin/ffmpeg), or None."""
+    return os.environ.get("SLC_FFMPEG") or shutil.which("ffmpeg") or \
+        ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else None)
+
+
+def _resolve_youtube(page_url, max_h=2160, itag=None):
+    """yt-dlp resolve for a YouTube URL. Returns {'kind':'vod', 'video':url, 'audio':url, 'ua':ua,
+    'height':h} for a recorded video (streamlink only exposes 360p for those; yt-dlp reaches the DASH
+    ladder), {'kind':'live'} for a live stream (kept on streamlink, which gives its 1080p HLS), or None
+    when yt-dlp is unavailable / extraction fails. With itag, that exact video format is used (the
+    quality menu picks one); otherwise the best direct-URL (non-SABR) format up to max_h is chosen."""
+    cmd = _ytdlp_cmd()
+    if not cmd:
+        return None
+    try:
+        out = subprocess.run(cmd + ["-J", "--no-warnings", "--no-playlist", "--", page_url],
+                             capture_output=True, text=True, timeout=45)
+        info = json.loads(out.stdout or "")
+    except Exception as e:
+        log(f"cast: yt-dlp resolve failed: {type(e).__name__}: {str(e)[:80]}")
+        return None
+    if info.get("is_live"):
+        return {"kind": "live"}
+    fmts = info.get("formats") or []
+    def _direct(f):
+        return f.get("url") and f.get("protocol") == "https"
+    auds = [f for f in fmts if _direct(f) and f.get("acodec") not in (None, "none")
+            and f.get("vcodec") in (None, "none")]
+    if not auds:
+        return None
+    if itag:
+        vids = [f for f in fmts if str(f.get("format_id")) == str(itag) and _direct(f)
+                and f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")]
+        if not vids:
+            return None
+        v = vids[0]
+    else:
+        vids = [f for f in fmts if _direct(f) and f.get("vcodec") not in (None, "none")
+                and f.get("acodec") in (None, "none") and 0 < (f.get("height") or 0) <= max_h]
+        if not vids:
+            return None
+        def _vrank(f):
+            vc = f.get("vcodec") or ""
+            codec_pref = 2 if vc.startswith("av01") else (1 if vc.startswith("avc") else 0)   # av1 > h264 > vp9
+            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0   # prefer SDR (lighter to render than HDR)
+            return (f.get("height") or 0, f.get("fps") or 0, sdr, codec_pref, f.get("tbr") or 0)
+        v = max(vids, key=_vrank)
+    a = max(auds, key=lambda f: f.get("tbr") or 0)
+    ua = (v.get("http_headers") or {}).get("User-Agent") or "Mozilla/5.0"
+    return {"kind": "vod", "video": v["url"], "audio": a["url"], "ua": ua, "height": v.get("height")}
+
+
+def _start_youtube_remux(yt, tmpdir):
+    """Remux the YouTube video+audio streams into a growing HLS (fMP4) playlist in tmpdir: video is
+    copied (no re-encode, so ~free) and audio -> AAC for broad HLS compatibility. Returns the ffmpeg
+    Popen, or None if ffmpeg isn't installed. The child is killed with the helper (PDEATHSIG)."""
+    ff = _ffmpeg_bin()
+    if not ff:
+        return None
+    ua = yt["ua"]
+    # -hls_playlist_type event (not vod): ffmpeg rewrites index.m3u8 after every segment, so playback
+    # can start while the remux is still running. vod only writes the playlist at the very end, which
+    # would stall the cast. All segments are kept (no sliding window), so seeking works; ffmpeg adds
+    # #EXT-X-ENDLIST when it finishes, turning it into a fully seekable VOD.
+    cmd = [ff, "-nostdin", "-loglevel", "error", "-y",
+           "-user_agent", ua, "-i", yt["video"],
+           "-user_agent", ua, "-i", yt["audio"],
+           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+           "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event", "-hls_segment_type", "fmp4",
+           "-hls_flags", "independent_segments",
+           "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.m4s"),
+           os.path.join(tmpdir, "index.m3u8")]
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            preexec_fn=_PDEATHSIG)
+
+
+def _make_dir_server(root, tv=""):
+    """CORS-enabled static file server rooted at root (the ffmpeg HLS output dir), reachable only by the
+    cast target + loopback. SimpleHTTPRequestHandler already answers Range requests, so the receiver can
+    seek within what ffmpeg has written."""
+    class _DirHandler(http.server.SimpleHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=root, **k)
+        def log_message(self, *a):
+            pass
+        def guess_type(self, path):
+            if path.endswith(".m3u8"):
+                return "application/vnd.apple.mpegurl"
+            if path.endswith((".m4s", ".mp4")):
+                return "video/mp4"
+            return super().guess_type(path)
+        def end_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+        def do_GET(self):
+            if self.client_address[0] not in (tv, "127.0.0.1"):
+                self.send_error(403)
+                return
+            super().do_GET()
+    return _DirHandler
+
+
 def run_cast(args):
-    """Cast a live HLS stream to the branded receiver. The helper runs an authenticating HLS
+    """Cast an HLS stream (live or VOD) to the branded receiver. The helper runs an authenticating HLS
     reverse-proxy (make_hls_proxy: injects the sniffed headers/token + CORS, rewrites playlist URLs
     to stay proxied); the receiver's native player handles playback: adaptive sync, gap-jumping,
     fragment/playlist retries and discontinuity handling. Sources that aren't a direct playlist
-    (Twitch, etc.) are resolved to their HLS with streamlink first."""
+    (Twitch, etc.) are resolved to their HLS with streamlink first. A finite VOD is cast seekable."""
     import pychromecast
     from pychromecast.controllers import BaseController
 
@@ -1776,7 +2733,30 @@ def run_cast(args):
     # resolved, fall back to proxying the given URL.
     _page = args.url or ""
     _low_latency = False
-    if any(site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
+    _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
+    _yt_ff = None
+    if ("youtube.com" in _page) or ("youtu.be" in _page):
+        # streamlink only exposes 360p for a YouTube VOD; resolve those with yt-dlp and remux the DASH
+        # video+audio to HLS with ffmpeg (up to SLC_YT_MAXH, default 2160p). A live YouTube stays on
+        # streamlink below (it gives the 1080p HLS ladder).
+        _qsel = getattr(args, "quality", "best") or "best"
+        _im = re.match(r"itag:(\w+)$", _qsel)
+        if _im:
+            yt = _resolve_youtube(_page, itag=_im.group(1))          # exact format the quality menu picked
+        else:
+            _qm = re.match(r"(\d+)p", _qsel)
+            _maxh = int(_qm.group(1)) if _qm else int(os.environ.get("SLC_YT_MAXH", "2160") or 2160)
+            yt = _resolve_youtube(_page, _maxh)
+        if yt and yt.get("kind") == "vod":
+            _yt_dir = tempfile.mkdtemp(prefix="slc-yt-")
+            _yt_ff = _start_youtube_remux(yt, _yt_dir)
+            if _yt_ff:
+                log(f"cast: youtube VOD -> yt-dlp + ffmpeg HLS remux ({yt.get('height')}p)")
+            else:
+                shutil.rmtree(_yt_dir, ignore_errors=True)
+                _yt_dir = None
+                log("cast: ffmpeg not found; falling back to streamlink (360p)")
+    if _yt_dir is None and any(site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
         resolved = _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
         if resolved:
             log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
@@ -1785,12 +2765,65 @@ def run_cast(args):
         else:
             log(f"cast: could not resolve {_page[:48]} via streamlink; proxying {source_url[:36]} as-is")
 
-    httpd = ThreadingHTTPServer((ip, args.port), make_hls_proxy(source_url, hdr_map, tv=args.tv))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    # ?ll=1 asks the receiver to sit closer to the live edge (lower delay) for these stable sources;
-    # everything else keeps the deeper default. The proxy matches on /live.m3u8, ignoring the query.
-    hls_url = f"http://{ip}:{args.port}/live.m3u8" + ("?ll=1" if _low_latency else "")
-    log(f"HLS proxy at {hls_url} -> cast (native player) to {args.cast_name or args.tv}")
+    # A sniffed HLS master + a resolution picked in the menu -> serve just that variant (no adaptive).
+    # Skip this when the control server already resolved the exact media to cast (--src-kind): re-resolving
+    # would refetch the source and walk sibling-master guesses again, delaying the cast for no gain.
+    _vq = getattr(args, "quality", "best") or "best"
+    if _yt_dir is None and args.media_url and re.match(r"\d+p", _vq) and not getattr(args, "src_kind", ""):
+        for v in _hls_variants(source_url, hdr_map):
+            if v["quality"] == _vq:
+                source_url = v["url"]; log(f"cast: sniffed HLS -> variant {_vq}"); break
+
+    if _yt_dir is not None:
+        # YouTube VOD: serve ffmpeg's growing HLS output dir; wait for the first segment before LOAD.
+        httpd = ThreadingHTTPServer((ip, args.port), _make_dir_server(_yt_dir, tv=args.tv))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        _is_vod, _stream_type = True, "BUFFERED"
+        hls_url = f"http://{ip}:{args.port}/index.m3u8?vod=1"
+        _ready = False
+        for _ in range(60):     # up to ~30s for ffmpeg to lay down the init + first segment
+            if os.path.exists(os.path.join(_yt_dir, "index.m3u8")) and \
+               any(fn.endswith(".m4s") for fn in os.listdir(_yt_dir)):
+                _ready = True
+                break
+            if _yt_ff.poll() is not None:     # ffmpeg exited before producing a segment
+                break
+            time.sleep(0.5)
+        if not _ready:
+            log("cast: youtube remux produced no output (ffmpeg failed); aborting cast")
+            try:
+                _yt_ff.terminate()
+            except Exception:
+                pass
+            shutil.rmtree(_yt_dir, ignore_errors=True)
+            httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+        log(f"youtube HLS remux at {hls_url} -> cast (VOD/seekable) to {args.cast_name or args.tv}")
+    else:
+        # Classify the source once: a direct media file (mp4/webm) is served with byte-range seeking; an
+        # HLS playlist keeps the reverse-proxy path. A finite VOD (a file, or an HLS with #EXT-X-ENDLIST)
+        # is cast as a seekable BUFFERED stream; a live source stays LIVE. ?vod=1 / ?ll=1 carry that to
+        # the receiver (ll=1 also rides closer to the live edge). The proxy ignores the query.
+        # The control server passes its own classification (--src-kind) for a sniffed HLS source, so reuse
+        # it instead of refetching the source to re-probe (faster start; and it doesn't spend a single-use
+        # token). Fall back to probing here for the single-URL path that carried no classification.
+        if getattr(args, "src_kind", ""):
+            _kind, _is_vod, _container, _ll = args.src_kind, args.src_vod, "mp4", args.src_ll
+        else:
+            _kind, _is_vod, _container, _ll = _classify_source(source_url, hdr_map)
+        if _ll and not _is_vod:
+            _low_latency = True   # LL-HLS live: ride near the edge with a shallow buffer so it can start
+        httpd = ThreadingHTTPServer((ip, args.port),
+                                    make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        _stream_type = "BUFFERED" if _is_vod else "LIVE"
+        _marks = []
+        if _low_latency and _kind != "file":
+            _marks.append("ll=1")
+        if _is_vod:
+            _marks.append("vod=1")
+        _path = f"/live.{_container}" if _kind == "file" else "/live.m3u8"
+        hls_url = f"http://{ip}:{args.port}{_path}" + ("?" + "&".join(_marks) if _marks else "")
+        log(f"{_kind} proxy at {hls_url} -> cast ({'VOD/seekable' if _is_vod else 'live'}) to {args.cast_name or args.tv}")
 
     if not _tcp_open(args.tv, args.cast_port):
         log(f"cast: {args.tv}:{args.cast_port} not reachable. Is the TV on (not in standby)?")
@@ -1874,7 +2907,7 @@ def run_cast(args):
     # playback tolerant of segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer).
     mc = cc.media_controller
     try:
-        mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type="LIVE")
+        mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type=_stream_type)
         try:
             mc.block_until_active(timeout=10)
         except Exception:
@@ -1937,7 +2970,7 @@ def run_cast(args):
                 load_attempts += 1
                 log(f"cast: load failed ({err}); auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
                 try:
-                    mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type="LIVE")
+                    mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type=_stream_type)
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: auto-retry LOAD send failed: {type(e).__name__}: {str(e)[:60]}")
@@ -1958,6 +2991,13 @@ def run_cast(args):
 
     _quit()
     httpd.shutdown()
+    if _yt_ff:
+        try:
+            _yt_ff.terminate()
+        except Exception:
+            pass
+    if _yt_dir:
+        shutil.rmtree(_yt_dir, ignore_errors=True)
     _safe_unlink(PIDFILE)
     clear_cast_state()
     os._exit(0)
@@ -2055,6 +3095,9 @@ def main():
     ap.add_argument("--low-latency", action="store_true", help="aggressive: live-edge 1")
     ap.add_argument("--stop", action="store_true", help="just stop playback on the TV")
     ap.add_argument("--media-url", default="", help="direct media URL (HLS/DASH/file) to cast instead of resolving the page")
+    ap.add_argument("--src-kind", default="", help=argparse.SUPPRESS)       # control's source classification (hls) -> skip the proxy re-probe
+    ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--src-ll", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--title", default="", help="title to show on the renderer (defaults to the URL)")
     ap.add_argument("--add-header", action="append", default=[], metavar="NAME=VALUE",
                     help="extra HTTP header for streamlink, repeatable (e.g. Referer=..., Cookie=...)")

@@ -1,11 +1,13 @@
 # Streaming LAN Cast
 
-Cast the live video playing in your current browser tab to a DLNA/UPnP media renderer (a smart TV, an
+Cast the video playing in your current browser tab to a DLNA/UPnP media renderer (a smart TV, an
 AV receiver, or a media player) or a Google Cast device (Chromecast, Android TV, Google TV) on your
-local network, straight from your browser.
+local network, straight from your browser. It works with live streams as well as on-demand video and
+direct video files, and on-demand playback stays seekable on the TV, so you can skip around with the
+remote.
 
 Everything stays on your own machine and LAN: nothing about what you watch is ever sent to a server we
-control. There's no tracking, no analytics, no account.
+control. It does no tracking or analytics, and there's no account to create.
 
 > Casting may be subject to the terms of service of the site you're streaming from. Use it only with
 > content and networks you are allowed to use.
@@ -32,11 +34,13 @@ Streaming LAN Cast is two pieces that talk over your machine's loopback address:
   **DLNA/UPnP** renderer it uses [streamlink](https://github.com/streamlink/streamlink) to pull the live
   stream and re-serves it as a non-seekable live MPEG-TS feed over your LAN, pushed to the device via
   UPnP AVTransport. For a **Google Cast** device it connects with
-  [pychromecast](https://github.com/home-assistant-libs/pychromecast) and tells the Default Media
-  Receiver what to play; the helper runs an authenticating HLS reverse-proxy that re-serves the source
-  playlist over your LAN with CORS, injecting the headers and token the CDN needs, so token-gated,
-  expiring-segment live streams keep playing reliably. Sites that aren't a direct playlist (Twitch and
-  other streamlink-supported sites) are resolved to their HLS first.
+  [pychromecast](https://github.com/home-assistant-libs/pychromecast) and loads a branded Cast
+  receiver that plays the stream; the helper runs an authenticating HLS reverse-proxy that re-serves the
+  source over your LAN with CORS, injecting the headers and token the source needs, so token-gated,
+  expiring-segment live streams keep playing reliably. A live source plays live; on-demand video and
+  direct video files (`.mp4`, `.webm`, and similar) are served with byte ranges so they stay seekable on
+  the TV. Sites that aren't a direct playlist (Twitch and other streamlink-supported sites) are resolved
+  first.
 
 The extension only ever connects to `http://127.0.0.1:9988` (your own computer), authenticated with a
 per-install token. See [`PRIVACY.md`](PRIVACY.md).
@@ -48,9 +52,10 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
   for you; the Windows `.exe` bundles those, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**
   device (Chromecast, Android TV, Google TV) on the same network
-- **ffmpeg (optional)** only for streams that carry separate audio and video tracks, which streamlink
-  muxes with it. Install a system ffmpeg if you hit one (Linux `apt install ffmpeg`, macOS `brew
-  install ffmpeg`, Windows: add it to PATH). Most live streams are a single muxed track and need none.
+- **ffmpeg (optional)** for streams that carry separate audio and video tracks (which streamlink muxes
+  with it) and for remuxing some on-demand video into a castable form. Install a system ffmpeg if you
+  need one (Linux `apt install ffmpeg`, macOS `brew install ffmpeg`, Windows: add it to PATH). Most live
+  streams are a single muxed track and need none.
 
 ## Install
 
@@ -109,9 +114,9 @@ Then open the toolbar popup:
 
 ## Usage
 
-1. Open a tab with a live stream and click the **Streaming LAN Cast** toolbar button.
+1. Open a tab with a live stream or an on-demand video and click the **Streaming LAN Cast** toolbar button.
 2. Pick a device, optionally choose a quality, then **Cast**. You can change the quality while
-   casting.
+   casting, and on-demand video is seekable from the TV remote.
 3. Stop from the popup, or from the TV's own remote (the popup notices and resets).
 
 ### Casting from arbitrary sites (optional "source detection")

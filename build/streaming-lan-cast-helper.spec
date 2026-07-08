@@ -14,6 +14,8 @@ tmp_ret = collect_all('pychromecast')   # Google Cast / Android TV support
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('zeroconf')        # mDNS discovery for cast devices
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('curl_cffi')       # fetch fallback HTTP client: compiled libcurl backend + CA bundle
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(

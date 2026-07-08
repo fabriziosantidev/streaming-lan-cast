@@ -3,3 +3,4 @@
 # The Linux/macOS installer and the Windows PyInstaller build install this same set.
 streamlink       # resolve and pull the live stream from the page
 pychromecast     # Google Cast (Chromecast / Android TV) targets; pulls in zeroconf for mDNS discovery
+curl_cffi        # browser-fingerprint fetch fallback for a CDN bot-check (a 403 a real browser passes)
