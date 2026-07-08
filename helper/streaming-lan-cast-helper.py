@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.1"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.5.2"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -2684,8 +2684,14 @@ def _start_youtube_remux(yt, tmpdir):
            "-hls_flags", "independent_segments",
            "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.m4s"),
            os.path.join(tmpdir, "index.m3u8")]
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    # ffmpeg gets a real log-file handle, not subprocess.DEVNULL: under the no-console frozen helper
+    # (CREATE_NO_WINDOW) a DEVNULL stdout/stderr leaves ffmpeg producing no segments. The log in tmpdir
+    # also captures a remux failure (cleaned up with the dir).
+    fflog = open(os.path.join(tmpdir, "ffmpeg.log"), "w")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fflog, stderr=subprocess.STDOUT,
                             creationflags=NO_WINDOW, preexec_fn=_PDEATHSIG)
+    fflog.close()   # the child keeps its own dup
+    return proc
 
 
 def _make_dir_server(root, tv=""):
