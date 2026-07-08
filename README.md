@@ -52,10 +52,10 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
   for you; the Windows `.exe` bundles those, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**
   device (Chromecast, Android TV, Google TV) on the same network
-- **ffmpeg (optional)** for streams that carry separate audio and video tracks (which streamlink muxes
-  with it) and for remuxing some on-demand video into a castable form. Install a system ffmpeg if you
-  need one (Linux `apt install ffmpeg`, macOS `brew install ffmpeg`, Windows: add it to PATH). Most live
-  streams are a single muxed track and need none.
+- **ffmpeg** remuxes on-demand video (like a high-res YouTube VOD) and muxes streams that carry separate
+  audio and video tracks. The installers set it up for you: the Windows `.exe` bundles it, and the
+  Linux/macOS installer downloads a static build into the data directory. You only need to install one
+  yourself if that download is skipped or fails (Linux `apt install ffmpeg`, macOS `brew install ffmpeg`).
 
 ## Install
 

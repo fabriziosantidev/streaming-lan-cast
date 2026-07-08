@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.4.0"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.5.0"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -2589,17 +2589,32 @@ def _ytdlp_cmd():
     cand = os.environ.get("SLC_YTDLP") or shutil.which("yt-dlp")
     if not cand:
         for d in (os.path.dirname(sys.executable or ""), os.path.dirname(os.path.abspath(__file__))):
-            p = os.path.join(d, "yt-dlp")
-            if d and os.path.exists(p):
-                cand = p
+            for name in ("yt-dlp", "yt-dlp.exe"):   # .exe covers the bundled Windows binary
+                p = os.path.join(d, name)
+                if d and os.path.exists(p):
+                    cand = p
+                    break
+            if cand:
                 break
     return [cand] if cand else None
 
 
 def _ffmpeg_bin():
-    """Path to ffmpeg (SLC_FFMPEG override, else on PATH, else /usr/bin/ffmpeg), or None."""
-    return os.environ.get("SLC_FFMPEG") or shutil.which("ffmpeg") or \
-        ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else None)
+    """Path to ffmpeg (SLC_FFMPEG override, else on PATH, else the binary bundled next to the
+    helper/exe, else /usr/bin/ffmpeg), or None."""
+    cand = os.environ.get("SLC_FFMPEG") or shutil.which("ffmpeg")
+    if not cand:
+        for d in (os.path.dirname(sys.executable or ""), os.path.dirname(os.path.abspath(__file__))):
+            for name in ("ffmpeg", "ffmpeg.exe"):   # .exe covers the bundled Windows binary
+                p = os.path.join(d, name)
+                if d and os.path.exists(p):
+                    cand = p
+                    break
+            if cand:
+                break
+    if not cand and os.path.exists("/usr/bin/ffmpeg"):
+        cand = "/usr/bin/ffmpeg"
+    return cand or None
 
 
 def _resolve_youtube(page_url, max_h=2160, itag=None):

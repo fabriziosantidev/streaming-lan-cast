@@ -135,12 +135,8 @@ else
   command -v launchctl >/dev/null 2>&1 || die "launchctl not found: this does not look like macOS."
 fi
 
-# ffmpeg is optional: only streams with separate audio+video tracks need it.
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  warn "ffmpeg not found. Most live streams cast fine without it, but a few (separate audio/video) need it."
-  if [ "$OS" = "Darwin" ]; then warn "  install later if a stream fails: brew install ffmpeg."
-  else warn "  install later if a stream fails (Debian/Ubuntu: sudo apt install ffmpeg; Fedora: sudo dnf install ffmpeg; Arch: sudo pacman -S ffmpeg)."; fi
-fi
+# ffmpeg and yt-dlp (for high-res VOD) are set up in the Python-environment step below,
+# alongside the venv, where the helper looks for them.
 
 # --- venv + streamlink -------------------------------------------------------
 step "[1/4] Python environment"
@@ -171,7 +167,42 @@ say "  installing streamlink + pychromecast (this downloads a few MB)"
 # Canonical runtime list lives in requirements.txt; keep this in sync (installed inline so the
 # curl | bash one-liner needs no checkout).
 "$VENV/bin/python" -m pip install --quiet --upgrade streamlink pychromecast curl_cffi
+# yt-dlp resolves high-res YouTube VODs (streamlink caps them at 360p). It is invoked as a tool, not
+# imported, so it stays out of requirements.txt; its venv console script sits next to the venv python,
+# where the helper looks for it.
+"$VENV/bin/python" -m pip install --quiet --upgrade yt-dlp
 say "  ${DIM}$("$VENV/bin/python" -m streamlink --version 2>/dev/null || echo streamlink)${RST}"
+
+# ffmpeg remuxes a high-res YouTube VOD (separate audio + video) into a castable HLS. Bundle a static
+# build in the data dir (no sudo) so it works out of the box; the helper finds it next to itself. A
+# system ffmpeg already on PATH is used as-is; a failed download falls back to the manual hint below.
+FFMPEG_DST="$DATA_DIR/ffmpeg"
+if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x "$FFMPEG_DST" ]; then
+  ff_url=""
+  case "$OS/$(uname -m)" in
+    Linux/x86_64|Linux/amd64)   ff_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" ;;
+    Linux/aarch64|Linux/arm64)  ff_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" ;;
+    Darwin/*)                   ff_url="https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" ;;
+  esac
+  if [ -n "$ff_url" ]; then
+    say "  downloading a bundled ffmpeg for high-res VOD (~20-40 MB)"
+    ff_tmp="$(mktemp -d)"
+    case "$ff_url" in
+      *.zip) fetch "$ff_url" "$ff_tmp/ff.zip"    && ( cd "$ff_tmp" && unzip -q ff.zip ) 2>/dev/null || true ;;
+      *)     fetch "$ff_url" "$ff_tmp/ff.tar.xz" && ( cd "$ff_tmp" && tar xf ff.tar.xz ) 2>/dev/null || true ;;
+    esac
+    ff_bin="$(find "$ff_tmp" -type f -name ffmpeg 2>/dev/null | head -1)"
+    [ -n "$ff_bin" ] && install -m 0755 "$ff_bin" "$FFMPEG_DST"
+    rm -rf "$ff_tmp"
+  fi
+  if [ -x "$FFMPEG_DST" ]; then
+    say "  bundled ffmpeg -> $FFMPEG_DST"
+  else
+    warn "could not bundle ffmpeg; high-res VOD needs it. Install one and the helper will use it:"
+    if [ "$OS" = "Darwin" ]; then warn "  brew install ffmpeg"
+    else warn "  Debian/Ubuntu: sudo apt install ffmpeg | Fedora: sudo dnf install ffmpeg | Arch: sudo pacman -S ffmpeg"; fi
+  fi
+fi
 
 # --- helper ------------------------------------------------------------------
 step "[2/4] Helper"
