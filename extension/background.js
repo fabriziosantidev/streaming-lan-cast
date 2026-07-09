@@ -233,8 +233,18 @@ function attachOrphans(dir, tabId) {
   }
 }
 function onHeadersReceived(d) {
-  const type = classify(d.url, ctOf(d.responseHeaders));
-  if (!type) return;
+  const ct = ctOf(d.responseHeaders);
+  const type = classify(d.url, ct);
+  if (!type) {
+    // A media segment (.ts/.m4s / video/mp2t) shares its playlist's stream directory but, unlike a
+    // worker-fetched one-shot playlist, carries the real tabId. Use it to reveal the tab for an orphan
+    // playlist parked from a tabId-less (Web Worker) request, without recording the segment itself.
+    if (d.tabId >= 0 && (/\.(ts|m4s)(\?|#|$)/i.test(d.url) || ct.toLowerCase().includes("mp2t"))) {
+      const sdir = dirOf(d.url);
+      if (sdir && !dirTab.has(sdir)) { dirTab.set(sdir, d.tabId); attachOrphans(sdir, d.tabId); }
+    }
+    return;
+  }
   const src = { url: d.url, type, headers: hdrStash.get(d.requestId) || {}, ts: Date.now() };
   const dir = dirOf(d.url);
   if (d.tabId >= 0) {

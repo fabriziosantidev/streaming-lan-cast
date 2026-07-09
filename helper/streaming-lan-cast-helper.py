@@ -2131,6 +2131,12 @@ def run_stop(args):
         # by the control server under its lock, so don't clear it here.
         if target and _pid_is_proxy(target):
             if IS_WIN:
+                # taskkill /F is a hard TerminateProcess, so the proxy's atexit (which quits the Cast
+                # receiver) never runs; a buffered VOD then keeps playing off its buffer and errors out
+                # when it can't reach the killed proxy. Quit the receiver directly first. Linux reaches
+                # the same _quit through the SIGTERM handler below, so it only needs the kill.
+                if args.cast:
+                    cast_quit(args.tv, args.cast_port, args.cast_uuid, args.cast_model, args.cast_name)
                 subprocess.run(["taskkill", "/PID", str(target), "/T", "/F"],
                                capture_output=True, creationflags=NO_WINDOW)
             else:
@@ -2617,12 +2623,14 @@ def _ffmpeg_bin():
     return cand or None
 
 
-def _resolve_youtube(page_url, max_h=2160, itag=None):
+def _resolve_youtube(page_url, max_h=2160, itag=None, codecs="avc"):
     """yt-dlp resolve for a YouTube URL. Returns {'kind':'vod', 'video':url, 'audio':url, 'ua':ua,
-    'height':h} for a recorded video (streamlink only exposes 360p for those; yt-dlp reaches the DASH
-    ladder), {'kind':'live'} for a live stream (kept on streamlink, which gives its 1080p HLS), or None
-    when yt-dlp is unavailable / extraction fails. With itag, that exact video format is used (the
-    quality menu picks one); otherwise the best direct-URL (non-SABR) format up to max_h is chosen."""
+    'height':h, ...} for a recorded video (streamlink only exposes 360p for those; yt-dlp reaches the
+    DASH ladder), {'kind':'live'} for a live stream (kept on streamlink, which gives its 1080p HLS), or
+    None when yt-dlp is unavailable / extraction fails. With itag, that exact video format is used (the
+    quality menu picks one); otherwise the best direct-URL (non-SABR) format up to max_h is chosen.
+    codecs="avc" restricts the pick to H.264 (what the remux muxes into MPEG-TS); codecs="any" ranks
+    every codec (av1 > h264 > vp9) for a path that plays the DASH file as-is."""
     cmd = _ytdlp_cmd()
     if not cmd:
         return None
@@ -2642,48 +2650,187 @@ def _resolve_youtube(page_url, max_h=2160, itag=None):
             and f.get("vcodec") in (None, "none")]
     if not auds:
         return None
+    def _vok(f):
+        # codecs="avc": H.264 only (what remuxes into MPEG-TS and decodes on every Cast target).
+        # codecs="any": the mp4-contained codecs (AV1/H.264) the as-is DASH path can index and play;
+        # VP9 rides WebM, whose index this path doesn't parse.
+        vc = f.get("vcodec") or ""
+        return vc.startswith("avc") if codecs == "avc" else vc.startswith(("av01", "avc"))
     if itag:
         vids = [f for f in fmts if str(f.get("format_id")) == str(itag) and _direct(f)
-                and (f.get("vcodec") or "").startswith("avc") and f.get("acodec") in (None, "none")]
+                and _vok(f) and f.get("acodec") in (None, "none")]
         if not vids:
             return None
         v = vids[0]
-        dv = v
     else:
-        # H.264 (avc) only: it loads and decodes on every Cast target and copies straight into MPEG-TS,
-        # whereas AV1/VP9 often fail to load on a TV receiver (Shaka LOAD_FAILED / 905) and do not copy
-        # into TS. H.264 tops out at 1080p on YouTube, so the remux caps there; a video with no H.264 at
-        # all returns None and the caller falls back to streamlink.
-        vids = [f for f in fmts if _direct(f) and (f.get("vcodec") or "").startswith("avc")
+        vids = [f for f in fmts if _direct(f) and _vok(f)
                 and f.get("acodec") in (None, "none") and 0 < (f.get("height") or 0) <= max_h]
         if not vids:
             return None
         def _vrank(f):
-            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0   # prefer SDR (lighter to render than HDR)
-            return (f.get("height") or 0, f.get("fps") or 0, sdr, f.get("tbr") or 0)
-        v = max(vids, key=_vrank)
-        # The parallel full-file download has no TS-muxing constraint (the file is served as .mp4,
-        # where AV1/VP9 play too), so it picks the best rendition of ANY codec up to max_h: the
-        # instant-start stream stays at the H.264 cap while the downloaded file can carry 4K.
-        allv = [f for f in fmts if _direct(f) and f.get("vcodec") not in (None, "none")
-                and f.get("acodec") in (None, "none") and 0 < (f.get("height") or 0) <= max_h]
-        def _drank(f):
             vc = f.get("vcodec") or ""
             codec_pref = 2 if vc.startswith("av01") else (1 if vc.startswith("avc") else 0)   # av1 > h264 > vp9
-            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0
+            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0   # prefer SDR (lighter to render than HDR)
             return (f.get("height") or 0, f.get("fps") or 0, sdr, codec_pref, f.get("tbr") or 0)
-        dv = max(allv, key=_drank) if allv else v
+        v = max(vids, key=_vrank)
+    v_avc = None
+    if codecs == "any":
+        # the as-is DASH path needs mp4 audio too (opus rides WebM); the remux re-encodes to AAC anyway
+        auds = [f for f in auds if (f.get("acodec") or "").startswith("mp4a")] or auds
+        # companion H.264 rendition for the manifest: the player keeps a variant every TV decodes and
+        # picks the best its hardware can actually play (an AV1 profile a decoder rejects would
+        # otherwise leave no playable variant at all)
+        avcs = [f for f in fmts if _direct(f) and (f.get("vcodec") or "").startswith("avc")
+                and f.get("acodec") in (None, "none") and 0 < (f.get("height") or 0) <= max_h]
+        if avcs and not (v.get("vcodec") or "").startswith("avc"):
+            def _arank(f):
+                sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0
+                return (f.get("height") or 0, f.get("fps") or 0, sdr, f.get("tbr") or 0)
+            v_avc = max(avcs, key=_arank)
     a = max(auds, key=lambda f: f.get("tbr") or 0)
     ua = (v.get("http_headers") or {}).get("User-Agent") or "Mozilla/5.0"
     return {"kind": "vod", "video": v["url"], "audio": a["url"], "ua": ua, "height": v.get("height"),
-            # exact format pairs for the parallel yt-dlp download of the full file (chunked, so it runs
-            # at line rate where a plain streamed fetch of the same URL is throttled to ~playback speed):
-            # dlfmt is the best-of-any-codec pick the .mp4 hand-off plays, fmt the H.264 stream pick
+            # the picked format dicts and runtime feed the on-demand DASH manifest
+            "v": v, "a": a, "v_avc": v_avc, "duration": info.get("duration"),
+            # exact format pair for the parallel yt-dlp download of the complete file (chunked, so it
+            # runs at line rate where a plain streamed fetch of the same URL is throttled to about
+            # playback speed). The file keeps the same H.264 pick as the stream: TV receivers decode
+            # H.264 universally, while an AV1 or VP9 file can render black or crash the receiver app.
             "fmt": (f"{v.get('format_id')}+{a.get('format_id')}"
-                    if v.get("format_id") and a.get("format_id") else ""),
-            "dlfmt": (f"{dv.get('format_id')}+{a.get('format_id')}"
-                      if dv.get("format_id") and a.get("format_id") else ""),
-            "dlheight": dv.get("height")}
+                    if v.get("format_id") and a.get("format_id") else "")}
+
+
+def _probe_dash_ranges(url, ua):
+    """Locate the header and index of a DASH mp4 by fetching its first bytes and walking the box
+    tree. Returns (init_end, index_start, index_end) byte offsets (init = ftyp+moov, index = sidx),
+    or None when the layout isn't the expected fragmented mp4."""
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-262143", "User-Agent": ua})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            head = r.read()
+    except Exception as e:
+        log(f"cast: DASH probe fetch failed: {type(e).__name__}: {str(e)[:60]}")
+        return None
+    off, moov_end, sidx = 0, 0, None
+    while off + 8 <= len(head):
+        size = int.from_bytes(head[off:off + 4], "big")
+        typ = head[off + 4:off + 8]
+        if size == 1 and off + 16 <= len(head):          # 64-bit box length
+            size = int.from_bytes(head[off + 8:off + 16], "big")
+        if size <= 0:
+            break
+        if typ == b"moov":
+            moov_end = off + size
+        elif typ == b"sidx":
+            sidx = (off, off + size - 1)
+            break
+        off += size
+    if moov_end and sidx:
+        return (moov_end - 1, sidx[0], sidx[1])
+    log(f"cast: DASH probe found no mp4 index (moov={bool(moov_end)}, first bytes {head[4:8]!r})")
+    return None
+
+
+def _build_mpd(duration, vlist, a):
+    """On-demand DASH manifest over the proxied DASH files (video<i>.mp4 / audio.mp4 next to it).
+    It declares the full runtime up front and carries the header/index byte ranges, so the player
+    shows the complete timeline immediately and fetches any fragment with one range request. One
+    video AdaptationSet per rendition: the player keeps only the variants this device can decode,
+    so an AV1 profile a TV rejects just drops to the H.264 companion instead of failing the load."""
+    ar = a["_ranges"]
+    ab = int((a.get("tbr") or 128) * 1000)
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" '
+           'profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" '
+           f'mediaPresentationDuration="PT{float(duration):.3f}S" minBufferTime="PT2S">',
+           '  <Period>']
+    for i, v in enumerate(vlist):
+        vr = v["_ranges"]
+        vb = int((v.get("tbr") or 5000) * 1000)
+        out += ['    <AdaptationSet contentType="video" mimeType="video/mp4">',
+                f'      <Representation id="v{i}" bandwidth="{vb}" codecs="{v.get("vcodec")}" '
+                f'width="{int(v.get("width") or 0)}" height="{int(v.get("height") or 0)}" '
+                f'frameRate="{int(v.get("fps") or 30)}">',
+                f'        <BaseURL>video{i}.mp4</BaseURL>',
+                f'        <SegmentBase indexRange="{vr[1]}-{vr[2]}"><Initialization range="0-{vr[0]}"/></SegmentBase>',
+                '      </Representation>',
+                '    </AdaptationSet>']
+    out += ['    <AdaptationSet contentType="audio" mimeType="audio/mp4">',
+            f'      <Representation id="a" bandwidth="{ab}" codecs="{a.get("acodec")}" '
+            f'audioSamplingRate="{int(a.get("asr") or 44100)}">',
+            '        <BaseURL>audio.mp4</BaseURL>',
+            f'        <SegmentBase indexRange="{ar[1]}-{ar[2]}"><Initialization range="0-{ar[0]}"/></SegmentBase>',
+            '      </Representation>',
+            '    </AdaptationSet>',
+            '  </Period>',
+            '</MPD>', '']
+    return "\n".join(out)
+
+
+def _make_dash_server(mpd_text, upstreams, ua, tv=""):
+    """DASH endpoint for the receiver: serves manifest.mpd and forwards ranged fetches of the DASH
+    files (upstreams: local path -> source URL) to the source CDN, so fragments stream on demand (a
+    seek anywhere lands with one range request; nothing is fetched ahead). Reachable only by the
+    cast target + loopback. Range is not a CORS-safelisted request header, so OPTIONS preflights
+    are answered too."""
+    class _DashHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a):
+            pass
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
+            self.send_header("Cache-Control", "no-store")
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        def do_GET(self):
+            if self.client_address[0] not in (tv, "127.0.0.1"):
+                self.send_error(403)
+                return
+            path = self.path.split("?")[0]
+            if path == "/manifest.mpd":
+                body = mpd_text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/dash+xml")
+                self.send_header("Content-Length", str(len(body)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            up = upstreams.get(path)
+            if not up:
+                self.send_error(404)
+                return
+            hdrs = {"User-Agent": ua}
+            if self.headers.get("Range"):
+                hdrs["Range"] = self.headers["Range"]
+            try:
+                with urllib.request.urlopen(urllib.request.Request(up, headers=hdrs), timeout=20) as r:
+                    self.send_response(r.status)
+                    for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                        if r.headers.get(h):
+                            self.send_header(h, r.headers[h])
+                    self._cors()
+                    self.end_headers()
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except urllib.error.HTTPError as e:
+                try:
+                    self.send_error(e.code)
+                except Exception:
+                    pass
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+    return _DashHandler
 
 
 def _start_youtube_remux(yt, tmpdir):
@@ -2733,6 +2880,8 @@ def _make_dir_server(root, tv=""):
                 return "video/mp2t"
             if path.endswith((".m4s", ".mp4")):
                 return "video/mp4"
+            if path.endswith(".webm"):
+                return "video/webm"
             return super().guess_type(path)
         def end_headers(self):
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -2812,21 +2961,47 @@ def run_cast(args):
     _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
     _yt_ff = None
     _yt_dl = None       # parallel yt-dlp download of the complete file (full-seek hand-off)
+    _yt_fname = "full.mp4"   # the downloaded file's name in the serve dir (extension per container)
+    _yt_dash = None     # (mpd, video_url, audio_url, ua) when YouTube is served as on-demand DASH
     if ("youtube.com" in _page) or ("youtu.be" in _page):
-        # streamlink only exposes 360p for a YouTube VOD; resolve those with yt-dlp and remux the DASH
-        # video+audio to HLS with ffmpeg (up to SLC_YT_MAXH, default 2160p). A live YouTube stays on
+        # A YouTube VOD is served as on-demand DASH: the receiver gets the complete timeline at once
+        # (total duration + free seek from the first second) and every fragment is range-fetched from
+        # the source on demand, so nothing is remuxed or downloaded ahead and the best rendition the
+        # TV can decode (4K included) plays as-is. SLC_YT_REMUX=1 forces the H.264 remux path
+        # instead; a failed index probe falls back to it on its own. A live YouTube stays on
         # streamlink below (it gives the 1080p HLS ladder).
         _qsel = getattr(args, "quality", "best") or "best"
         _im = re.match(r"itag:(\w+)$", _qsel)
-        yt = _resolve_youtube(_page, itag=_im.group(1)) if _im else None   # exact format the menu picked
-        if not (yt and yt.get("kind") == "vod"):
-            # No itag pick, or the picked format was not H.264: only H.264 remuxes into a castable
-            # MPEG-TS the TV loads, so fall back to the best H.264 up to the requested height rather than
-            # dropping to streamlink (which can't resolve a YouTube VOD anyway).
-            _qm = re.match(r"(\d+)p", _qsel)
-            _maxh = int(_qm.group(1)) if _qm else int(os.environ.get("SLC_YT_MAXH", "2160") or 2160)
-            yt = _resolve_youtube(_page, _maxh)
-        if yt and yt.get("kind") == "vod":
+        _qm = re.match(r"(\d+)p", _qsel)
+        _maxh = int(_qm.group(1)) if _qm else int(os.environ.get("SLC_YT_MAXH", "2160") or 2160)
+        yt = None
+        if not os.environ.get("SLC_YT_REMUX"):
+            yt = _resolve_youtube(_page, itag=_im.group(1), codecs="any") if _im else None
+            if not (yt and yt.get("kind") in ("vod", "live")):
+                yt = _resolve_youtube(_page, _maxh, codecs="any")
+            if yt and yt.get("kind") == "vod" and float(yt.get("duration") or 0) > 0:
+                _ar = _probe_dash_ranges(yt["audio"], yt["ua"])
+                _vlist, _ups = [], {"/audio.mp4": yt["audio"]}
+                for _vf in (yt["v"], yt.get("v_avc")):
+                    if not _vf:
+                        continue
+                    _vr = _probe_dash_ranges(_vf["url"], yt["ua"])
+                    if _vr:
+                        _vf["_ranges"] = _vr
+                        _ups[f"/video{len(_vlist)}.mp4"] = _vf["url"]
+                        _vlist.append(_vf)
+                if _vlist and _ar:
+                    yt["a"]["_ranges"] = _ar
+                    _yt_dash = (_build_mpd(yt["duration"], _vlist, yt["a"]), _ups, yt["ua"])
+                    _hs = "+".join(f"{int(_vf.get('height') or 0)}p" for _vf in _vlist)
+                    log(f"cast: youtube VOD -> on-demand DASH ({_hs}, full timeline)")
+                else:
+                    log("cast: DASH index probe failed; using the local remux instead")
+        if _yt_dash is None and (yt is None or yt.get("kind") == "vod"):
+            yt = _resolve_youtube(_page, itag=_im.group(1)) if _im else None   # H.264 pair for the remux
+            if not (yt and yt.get("kind") == "vod"):
+                yt = _resolve_youtube(_page, _maxh)
+        if _yt_dash is None and yt and yt.get("kind") == "vod":
             _yt_dir = tempfile.mkdtemp(prefix="slc-yt-")
             _yt_ff = _start_youtube_remux(yt, _yt_dir)
             if _yt_ff:
@@ -2836,12 +3011,12 @@ def run_cast(args):
                 # the file lands, the cast is reloaded onto it (a local .mp4 served with byte ranges), so
                 # the receiver gets the total duration and free seeking well before the remux would end.
                 _ytcmd = _ytdlp_cmd()
-                _dlf = yt.get("dlfmt") or yt.get("fmt")
+                _dlf = yt.get("fmt")
                 if _ytcmd and _dlf:
                     try:
                         _dlcmd = _ytcmd + ["-f", _dlf, "--no-playlist",
                                            "--merge-output-format", "mp4",
-                                           "-o", os.path.join(_yt_dir, "full.mp4")]
+                                           "-o", os.path.join(_yt_dir, _yt_fname)]
                         _ffb = _ffmpeg_bin()
                         if _ffb:
                             _dlcmd += ["--ffmpeg-location", _ffb]
@@ -2851,7 +3026,7 @@ def run_cast(args):
                                                   creationflags=NO_WINDOW, preexec_fn=_PDEATHSIG)
                         _dllog.close()
                         log(f"cast: downloading the full video in parallel "
-                            f"({yt.get('dlheight')}p file; free seek once it lands)")
+                            f"({yt.get('height')}p file; free seek once it lands)")
                     except Exception as e:
                         _yt_dl = None
                         log(f"cast: parallel download not started: {type(e).__name__}")
@@ -2859,7 +3034,8 @@ def run_cast(args):
                 shutil.rmtree(_yt_dir, ignore_errors=True)
                 _yt_dir = None
                 log("cast: ffmpeg not found; falling back to streamlink (360p)")
-    if _yt_dir is None and any(site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
+    if _yt_dash is None and _yt_dir is None and any(
+            site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
         resolved = _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
         if resolved:
             log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
@@ -2877,13 +3053,22 @@ def run_cast(args):
             if v["quality"] == _vq:
                 source_url = v["url"]; log(f"cast: sniffed HLS -> variant {_vq}"); break
 
-    if _yt_dir is not None:
+    _ct_load = "application/x-mpegurl"
+    if _yt_dash is not None:
+        httpd = ThreadingHTTPServer((ip, args.port), _make_dash_server(*_yt_dash, tv=args.tv))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        _is_vod, _stream_type = True, "BUFFERED"
+        _ct_load = "application/dash+xml"
+        hls_url = f"http://{ip}:{args.port}/manifest.mpd?vod=1"
+        log(f"youtube DASH at {hls_url} -> cast (VOD, instant full seek) to {args.cast_name or args.tv}")
+    elif _yt_dir is not None:
         # YouTube VOD: serve ffmpeg's growing HLS output dir; wait for the first segment before LOAD.
         httpd = ThreadingHTTPServer((ip, args.port), _make_dir_server(_yt_dir, tv=args.tv))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        # All segments are retained, so cast the remux as a seekable BUFFERED VOD: the ?vod=1 tag tells
-        # the receiver to use BUFFERED and drop the live delay. H.264 in MPEG-TS loads as VOD on the
-        # receiver; ffmpeg appends #EXT-X-ENDLIST when the remux finishes, so the seek range is complete.
+        # Cast the remux as a seekable BUFFERED VOD (?vod=1 tells the receiver to use BUFFERED and
+        # drop the live delay). The playlist grows while ffmpeg writes; the cast gains its full seek
+        # range from the parallel-download hand-off in the steady loop (or from ffmpeg's own
+        # #EXT-X-ENDLIST when the remux finishes first).
         _is_vod, _stream_type = True, "BUFFERED"
         hls_url = f"http://{ip}:{args.port}/index.m3u8?vod=1"
         _ready = False
@@ -2903,7 +3088,7 @@ def run_cast(args):
                 pass
             shutil.rmtree(_yt_dir, ignore_errors=True)
             httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-        log(f"youtube HLS remux at {hls_url} -> cast (live, DVR-seekable) to {args.cast_name or args.tv}")
+        log(f"youtube HLS remux at {hls_url} -> cast (VOD/seekable) to {args.cast_name or args.tv}")
     else:
         # Classify the source once: a direct media file (mp4/webm) is served with byte-range seeking; an
         # HLS playlist keeps the reverse-proxy path. A finite VOD (a file, or an HLS with #EXT-X-ENDLIST)
@@ -2933,12 +3118,16 @@ def run_cast(args):
 
     if not _tcp_open(args.tv, args.cast_port):
         log(f"cast: {args.tv}:{args.cast_port} not reachable. Is the TV on (not in standby)?")
-        httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+        if httpd:
+            httpd.shutdown()
+        _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
     try:
         cc = _cast_connect(args.tv, args.cast_port, args.cast_uuid, args.cast_model, args.cast_name)
     except Exception as e:
         log(f"cast connect failed: {type(e).__name__}: {str(e)[:80]}")
-        httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+        if httpd:
+            httpd.shutdown()
+        _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
 
     class _SlcChannel(BaseController):
         """Private receiver channel: sends play/stop, receives {type:'status'} pushes."""
@@ -3013,7 +3202,7 @@ def run_cast(args):
     # playback tolerant of segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer).
     mc = cc.media_controller
     try:
-        mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type=_stream_type)
+        mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
         try:
             mc.block_until_active(timeout=10)
         except Exception:
@@ -3077,7 +3266,7 @@ def run_cast(args):
         # resume position comes from the MEDIA-namespace status instead.
         if not _yt_vod_reloaded:
             _file_ready = (not _yt_file_failed and _yt_dl is not None and _yt_dl.poll() == 0
-                           and os.path.exists(os.path.join(_yt_dir, "full.mp4")))
+                           and os.path.exists(os.path.join(_yt_dir, _yt_fname)))
             _hls_done = _yt_ff is not None and _yt_ff.poll() == 0
             if _file_ready or _hls_done:
                 _yt_vod_reloaded = True
@@ -3088,8 +3277,9 @@ def run_cast(args):
                     pos = float(mc.status.current_time or 0)
                 except Exception:
                     pass
-                _nurl = f"http://{ip}:{args.port}/full.mp4?vod=1" if _file_ready else hls_url
-                _nct = "video/mp4" if _file_ready else "application/x-mpegurl"
+                _nurl = f"http://{ip}:{args.port}/{_yt_fname}?vod=1" if _file_ready else hls_url
+                _nct = (("video/webm" if _yt_fname.endswith(".webm") else "video/mp4")
+                        if _file_ready else "application/x-mpegurl")
                 try:
                     mc.play_media(_nurl, _nct, title=_title, stream_type="BUFFERED",
                                   current_time=max(0.0, pos - 1))
@@ -3142,7 +3332,7 @@ def run_cast(args):
                 load_attempts += 1
                 log(f"cast: load failed ({err}); auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
                 try:
-                    mc.play_media(hls_url, "application/x-mpegurl", title=_title, stream_type=_stream_type)
+                    mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: auto-retry LOAD send failed: {type(e).__name__}: {str(e)[:60]}")
@@ -3162,7 +3352,8 @@ def run_cast(args):
                     f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}")
 
     _quit()
-    httpd.shutdown()
+    if httpd:
+        httpd.shutdown()
     if _yt_ff:
         try:
             _yt_ff.terminate()

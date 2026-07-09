@@ -42,7 +42,7 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.6';
+    const RX_VERSION = '1.8';
     const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
     window.__stats = stats;
 
@@ -89,6 +89,7 @@
         // picks which.
         if (path.endsWith('.webm')) m.contentType = 'video/webm';
         else if (path.endsWith('.mp4') || path.endsWith('.m4v') || path.endsWith('.mov')) m.contentType = 'video/mp4';
+        else if (path.endsWith('.mpd')) m.contentType = 'application/dash+xml';
         else m.contentType = 'application/x-mpegurl';
         const isVod = url.indexOf('vod=1') !== -1;
         m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
@@ -97,8 +98,11 @@
         // A live HLS tagged ll=1 (Twitch/Kick/YouTube) rides closer to the edge with a shallower buffer;
         // a VOD seeks freely and has no live edge, so it drops the presentation delay.
         const lowLat = url.indexOf('ll=1') !== -1;
-        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 10);
+        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 14);
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
+        // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
+        // non-ll live so a bursty CDN doesn't loop stall-resume-stall
+        playbackConfig.shakaConfig.streaming.rebufferingGoal = isVod ? 2 : (lowLat ? 1 : 4);
         // Low-latency HLS: fetch the sub-second #EXT-X-PART parts and ride the edge with blocking reloads.
         // Some hosts deliver ALL media through the parts (the full #EXTINF segments are empty markers), so
         // without this Shaka fetches empty segments and never fills its buffer.
