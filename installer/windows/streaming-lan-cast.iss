@@ -106,6 +106,16 @@ Type: filesandordirs; Name: "{%USERPROFILE}\.streaming-lan-cast"
 var
   GToken: String;
 
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  rc: Integer;
+begin
+  { the running helper locks its own exe, so stop it (and any cast child) before the files are
+    replaced; otherwise an upgrade fails with 'DeleteFile failed; code 5. Access denied'. }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#MyAppExe} /t', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Result := '';
+end;
+
 function ReadToken(): String;
 var
   path: String;
