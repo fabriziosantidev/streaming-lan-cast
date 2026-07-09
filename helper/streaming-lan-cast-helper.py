@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.2"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.5.3"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -2644,28 +2644,50 @@ def _resolve_youtube(page_url, max_h=2160, itag=None):
         return None
     if itag:
         vids = [f for f in fmts if str(f.get("format_id")) == str(itag) and _direct(f)
-                and f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")]
+                and (f.get("vcodec") or "").startswith("avc") and f.get("acodec") in (None, "none")]
         if not vids:
             return None
         v = vids[0]
+        dv = v
     else:
-        vids = [f for f in fmts if _direct(f) and f.get("vcodec") not in (None, "none")
+        # H.264 (avc) only: it loads and decodes on every Cast target and copies straight into MPEG-TS,
+        # whereas AV1/VP9 often fail to load on a TV receiver (Shaka LOAD_FAILED / 905) and do not copy
+        # into TS. H.264 tops out at 1080p on YouTube, so the remux caps there; a video with no H.264 at
+        # all returns None and the caller falls back to streamlink.
+        vids = [f for f in fmts if _direct(f) and (f.get("vcodec") or "").startswith("avc")
                 and f.get("acodec") in (None, "none") and 0 < (f.get("height") or 0) <= max_h]
         if not vids:
             return None
         def _vrank(f):
+            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0   # prefer SDR (lighter to render than HDR)
+            return (f.get("height") or 0, f.get("fps") or 0, sdr, f.get("tbr") or 0)
+        v = max(vids, key=_vrank)
+        # The parallel full-file download has no TS-muxing constraint (the file is served as .mp4,
+        # where AV1/VP9 play too), so it picks the best rendition of ANY codec up to max_h: the
+        # instant-start stream stays at the H.264 cap while the downloaded file can carry 4K.
+        allv = [f for f in fmts if _direct(f) and f.get("vcodec") not in (None, "none")
+                and f.get("acodec") in (None, "none") and 0 < (f.get("height") or 0) <= max_h]
+        def _drank(f):
             vc = f.get("vcodec") or ""
             codec_pref = 2 if vc.startswith("av01") else (1 if vc.startswith("avc") else 0)   # av1 > h264 > vp9
-            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0   # prefer SDR (lighter to render than HDR)
+            sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0
             return (f.get("height") or 0, f.get("fps") or 0, sdr, codec_pref, f.get("tbr") or 0)
-        v = max(vids, key=_vrank)
+        dv = max(allv, key=_drank) if allv else v
     a = max(auds, key=lambda f: f.get("tbr") or 0)
     ua = (v.get("http_headers") or {}).get("User-Agent") or "Mozilla/5.0"
-    return {"kind": "vod", "video": v["url"], "audio": a["url"], "ua": ua, "height": v.get("height")}
+    return {"kind": "vod", "video": v["url"], "audio": a["url"], "ua": ua, "height": v.get("height"),
+            # exact format pairs for the parallel yt-dlp download of the full file (chunked, so it runs
+            # at line rate where a plain streamed fetch of the same URL is throttled to ~playback speed):
+            # dlfmt is the best-of-any-codec pick the .mp4 hand-off plays, fmt the H.264 stream pick
+            "fmt": (f"{v.get('format_id')}+{a.get('format_id')}"
+                    if v.get("format_id") and a.get("format_id") else ""),
+            "dlfmt": (f"{dv.get('format_id')}+{a.get('format_id')}"
+                      if dv.get("format_id") and a.get("format_id") else ""),
+            "dlheight": dv.get("height")}
 
 
 def _start_youtube_remux(yt, tmpdir):
-    """Remux the YouTube video+audio streams into a growing HLS (fMP4) playlist in tmpdir: video is
+    """Remux the YouTube H.264 video + audio into a growing MPEG-TS HLS playlist in tmpdir: video is
     copied (no re-encode, so ~free) and audio -> AAC for broad HLS compatibility. Returns the ffmpeg
     Popen, or None if ffmpeg isn't installed. The child is killed with the helper (PDEATHSIG)."""
     ff = _ffmpeg_bin()
@@ -2680,9 +2702,9 @@ def _start_youtube_remux(yt, tmpdir):
            "-user_agent", ua, "-i", yt["video"],
            "-user_agent", ua, "-i", yt["audio"],
            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-           "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event", "-hls_segment_type", "fmp4",
+           "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event",
            "-hls_flags", "independent_segments",
-           "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.m4s"),
+           "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.ts"),
            os.path.join(tmpdir, "index.m3u8")]
     # ffmpeg gets a real log-file handle, not subprocess.DEVNULL: under the no-console frozen helper
     # (CREATE_NO_WINDOW) a DEVNULL stdout/stderr leaves ffmpeg producing no segments. The log in tmpdir
@@ -2695,9 +2717,9 @@ def _start_youtube_remux(yt, tmpdir):
 
 
 def _make_dir_server(root, tv=""):
-    """CORS-enabled static file server rooted at root (the ffmpeg HLS output dir), reachable only by the
-    cast target + loopback. SimpleHTTPRequestHandler already answers Range requests, so the receiver can
-    seek within what ffmpeg has written."""
+    """CORS-enabled static file server rooted at root (the ffmpeg HLS output dir and the downloaded
+    file), reachable only by the cast target + loopback. Serves byte ranges (206), which the receiver
+    needs to seek within a local .mp4 (the stdlib handler alone answers every GET with the full body)."""
     class _DirHandler(http.server.SimpleHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         def __init__(self, *a, **k):
@@ -2707,16 +2729,49 @@ def _make_dir_server(root, tv=""):
         def guess_type(self, path):
             if path.endswith(".m3u8"):
                 return "application/vnd.apple.mpegurl"
+            if path.endswith(".ts"):
+                return "video/mp2t"
             if path.endswith((".m4s", ".mp4")):
                 return "video/mp4"
             return super().guess_type(path)
         def end_headers(self):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Accept-Ranges", "bytes")
             super().end_headers()
         def do_GET(self):
             if self.client_address[0] not in (tv, "127.0.0.1"):
                 self.send_error(403)
+                return
+            rng = (self.headers.get("Range") or "").strip()
+            m = re.match(r"bytes=(\d*)-(\d*)$", rng)
+            fpath = self.translate_path(self.path)
+            if m and (m.group(1) or m.group(2)) and os.path.isfile(fpath):
+                try:
+                    size = os.path.getsize(fpath)
+                    start = int(m.group(1)) if m.group(1) else max(0, size - int(m.group(2)))
+                    end = min(int(m.group(2)), size - 1) if (m.group(1) and m.group(2)) else size - 1
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    self.send_response(206)
+                    self.send_header("Content-Type", self.guess_type(fpath))
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Content-Length", str(end - start + 1))
+                    self.end_headers()
+                    with open(fpath, "rb") as f:
+                        f.seek(start)
+                        left = end - start + 1
+                        while left > 0:
+                            chunk = f.read(min(65536, left))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            left -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
             super().do_GET()
     return _DirHandler
@@ -2756,15 +2811,18 @@ def run_cast(args):
     _low_latency = False
     _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
     _yt_ff = None
+    _yt_dl = None       # parallel yt-dlp download of the complete file (full-seek hand-off)
     if ("youtube.com" in _page) or ("youtu.be" in _page):
         # streamlink only exposes 360p for a YouTube VOD; resolve those with yt-dlp and remux the DASH
         # video+audio to HLS with ffmpeg (up to SLC_YT_MAXH, default 2160p). A live YouTube stays on
         # streamlink below (it gives the 1080p HLS ladder).
         _qsel = getattr(args, "quality", "best") or "best"
         _im = re.match(r"itag:(\w+)$", _qsel)
-        if _im:
-            yt = _resolve_youtube(_page, itag=_im.group(1))          # exact format the quality menu picked
-        else:
+        yt = _resolve_youtube(_page, itag=_im.group(1)) if _im else None   # exact format the menu picked
+        if not (yt and yt.get("kind") == "vod"):
+            # No itag pick, or the picked format was not H.264: only H.264 remuxes into a castable
+            # MPEG-TS the TV loads, so fall back to the best H.264 up to the requested height rather than
+            # dropping to streamlink (which can't resolve a YouTube VOD anyway).
             _qm = re.match(r"(\d+)p", _qsel)
             _maxh = int(_qm.group(1)) if _qm else int(os.environ.get("SLC_YT_MAXH", "2160") or 2160)
             yt = _resolve_youtube(_page, _maxh)
@@ -2773,6 +2831,30 @@ def run_cast(args):
             _yt_ff = _start_youtube_remux(yt, _yt_dir)
             if _yt_ff:
                 log(f"cast: youtube VOD -> yt-dlp + ffmpeg HLS remux ({yt.get('height')}p)")
+                # In parallel, download the COMPLETE file with yt-dlp: its chunked fetches run at line
+                # rate, while the streamed remux above is throttled by the host to ~playback speed. Once
+                # the file lands, the cast is reloaded onto it (a local .mp4 served with byte ranges), so
+                # the receiver gets the total duration and free seeking well before the remux would end.
+                _ytcmd = _ytdlp_cmd()
+                _dlf = yt.get("dlfmt") or yt.get("fmt")
+                if _ytcmd and _dlf:
+                    try:
+                        _dlcmd = _ytcmd + ["-f", _dlf, "--no-playlist",
+                                           "--merge-output-format", "mp4",
+                                           "-o", os.path.join(_yt_dir, "full.mp4")]
+                        _ffb = _ffmpeg_bin()
+                        if _ffb:
+                            _dlcmd += ["--ffmpeg-location", _ffb]
+                        _dllog = open(os.path.join(_yt_dir, "yt-dlp.log"), "w")
+                        _yt_dl = subprocess.Popen(_dlcmd + ["--", _page], stdin=subprocess.DEVNULL,
+                                                  stdout=_dllog, stderr=subprocess.STDOUT,
+                                                  creationflags=NO_WINDOW, preexec_fn=_PDEATHSIG)
+                        _dllog.close()
+                        log(f"cast: downloading the full video in parallel "
+                            f"({yt.get('dlheight')}p file; free seek once it lands)")
+                    except Exception as e:
+                        _yt_dl = None
+                        log(f"cast: parallel download not started: {type(e).__name__}")
             else:
                 shutil.rmtree(_yt_dir, ignore_errors=True)
                 _yt_dir = None
@@ -2799,12 +2881,15 @@ def run_cast(args):
         # YouTube VOD: serve ffmpeg's growing HLS output dir; wait for the first segment before LOAD.
         httpd = ThreadingHTTPServer((ip, args.port), _make_dir_server(_yt_dir, tv=args.tv))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # All segments are retained, so cast the remux as a seekable BUFFERED VOD: the ?vod=1 tag tells
+        # the receiver to use BUFFERED and drop the live delay. H.264 in MPEG-TS loads as VOD on the
+        # receiver; ffmpeg appends #EXT-X-ENDLIST when the remux finishes, so the seek range is complete.
         _is_vod, _stream_type = True, "BUFFERED"
         hls_url = f"http://{ip}:{args.port}/index.m3u8?vod=1"
         _ready = False
         for _ in range(60):     # up to ~30s for ffmpeg to lay down the init + first segment
             if os.path.exists(os.path.join(_yt_dir, "index.m3u8")) and \
-               any(fn.endswith(".m4s") for fn in os.listdir(_yt_dir)):
+               any(fn.startswith("seg") for fn in os.listdir(_yt_dir)):
                 _ready = True
                 break
             if _yt_ff.poll() is not None:     # ffmpeg exited before producing a segment
@@ -2818,7 +2903,7 @@ def run_cast(args):
                 pass
             shutil.rmtree(_yt_dir, ignore_errors=True)
             httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-        log(f"youtube HLS remux at {hls_url} -> cast (VOD/seekable) to {args.cast_name or args.tv}")
+        log(f"youtube HLS remux at {hls_url} -> cast (live, DVR-seekable) to {args.cast_name or args.tv}")
     else:
         # Classify the source once: a direct media file (mp4/webm) is served with byte-range seeking; an
         # HLS playlist keeps the reverse-proxy path. A finite VOD (a file, or an HLS with #EXT-X-ENDLIST)
@@ -2941,6 +3026,14 @@ def run_cast(args):
     # when the user leaves (app change / stop) or the control connection is truly gone. ----
     POLL = 1.5
     played = False
+    # A YouTube remux plays with a live-style window while ffmpeg is still writing; once ffmpeg
+    # finishes, index.m3u8 gains #EXT-X-ENDLIST and becomes a finite, fully seekable VOD. Track
+    # whether that hand-off still needs to reach the receiver (True = nothing to do: not a remux,
+    # or the remux already finished before the LOAD so the first LOAD saw the finite playlist).
+    _yt_vod_reloaded = (_yt_ff is None) or (_yt_ff.poll() is not None)
+    _yt_switch_at = 0.0        # when the cast was reloaded onto the downloaded file (0 = not switched)
+    _yt_pos_at_switch = 0.0
+    _yt_file_failed = False    # the switched file didn't play on this TV -> stay on the HLS remux
     reconnect_tries = 0
     tele = 0                       # telemetry heartbeat (log latency/buffer every ~10s)
     last_stalls = 0
@@ -2977,6 +3070,64 @@ def run_cast(args):
         if st == "playing" and not played:
             played = True
             log(f"cast: playing (receiver rx={slc.last.get('ver')})")
+        # Full-seek hand-off: the parallel download landing a complete local .mp4 (served with byte
+        # ranges), or the remux finishing (#EXT-X-ENDLIST -> finite HLS), turns the cast into a real
+        # VOD. Re-send the LOAD resuming at the current position so the receiver shows the total
+        # duration and seeks freely. The receiver telemetry's t is always 0 (shadow-DOM), so the
+        # resume position comes from the MEDIA-namespace status instead.
+        if not _yt_vod_reloaded:
+            _file_ready = (not _yt_file_failed and _yt_dl is not None and _yt_dl.poll() == 0
+                           and os.path.exists(os.path.join(_yt_dir, "full.mp4")))
+            _hls_done = _yt_ff is not None and _yt_ff.poll() == 0
+            if _file_ready or _hls_done:
+                _yt_vod_reloaded = True
+                pos = 0.0
+                try:
+                    mc.update_status()
+                    time.sleep(0.3)
+                    pos = float(mc.status.current_time or 0)
+                except Exception:
+                    pass
+                _nurl = f"http://{ip}:{args.port}/full.mp4?vod=1" if _file_ready else hls_url
+                _nct = "video/mp4" if _file_ready else "application/x-mpegurl"
+                try:
+                    mc.play_media(_nurl, _nct, title=_title, stream_type="BUFFERED",
+                                  current_time=max(0.0, pos - 1))
+                    last_load_at = time.monotonic()
+                    log(f"cast: {'full file landed' if _file_ready else 'remux finished'} -> "
+                        f"reloading seekable at t={int(pos)}s")
+                    if _file_ready:
+                        # keep the streaming remux alive until the file confirms below: it is the
+                        # fallback if this TV can't decode the downloaded rendition
+                        _yt_switch_at = time.monotonic()
+                        _yt_pos_at_switch = pos
+                except Exception as e:
+                    log(f"cast: seekable reload failed: {type(e).__name__}: {str(e)[:60]}")
+        # Confirm the file switch: an error after it (e.g. a codec this TV can't decode) falls back
+        # to the still-running HLS remux at the same position; a clean stretch confirms the file and
+        # stops the throttled stream. Errors in the first seconds are the old pre-switch report still
+        # riding the 2s telemetry, so they don't count.
+        if _yt_switch_at and not _yt_file_failed:
+            _e = slc.last.get("err") if slc.last else None
+            _dt = time.monotonic() - _yt_switch_at
+            _bad = (_e and _e.startswith("shaka/") and _dt > 4) or (st == "idle" and _dt > 12)
+            if _bad:
+                _yt_file_failed = True
+                _yt_dl = None            # the file path is out; the finite-HLS hand-off can still come
+                _yt_vod_reloaded = False
+                _yt_switch_at = 0.0
+                try:
+                    mc.play_media(hls_url, "application/x-mpegurl", title=_title,
+                                  stream_type="BUFFERED", current_time=max(0.0, _yt_pos_at_switch - 1))
+                    last_load_at = time.monotonic()
+                    log(f"cast: the downloaded file failed on this TV ({_e or st}); back to the stream remux")
+                except Exception as e:
+                    log(f"cast: fallback reload failed: {type(e).__name__}: {str(e)[:60]}")
+            elif _dt > 25:
+                _yt_switch_at = 0.0
+                if _yt_ff is not None and _yt_ff.poll() is None:
+                    _yt_ff.terminate()   # file confirmed; the throttled stream is superseded
+                log("cast: seekable file confirmed")
         # surface the receiver's err/state changes in the log as they happen
         err = slc.last.get("err") if slc.last else None
         if err and err != last_err:
@@ -3015,6 +3166,11 @@ def run_cast(args):
     if _yt_ff:
         try:
             _yt_ff.terminate()
+        except Exception:
+            pass
+    if _yt_dl:
+        try:
+            _yt_dl.terminate()
         except Exception:
             pass
     if _yt_dir:

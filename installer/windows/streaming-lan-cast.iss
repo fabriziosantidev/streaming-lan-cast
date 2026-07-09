@@ -4,7 +4,7 @@
 ; This file MUST be saved as UTF-8 with BOM (it contains non-ASCII translations).
 
 #define MyAppName "Streaming LAN Cast"
-#define MyAppVersion "0.5.2"
+#define MyAppVersion "0.5.3"
 #define MyAppPublisher "Fabrizio Santi"
 #define MyAppExe "streaming-lan-cast-helper.exe"
 
