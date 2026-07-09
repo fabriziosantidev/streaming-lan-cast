@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.3"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.5.4"   # reported to the extension via /ping; bump with manifest.json + the .iss
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -1779,6 +1779,8 @@ def serve_control(port):
                 self._cast(q)
             elif u.path == "/qualities":       # POST so the page's Cookie (for reading its ladder) stays out of the URL
                 self._qualities(q)
+            elif u.path == "/quit":
+                self._quit(q)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
 
@@ -2096,6 +2098,31 @@ def serve_control(port):
 
         def _ping(self, q):
             self._json({"ok": True, "pong": True, "version": HELPER_VERSION})
+
+        def _quit(self, q):
+            # Graceful self-shutdown so an installer can replace our exe without killing us from
+            # outside. A running exe stays locked, and a per-user installer's taskkill can't reach
+            # a helper that happens to run elevated. A process can always end itself, though, so a
+            # token-gated loopback call frees the file even when an external kill would be denied.
+            self._json({"ok": True, "quitting": True})
+            def _shutdown():
+                time.sleep(0.3)   # let the response flush before the process dies
+                try:
+                    with _state_lock:
+                        kind = state.get("kind", "dlna")
+                        cinfo = state.get("cast") or {}
+                        dev = state.get("device") or ""
+                        state.update(_empty_cast_state())
+                        clear_cast_state()
+                    if kind == "cast" and dev:
+                        cast_quit(dev, cinfo.get("port"), cinfo.get("uuid"),
+                                  cinfo.get("model"), cinfo.get("name"))
+                    kill_previous_proxy()   # stop the detached cast child so it frees the exe too
+                    _safe_unlink(PIDFILE)
+                except Exception:
+                    pass
+                os._exit(0)
+            threading.Thread(target=_shutdown, daemon=True).start()
 
     def _dev_loop():
         while True:

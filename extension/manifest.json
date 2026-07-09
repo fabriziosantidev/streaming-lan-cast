@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Streaming LAN Cast",
-  "version": "0.5.0",
+  "version": "0.5.4",
   "default_locale": "en",
   "description": "__MSG_extDescription__",
   "author": "Fabrizio Santi",

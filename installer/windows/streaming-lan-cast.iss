@@ -4,7 +4,7 @@
 ; This file MUST be saved as UTF-8 with BOM (it contains non-ASCII translations).
 
 #define MyAppName "Streaming LAN Cast"
-#define MyAppVersion "0.5.3"
+#define MyAppVersion "0.5.4"
 #define MyAppPublisher "Fabrizio Santi"
 #define MyAppExe "streaming-lan-cast-helper.exe"
 
@@ -106,13 +106,65 @@ Type: filesandordirs; Name: "{%USERPROFILE}\.streaming-lan-cast"
 var
   GToken: String;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function ExeLocked(): Boolean;
+{ True while the installed helper exe still can't be removed, i.e. a helper process (the control
+  server or its cast child) still holds it open. DeleteFile only probes the lock here: if it
+  succeeds the file was going to be overwritten anyway, and Setup lays down the fresh copy next. }
 var
+  p: String;
+begin
+  p := ExpandConstant('{app}\{#MyAppExe}');
+  Result := FileExists(p) and (not DeleteFile(p));
+end;
+
+procedure AskHelperToQuit();
+{ Ask a running helper to shut itself down through its own loopback control channel. This works
+  even when the helper runs at a higher integrity level than this per-user installer (which a
+  taskkill can't reach): a process can always end itself. The per-install token is read from the
+  user's profile by PowerShell so it never lands on a command line. }
+var
+  sl: TArrayOfString;
+  tmp: String;
   rc: Integer;
 begin
-  { the running helper locks its own exe, so stop it (and any cast child) before the files are
-    replaced; otherwise an upgrade fails with 'DeleteFile failed; code 5. Access denied'. }
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#MyAppExe} /t', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  tmp := ExpandConstant('{tmp}\slc-quit.ps1');
+  SetArrayLength(sl, 6);
+  sl[0] := '$ErrorActionPreference = ''SilentlyContinue''';
+  sl[1] := '$f = Join-Path $env:USERPROFILE ''.streaming-lan-cast\token''';
+  sl[2] := 'if (Test-Path $f) {';
+  sl[3] := '  $t = (Get-Content -Raw $f).Trim()';
+  sl[4] := '  try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Method Post -Uri ''http://127.0.0.1:9988/quit'' -Headers @{ ''X-LanCast-Token'' = $t } | Out-Null } catch { }';
+  sl[5] := '}';
+  if SaveStringsToFile(tmp, sl, False) then
+    Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + tmp + '"',
+         '', SW_HIDE, ewWaitUntilTerminated, rc);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  rc, i: Integer;
+begin
+  { The running helper locks its own exe, so it has to stop before Setup can replace the files;
+    otherwise an upgrade fails with 'DeleteFile failed; code 5. Access denied'. Ask it to quit
+    itself first (works no matter its privilege level), then wait until the exe is actually free.
+    The control server exits at once, but its cast child can take a beat to die. }
+  AskHelperToQuit();
+  for i := 1 to 20 do
+  begin
+    if not ExeLocked() then break;
+    Sleep(300);
+  end;
+  { Fallback for a helper too old to know /quit, or one we could not reach: a hard kill (only
+    effective when the helper runs at this installer's integrity level). }
+  if ExeLocked() then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#MyAppExe} /t', '', SW_HIDE, ewWaitUntilTerminated, rc);
+    for i := 1 to 10 do
+    begin
+      if not ExeLocked() then break;
+      Sleep(300);
+    end;
+  end;
   Result := '';
 end;
 
