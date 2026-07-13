@@ -67,7 +67,12 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.4"   # reported to the extension via /ping; bump with manifest.json + the .iss
+HELPER_VERSION = "0.5.5"   # reported to the extension via /ping; for a release bump this and the .iss
+                           # (the extension version is independent now; see version.json / checkHelperVersion)
+# Canonical "latest published helper" manifest, checked in the background so /ping can tell the
+# extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
+VERSION_URL = "https://fabriziosantidev.github.io/streaming-lan-cast/version.json"
+_UPDATE = {"latest": "", "min_ext": ""}   # last successful check; stays empty until/unless one succeeds
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -1583,6 +1588,28 @@ def cast_quit(host, port, uuid, model, name):
         log(f"cast quit failed: {type(e).__name__}: {str(e)[:80]}")
 
 
+def _check_latest_version():
+    """Best-effort background check of the published version manifest, so /ping can tell the extension
+    whether a newer helper exists and the minimum extension that helper needs. Never raises; a failed
+    or missing check leaves the cache empty and the extension falls back to its own version compare."""
+    try:
+        req = urllib.request.Request(VERSION_URL, headers={"User-Agent": f"streaming-lan-cast/{HELPER_VERSION}"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read(4096).decode("utf-8", "replace"))
+        latest = str(data.get("helper", "")).strip()
+        if re.match(r"^\d+\.\d+", latest):
+            _UPDATE["latest"] = latest
+            _UPDATE["min_ext"] = str(data.get("min_extension", "") or "").strip()
+    except Exception:
+        pass
+
+
+def _update_check_loop():
+    while True:
+        _check_latest_version()
+        time.sleep(6 * 3600)
+
+
 def serve_control(port):
     self_script = os.path.abspath(__file__)
     TOKEN = load_or_create_token()
@@ -2097,7 +2124,12 @@ def serve_control(port):
             self._json({"ok": True, "casting": alive, **snap, **({"perror": perror} if perror else {})})
 
         def _ping(self, q):
-            self._json({"ok": True, "pong": True, "version": HELPER_VERSION})
+            resp = {"ok": True, "pong": True, "version": HELPER_VERSION}
+            if _UPDATE["latest"]:
+                resp["latest"] = _UPDATE["latest"]
+                if _UPDATE["min_ext"]:
+                    resp["min_ext"] = _UPDATE["min_ext"]
+            self._json(resp)
 
         def _quit(self, q):
             # Graceful self-shutdown so an installer can replace our exe without killing us from
@@ -2133,6 +2165,7 @@ def serve_control(port):
             time.sleep(25)
     threading.Thread(target=_dev_loop, daemon=True).start()
 
+    threading.Thread(target=_update_check_loop, daemon=True).start()   # keeps /ping's latest/min_ext fresh
     httpd = ThreadingHTTPServer(("127.0.0.1", port), CtrlHandler)
     log(f"control server on http://127.0.0.1:{port}  (/cast?url=  /stop  /ping  /devices)")
     httpd.serve_forever()

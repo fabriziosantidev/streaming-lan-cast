@@ -113,13 +113,23 @@ async function init() {
   startStatusPoll();
 }
 
-// warn if the local helper is behind the extension: the two ship together (every release bumps both), so
-// an older helper misses fixes and can reject newer requests. Compares the full major.minor.patch, so a
-// patch-level helper update prompts too; a helper too old to report a version at all counts as behind.
+// Prompt when the local helper is behind the latest published version. The helper reports `latest`
+// (and `min_ext`, the minimum extension that helper needs) from the release manifest, so a helper-only
+// release can nudge without shipping a new extension. Only prompt when this extension can actually drive
+// that helper: if the latest helper needs a newer extension than this one, stay quiet until the store
+// updates the extension. A helper too old to report `latest` falls back to comparing against this
+// extension's own version.
 function checkHelperVersion(ping) {
   const mm = (v) => { const p = String(v || "").split("."); return (Number(p[0]) || 0) * 1e6 + (Number(p[1]) || 0) * 1e3 + (Number(p[2]) || 0); };
   const helper = ping && ping.version;
-  const behind = !helper || mm(helper) < mm(browser.runtime.getManifest().version);
+  let behind;
+  if (ping && ping.latest) {
+    const helperOld = !helper || mm(helper) < mm(ping.latest);
+    const extOk = !ping.min_ext || mm(browser.runtime.getManifest().version) >= mm(ping.min_ext);
+    behind = helperOld && extOk;
+  } else {
+    behind = !helper || mm(helper) < mm(browser.runtime.getManifest().version);
+  }
   $("helperOld").hidden = !behind;
 }
 function stopAll() { stopScan(); stopStatusPoll(); }

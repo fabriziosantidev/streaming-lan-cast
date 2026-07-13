@@ -70,7 +70,8 @@ manifest pointing at an `updates.json` you host.
 - **Extension id** (`browser_specific_settings.gecko.id`): set to
   `streaming-lan-cast@fabriziosantidev.github.io`. It is permanent for the listing and cannot be changed
   later without a new listing.
-- **`version`**: bump it (`manifest.json`) for every update you submit.
+- **`version`**: bump it (`manifest.json`) for every *extension* update you submit to the stores. A
+  helper-only release no longer needs an extension bump (see "Versioning and the update nudge" below).
 - **`homepage_url`** (optional): add it once you have a repo/landing page.
 
 ## 5. Hosting the privacy policy
@@ -107,6 +108,35 @@ installer/unix/uninstall.sh    # stop + remove everything (service, venv, token)
 ```
 Manage it with `systemctl --user {status,restart,stop} streaming-lan-cast.service` (Linux) or
 `launchctl {list,unload,load}` on the LaunchAgent (macOS).
+
+## Versioning and the update nudge
+
+There are three version numbers, and they are no longer bumped in lockstep:
+
+- **`HELPER_VERSION`** (`helper/streaming-lan-cast-helper.py`) and **`MyAppVersion`** (the Inno `.iss`)
+  move together: they are what a helper/installer release carries.
+- **`version`** (`extension/manifest.json`) is independent. Bump it only when the extension's own code
+  changes and you resubmit it to the stores.
+
+`docs/version.json` is the single source of truth for the latest helper:
+
+```
+{ "helper": "0.5.5", "min_extension": "0.4.0" }
+```
+
+The running helper fetches it in the background and reports `latest` + `min_ext` on `/ping`. The popup
+prompts "update your helper" only when the running helper is older than `helper` AND this extension is
+at least `min_extension`. So:
+
+- **Helper-only release**: bump `HELPER_VERSION` + the `.iss`, build the installer, cut the GitHub
+  release, and set `helper` in `docs/version.json` to the new version. Leave `min_extension` and the
+  extension alone. Existing users get nudged with no store resubmit.
+- **Release that needs a newer extension**: also bump the extension `version`, resubmit it to the
+  stores, and raise `min_extension` to that version. The nudge stays silent until a user's extension
+  reaches `min_extension`, so nobody is told to install a helper their extension can't drive.
+
+A helper too old to report `latest` falls back to comparing against the extension's own version, so
+bumping the extension still nudges those users.
 
 ## Quick reference
 ```
