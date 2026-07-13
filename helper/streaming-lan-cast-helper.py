@@ -2890,6 +2890,63 @@ def _start_youtube_remux(yt, tmpdir):
     return proc
 
 
+def _mp4_moov_at_end(url, hdr_map):
+    """True if a progressive MP4 keeps its moov after mdat (not fast-start): a Cast receiver never
+    reaches the index and sits in 'loading', so the file has to be remuxed to play. False for a
+    fast-start MP4 (moov first), a fragmented MP4 (moof, which streams fine), and on any probe
+    failure, where casting the file directly is still worth a try."""
+    hdrs = {"Range": "bytes=0-262143"}
+    hdrs.update(hdr_map)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=12) as r:
+            head = r.read(262144)
+    except Exception as e:
+        log(f"cast: fast-start probe failed: {type(e).__name__}: {str(e)[:60]}")
+        return False
+    off = 0
+    while off + 8 <= len(head):
+        size = int.from_bytes(head[off:off + 4], "big")
+        typ = head[off + 4:off + 8]
+        if size == 1 and off + 16 <= len(head):          # 64-bit box length
+            size = int.from_bytes(head[off + 8:off + 16], "big")
+        if typ == b"moov":
+            return False              # index before media -> already fast-start
+        if typ in (b"mdat", b"moof"):
+            return typ == b"mdat"     # mdat first -> moov is at the end; moof -> fragmented (streams fine)
+        if size <= 0:
+            break
+        off += size
+    return False
+
+
+def _start_file_remux(url, hdr_map, tmpdir):
+    """Remux a direct media file a Cast device can't start (e.g. a progressive MP4 with its moov at
+    the end) into a growing MPEG-TS HLS playlist in tmpdir: video copied (no re-encode), audio -> AAC.
+    The event playlist plays while ffmpeg runs and gains #EXT-X-ENDLIST (fully seekable) when it
+    finishes. Returns the ffmpeg Popen, or None if ffmpeg isn't installed. Killed with the helper."""
+    ff = _ffmpeg_bin()
+    if not ff:
+        return None
+    pre = []
+    ua = hdr_map.get("User-Agent")
+    if ua:
+        pre += ["-user_agent", ua]
+    extra = "".join(f"{k}: {v}\r\n" for k, v in hdr_map.items() if k.lower() != "user-agent")
+    if extra:
+        pre += ["-headers", extra]
+    cmd = [ff, "-nostdin", "-loglevel", "error", "-y", *pre, "-i", url,
+           "-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+           "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event",
+           "-hls_flags", "independent_segments",
+           "-hls_segment_filename", os.path.join(tmpdir, "seg%05d.ts"),
+           os.path.join(tmpdir, "index.m3u8")]
+    fflog = open(os.path.join(tmpdir, "ffmpeg.log"), "w")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fflog, stderr=subprocess.STDOUT,
+                            creationflags=NO_WINDOW, preexec_fn=_PDEATHSIG)
+    fflog.close()
+    return proc
+
+
 def _make_dir_server(root, tv=""):
     """CORS-enabled static file server rooted at root (the ffmpeg HLS output dir and the downloaded
     file), reachable only by the cast target + loopback. Serves byte ranges (206), which the receiver
@@ -2988,6 +3045,9 @@ def run_cast(args):
     _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
     _yt_ff = None
     _yt_dl = None       # parallel yt-dlp download of the complete file (full-seek hand-off)
+    _file_remux = False  # True when a non-fast-start direct file is remuxed: play the event HLS to the
+                         # end and skip the finite-VOD reload (that reload resumes at the receiver's
+                         # reported position, which this receiver often gives as 0 -> restart from top)
     _yt_fname = "full.mp4"   # the downloaded file's name in the serve dir (extension per container)
     _yt_dash = None     # (mpd, video_url, audio_url, ua) when YouTube is served as on-demand DASH
     if ("youtube.com" in _page) or ("youtu.be" in _page):
@@ -3080,6 +3140,28 @@ def run_cast(args):
             if v["quality"] == _vq:
                 source_url = v["url"]; log(f"cast: sniffed HLS -> variant {_vq}"); break
 
+    # A direct progressive MP4 whose moov sits after mdat never starts on a Cast device (the native
+    # player waits forever for the index). Remux it to a growing, immediately-playable HLS (seekable
+    # once it ends), reusing the same local-VOD serve path as a YouTube VOD (the elif branch below).
+    # Fast-start and fragmented files, and all HLS sources, keep the direct reverse-proxy. The
+    # classification is stashed so the else branch below doesn't re-probe (and re-spend) the source URL.
+    _src_cls = None
+    if _yt_dash is None and _yt_dir is None:
+        if getattr(args, "src_kind", ""):
+            _src_cls = (args.src_kind, args.src_vod, "mp4", args.src_ll)
+        else:
+            _src_cls = _classify_source(source_url, hdr_map)
+        if (_src_cls[0] == "file" and _src_cls[2] in ("mp4", "m4v", "mov")
+                and _mp4_moov_at_end(source_url, hdr_map)):
+            _rf = tempfile.mkdtemp(prefix="slc-ff-")
+            _ff = _start_file_remux(source_url, hdr_map, _rf)
+            if _ff:
+                _yt_dir, _yt_ff, _file_remux = _rf, _ff, True
+                log("cast: direct MP4 is not fast-start (moov at end) -> ffmpeg HLS remux")
+            else:
+                shutil.rmtree(_rf, ignore_errors=True)
+                log("cast: MP4 not fast-start but ffmpeg is unavailable; casting as-is (may not start)")
+
     _ct_load = "application/x-mpegurl"
     if _yt_dash is not None:
         httpd = ThreadingHTTPServer((ip, args.port), _make_dash_server(*_yt_dash, tv=args.tv))
@@ -3089,7 +3171,8 @@ def run_cast(args):
         hls_url = f"http://{ip}:{args.port}/manifest.mpd?vod=1"
         log(f"youtube DASH at {hls_url} -> cast (VOD, instant full seek) to {args.cast_name or args.tv}")
     elif _yt_dir is not None:
-        # YouTube VOD: serve ffmpeg's growing HLS output dir; wait for the first segment before LOAD.
+        # Local ffmpeg HLS remux (a YouTube VOD, or a non-fast-start direct file): serve the growing
+        # output dir; wait for the first segment before LOAD.
         httpd = ThreadingHTTPServer((ip, args.port), _make_dir_server(_yt_dir, tv=args.tv))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         # Cast the remux as a seekable BUFFERED VOD (?vod=1 tells the receiver to use BUFFERED and
@@ -3108,14 +3191,14 @@ def run_cast(args):
                 break
             time.sleep(0.5)
         if not _ready:
-            log("cast: youtube remux produced no output (ffmpeg failed); aborting cast")
+            log("cast: remux produced no output (ffmpeg failed); aborting cast")
             try:
                 _yt_ff.terminate()
             except Exception:
                 pass
             shutil.rmtree(_yt_dir, ignore_errors=True)
             httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
-        log(f"youtube HLS remux at {hls_url} -> cast (VOD/seekable) to {args.cast_name or args.tv}")
+        log(f"ffmpeg HLS remux at {hls_url} -> cast (VOD/seekable) to {args.cast_name or args.tv}")
     else:
         # Classify the source once: a direct media file (mp4/webm) is served with byte-range seeking; an
         # HLS playlist keeps the reverse-proxy path. A finite VOD (a file, or an HLS with #EXT-X-ENDLIST)
@@ -3124,7 +3207,9 @@ def run_cast(args):
         # The control server passes its own classification (--src-kind) for a sniffed HLS source, so reuse
         # it instead of refetching the source to re-probe (faster start; and it doesn't spend a single-use
         # token). Fall back to probing here for the single-URL path that carried no classification.
-        if getattr(args, "src_kind", ""):
+        if _src_cls is not None:
+            _kind, _is_vod, _container, _ll = _src_cls
+        elif getattr(args, "src_kind", ""):
             _kind, _is_vod, _container, _ll = args.src_kind, args.src_vod, "mp4", args.src_ll
         else:
             _kind, _is_vod, _container, _ll = _classify_source(source_url, hdr_map)
@@ -3291,7 +3376,7 @@ def run_cast(args):
         # VOD. Re-send the LOAD resuming at the current position so the receiver shows the total
         # duration and seeks freely. The receiver telemetry's t is always 0 (shadow-DOM), so the
         # resume position comes from the MEDIA-namespace status instead.
-        if not _yt_vod_reloaded:
+        if not _yt_vod_reloaded and not _file_remux:
             _file_ready = (not _yt_file_failed and _yt_dl is not None and _yt_dl.poll() == 0
                            and os.path.exists(os.path.join(_yt_dir, _yt_fname)))
             _hls_done = _yt_ff is not None and _yt_ff.poll() == 0
