@@ -24,7 +24,7 @@ Streaming LAN Cast is two pieces that talk over your machine's loopback address:
   browser extension ─HTTP─▶ local helper ───┤
   (picks device,           (127.0.0.1:9988) │
    sends the tab URL)                       └─ Google Cast ──▶  Chromecast / Android TV
-                                               (authenticating HLS proxy via pychromecast)
+                                               (authenticating proxy via pychromecast)
 ```
 
 - The **extension** (MV3 WebExtension) is the UI: it discovers both DLNA (SSDP) and Google Cast (mDNS,
@@ -35,12 +35,14 @@ Streaming LAN Cast is two pieces that talk over your machine's loopback address:
   stream and re-serves it as a non-seekable live MPEG-TS feed over your LAN, pushed to the device via
   UPnP AVTransport. For a **Google Cast** device it connects with
   [pychromecast](https://github.com/home-assistant-libs/pychromecast) and loads a branded Cast
-  receiver that plays the stream; the helper runs an authenticating HLS reverse-proxy that re-serves the
+  receiver that plays the stream; the helper runs an authenticating reverse-proxy that re-serves the
   source over your LAN with CORS, injecting the headers and token the source needs, so token-gated,
   expiring-segment live streams keep playing reliably. A live source plays live; on-demand video and
   direct video files (`.mp4`, `.webm`, and similar) are served with byte ranges so they stay seekable on
-  the TV. Sites that aren't a direct playlist (Twitch and other streamlink-supported sites) are resolved
-  first.
+  the TV, and a high-resolution on-demand source (like a YouTube VOD) is served as seekable DASH. When
+  the source is in a codec the device can't decode (AV1, which many TVs can't play), the helper
+  transcodes it to H.264 on the fly so it still casts and stays seekable. Sites that aren't a direct
+  playlist (Twitch and other streamlink-supported sites) are resolved first.
 
 The extension only ever connects to `http://127.0.0.1:9988` (your own computer), authenticated with a
 per-install token. See [`PRIVACY.md`](PRIVACY.md).
@@ -52,8 +54,9 @@ per-install token. See [`PRIVACY.md`](PRIVACY.md).
   for you; the Windows `.exe` bundles those, so Windows needs nothing extra)
 - A **DLNA/UPnP renderer** (most smart TVs, many AV receivers / media players) or a **Google Cast**
   device (Chromecast, Android TV, Google TV) on the same network
-- **ffmpeg** remuxes on-demand video (like a high-res YouTube VOD) and muxes streams that carry separate
-  audio and video tracks. The installers set it up for you: the Windows `.exe` bundles it, and the
+- **ffmpeg** remuxes on-demand video (like a high-res YouTube VOD), transcodes a source the device can't
+  decode (such as AV1) to H.264, and muxes streams that carry separate audio and video tracks. The
+  installers set it up for you: the Windows `.exe` bundles it, and the
   Linux/macOS installer downloads a static build into the data directory. You only need to install one
   yourself if that download is skipped or fails (Linux `apt install ffmpeg`, macOS `brew install ffmpeg`).
 
