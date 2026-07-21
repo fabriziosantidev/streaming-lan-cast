@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.5"   # reported to the extension via /ping; for a release bump this and the .iss
+HELPER_VERSION = "0.5.6"   # reported to the extension via /ping; for a release bump this and the .iss
                            # (the extension version is independent now; see version.json / checkHelperVersion)
 # Canonical "latest published helper" manifest, checked in the background so /ping can tell the
 # extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
@@ -84,6 +84,8 @@ PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-e
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
 LOGFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast.log")   # caster diagnostics (pythonw has no console)
+LOG_MAX = 50 * 1024 * 1024   # at this size the log rotates to LOGFILE.old (fresh log, never mixed with
+                             # the old one); disk use stays bounded to ~2x this (current + one .old)
 # Advertised on the HTTP response so the renderer treats it as a LIVE, non-seekable
 # broadcast (OP=00 = no seek; sender-paced / sliding-window live flags).
 DLNA_LIVE_CF = "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8D500000000000000000000000000000"
@@ -137,11 +139,41 @@ def log(msg):
     except Exception:
         pass  # no console (e.g. launched via pythonw)
     try:
+        # At the cap, rotate the full log aside to LOGFILE.old (replacing any previous .old) so a fresh
+        # log starts and old lines never mix with new ones. os.replace is atomic, so concurrent writers
+        # at worst rotate a small fresh file twice.
+        try:
+            if os.path.getsize(LOGFILE) >= LOG_MAX:
+                os.replace(LOGFILE, LOGFILE + ".old")
+        except OSError:
+            pass
         # create owner-only (0600): the log lives in the shared temp dir and can carry media
         # URLs, so don't leave it world-readable for other local users.
         fd = os.open(LOGFILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {msg}\n")
+            f.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] [{HELPER_VERSION}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _rotate_log_on_version_change():
+    """When a new helper version starts, archive the previous version's log to LOGFILE.old (replacing
+    any existing .old) so an update never mixes old and new logs. The change is read from the version
+    tag the last line carries; a log with no tagged line (older format, or empty) is left as is."""
+    try:
+        size = os.path.getsize(LOGFILE)
+    except OSError:
+        return
+    if size == 0:
+        return
+    try:
+        with open(LOGFILE, "rb") as f:
+            f.seek(max(0, size - 4096))                     # the last line is enough to read the version
+            tail = f.read().decode("utf-8", "replace").splitlines()
+        last = next((ln for ln in reversed(tail) if ln.strip()), "")
+        m = re.search(r"\[\d+\]\s+\[([^\]]+)\]", last)      # HH:MM:SS [pid] [ver] msg
+        if m and m.group(1) != HELPER_VERSION:
+            os.replace(LOGFILE, LOGFILE + ".old")
     except Exception:
         pass
 
@@ -1254,7 +1286,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
         qs = path.split("?", 1)[1] if "?" in path else ""
         return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
 
-    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0}   # log the first of each event only once
+    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False}   # log the first of each event only once
 
     class HlsProxy(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1287,7 +1319,9 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                     # Direct media file: forward the receiver's Range so it can seek; relay the ranging
                     # headers (status 206 + Content-Range) the player needs.
                     status, uh, body_it = _fetch_ranged(source_url, self.headers.get("Range"))
-                    ct = uh.get("Content-Type") or ("video/webm" if p.endswith(".webm") else "video/mp4")
+                    ct = uh.get("Content-Type") or ""
+                    if not ct.startswith("video/"):   # many direct-download hosts serve the file as
+                        ct = "video/webm" if p.endswith(".webm") else "video/mp4"   # octet-stream; the receiver needs a video type
                     extra = [("Accept-Ranges", "bytes")]
                     crange, clen = uh.get("Content-Range"), uh.get("Content-Length")
                     if crange:
@@ -1331,11 +1365,22 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                         self._serve_m3u8(r.read().decode("utf-8", "replace"), u)
                         return
                     first = r.read(65536)
-                    # A segment hidden behind a non-media Content-Type (some sites serve fMP4/TS as
-                    # text/html to dodge adblock/CDN filters) -> label it from its own bytes so the
-                    # receiver's player accepts it (fMP4 starts with an MP4 box; TS with a 0x47 sync byte).
                     ct = ctype
-                    if (not ct) or "text/html" in ct or "octet-stream" in ct:
+                    # A segment can carry a header ahead of the real media: some hosts prepend a tiny
+                    # valid image (e.g. a 1x1 PNG, then MPEG-TS) so an image-only CDN accepts the upload.
+                    # Strip to where the media starts so the decoder gets a clean stream.
+                    if first[:1] == b"\x89" or first[:3] == b"\xff\xd8\xff" or first[:3] == b"GIF" or ct.startswith("image/"):
+                        _k, _at = _media_signature(first)
+                        if _at > 0:
+                            first = first[_at:]
+                            ct = "video/mp2t" if _k == "ts" else "video/mp4"
+                            if not dbg["dewrap"]:
+                                dbg["dewrap"] = True
+                                log(f"proxy: stripped a {_at}-byte image header off segments ({_k})")
+                    # A segment served under a non-media Content-Type (some sites label fMP4/TS as
+                    # text/html or an image type): label it from its own bytes so the receiver's player
+                    # accepts it (fMP4 starts with an MP4 box; TS with a 0x47 sync byte).
+                    if (not ct) or "text/html" in ct or "octet-stream" in ct or ct.startswith("image/"):
                         if first[4:8] in (b"ftyp", b"styp", b"moof", b"moov", b"sidx", b"mdat"):
                             ct = "video/mp4"
                         elif first[:1] == b"\x47":
@@ -1612,6 +1657,7 @@ def _update_check_loop():
 
 def serve_control(port):
     self_script = os.path.abspath(__file__)
+    _rotate_log_on_version_change()   # a helper update starts a fresh log (old one -> LOGFILE.old)
     TOKEN = load_or_create_token()
     _tok_ok, _tok_detail = secure_token_file()
     log(f"token file: {TOKEN_FILE} ({_tok_detail})")
@@ -2536,6 +2582,26 @@ def _prefer_h264_codec(url):
     return re.sub(r'([?&][^=&]*codec[^=&]*=)av1(?=&|$)', r'\g<1>h264', url, flags=re.IGNORECASE)
 
 
+def _media_signature(buf):
+    """Locate a media container inside buf (which may carry a wrapper header). Returns (kind, offset):
+    'ts'/'fmp4' and the byte offset where it begins (0 = plain media, >0 = wrapped), or ('', -1) if
+    none is found (a genuine image)."""
+    if not buf:
+        return "", -1
+    n = len(buf)
+    for tag in (b"ftyp", b"styp", b"moof", b"sidx"):    # an ISO-BMFF box: 4-byte size then the type
+        i = buf.find(tag, 4)
+        while i >= 4:
+            sz = int.from_bytes(buf[i - 4:i], "big")
+            if 8 <= sz <= 50_000_000:
+                return "fmp4", i - 4
+            i = buf.find(tag, i + 1)
+    for o in range(min(n, 4096)):                       # MPEG-TS: 0x47 at 3 consecutive 188B boundaries
+        if buf[o] == 0x47 and o + 376 < n and buf[o + 188] == 0x47 and buf[o + 376] == 0x47:
+            return "ts", o
+    return "", -1
+
+
 def _classify_stream(urls, hdr_map, probe_media=True):
     """Understand a sniffed HLS stream from its content, not its URL shape. Picks the media playlist to cast
     (resolving a master to its variants first) and describes the structure the cast path and the user need.
@@ -2602,13 +2668,34 @@ def _classify_stream(urls, hdr_map, probe_media=True):
         if km:
             meth = km.group(1).upper()
             model["encryption"] = "drm" if meth.startswith("SAMPLE-AES") else meth.lower()
-        # Segments that are IMAGES (.image/.png/.jpg...) mean the video is steganographically hidden inside
-        # them (an anti-cast trick: the player de-embeds it in obfuscated JS). The receiver can't decode a
-        # picture, so reject with a clear reason. Normal HLS segments are .ts/.m4s/.mp4/.aac, so this never
-        # trips a real stream.
-        _segs = [ln.strip().split("?")[0].lower() for ln in mt.splitlines() if ln.strip() and not ln.startswith("#")]
-        if _segs and sum(s.endswith((".image", ".png", ".jpg", ".jpeg", ".webp", ".gif")) for s in _segs[:5]) >= min(2, len(_segs)):
-            model["castable"], model["reason"] = False, "obfuscated"
+        # Image-named segments (.image/.png/.jpg...): most hosts still serve REAL media bytes under those
+        # names (naming is free; the player never looks at it), while a few embed the video inside actual
+        # pictures, which the receiver can't decode. Judge by the BYTES, not the name: fetch the head of
+        # the first segment and locate a media container in it. media_at gives the byte offset (0 = plain
+        # media; >0 = media wrapped behind a header the proxy strips); -1 = no media found = truly a
+        # picture, reject.
+        _segs = [ln.strip() for ln in mt.splitlines() if ln.strip() and not ln.startswith("#")]
+        _names = [s.split("?")[0].lower() for s in _segs]
+        if _names and sum(s.endswith((".image", ".png", ".jpg", ".jpeg", ".webp", ".gif")) for s in _names[:5]) >= min(2, len(_names)):
+            _plu = probe if probe_media else src
+            _su = urllib.parse.urljoin(_plu or src, _segs[0]) if _segs else ""
+            _head = b""
+            try:
+                _h = dict(hdr_map or {})
+                _h["Range"] = "bytes=0-65535"
+                with urllib.request.urlopen(urllib.request.Request(_su, headers=_h), timeout=6) as _r:
+                    _head = _r.read(65536)
+            except Exception as _e:
+                log(f"stream: image-named segment fetch failed ({type(_e).__name__}); rejecting")
+            _kind, _at = _media_signature(_head)
+            log(f"stream: image-named segment {_su.split('?')[0].rsplit('/', 1)[-1][:40]} "
+                f"{len(_head)}B head={_head[:16].hex()} -> {_kind or 'no-media'}@{_at}")
+            if _at >= 0:
+                # real media under an image name (offset 0), or behind a small image header the proxy
+                # strips before serving (offset >0, e.g. a 1x1 PNG prepended so an image CDN accepts it)
+                model["container"] = _kind
+            else:
+                model["castable"], model["reason"] = False, "obfuscated"   # no media at all = a real picture
     # For a live master stream, cast the fresh sniffed chunklist probed above rather than a master variant,
     # which can resolve to a stale or wrong sub-stream (rolled off, or a codec the receiver can't play).
     # fresh is only set when a master resolved, so the override applies to master streams only.
@@ -2980,6 +3067,419 @@ def _start_file_remux(url, hdr_map, tmpdir):
     return proc
 
 
+def _hls_video_codec(url, hdr_map):
+    """Best-effort video codec of an HLS source: 'h264', 'av1', 'hevc', or '' if unknown. Reads a
+    master's CODECS attribute, else probes the media playlist's fMP4 init segment (#EXT-X-MAP) for its
+    codec box. Used to decide whether to transcode a codec the Cast target can't decode (AV1) to H.264."""
+    def _name(s):
+        s = s.lower()
+        if "av01" in s or "av1c" in s: return "av1"
+        if "hev1" in s or "hvc1" in s or "hvcc" in s: return "hevc"
+        if "avc1" in s or "avc3" in s or "avcc" in s: return "h264"
+        return ""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdr_map), timeout=10) as r:
+            txt = r.read(1000000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    if "#EXT-X-STREAM-INF" in txt:                       # master: the CODECS attribute names the codec
+        m = re.search(r'CODECS="([^"]+)"', txt)
+        return _name(m.group(1)) if m else ""
+    m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', txt)      # media playlist: read the fMP4 init's codec box
+    if not m:
+        return ""
+    try:
+        init = urllib.parse.urljoin(url, m.group(1))
+        hd = dict(hdr_map); hd["Range"] = "bytes=0-8191"
+        with urllib.request.urlopen(urllib.request.Request(init, headers=hd), timeout=10) as r:
+            head = r.read(8192)
+        return _name(head.decode("latin1", "replace"))
+    except Exception:
+        return ""
+
+
+def _hls_media_parts(url, hdr_map):
+    """Resolve an HLS url to its media playlist and return (init_url, [(start_s, seg_url), ...]) with
+    URIs absolute and each segment's cumulative start time (following one master -> variant hop). The
+    raw byte fetch works for any segment naming."""
+    def _get(u):
+        with urllib.request.urlopen(urllib.request.Request(u, headers=hdr_map), timeout=15) as r:
+            return r.read(4000000).decode("utf-8", "replace")
+    txt = _get(url)
+    if "#EXT-X-STREAM-INF" in txt and "#EXTINF" not in txt:
+        for ln in txt.splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                url = urllib.parse.urljoin(url, ln)
+                txt = _get(url)
+                break
+    init = None
+    m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', txt)
+    if m:
+        init = urllib.parse.urljoin(url, m.group(1))
+    segs = []
+    t = dur = 0.0
+    for ln in txt.splitlines():
+        ln = ln.strip()
+        md = re.match(r"#EXTINF:([\d.]+)", ln)
+        if md:
+            dur = float(md.group(1))
+        elif ln and not ln.startswith("#"):
+            segs.append((t, urllib.parse.urljoin(url, ln)))
+            t += dur
+    return init, segs
+
+
+def _start_transcode_h264(url, hdr_map, tmpdir, begin=0):
+    """Transcode an HLS source a Cast target can't decode (e.g. AV1) into growing H.264+AAC fMP4 HLS in
+    tmpdir, as SEPARATE audio and video renditions (init_v/seg_v_* and init_a/seg_a_*), cut on a 4s
+    forced-keyframe cadence so segment numbers map to absolute time. The renditions have to stay
+    separate: the source interleaves audio ~10s behind video, so a single muxed output would carry the
+    audio a whole source-segment behind. The source is fed to ffmpeg as ONE CONTINUOUS stream over stdin (a
+    thread fetches init+segments in order): ffmpeg's own HLS demuxer shifts this source's audio
+    timestamps by hundreds of ms across segment boundaries, while the plain file demuxer over the same
+    bytes keeps them exact. begin > 0 starts the feed at the source segment containing that time (the
+    seek-restart path, so a far seek costs seconds instead of waiting for the encode to reach it); the
+    output timestamps then run from 0 with both tracks sharing that segment's start as their zero, and
+    the serving side re-times them onto the absolute timeline. Returns (Popen, base_seconds) - base is
+    the absolute time of the epoch's zero - or None if unavailable."""
+    ff = _ffmpeg_bin()
+    if not ff:
+        return None
+    try:
+        init_url, segs = _hls_media_parts(url, hdr_map)
+    except Exception as e:
+        log(f"transcode: source playlist fetch failed ({type(e).__name__})")
+        return None
+    if not segs:
+        return None
+    k0 = 0
+    for i, (st, _u) in enumerate(segs):
+        if st <= begin:
+            k0 = i
+        else:
+            break
+    base = segs[k0][0] if k0 else 0.0
+    seg_urls = [u for _st, u in segs[k0:]]
+    cmd = [ff, "-nostdin", "-loglevel", "error", "-y",
+           "-i", "pipe:0",
+           "-map", "0:v:0?", "-map", "0:a:0?",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+           "-profile:v", "high", "-level:v", "4.0",         # pin the codec so the master's CODECS matches (avc1.640028)
+           "-force_key_frames", "expr:gte(t,n_forced*4)",   # a keyframe every 4s -> uniform 4s segments
+           "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000",
+           "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event",
+           # temp_file: a segment is renamed into place only once whole, so "exists" == "complete".
+           # Separate audio/video renditions so each track segments on its own PTS (source audio lags).
+           "-hls_flags", "independent_segments+temp_file",
+           "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init_%v.mp4",
+           "-var_stream_map", "v:0,agroup:au,name:v a:0,agroup:au,name:a,default:yes",
+           "-master_pl_name", "master.m3u8",
+           "-hls_segment_filename", os.path.join(tmpdir, "seg_%v_%05d.m4s"),
+           os.path.join(tmpdir, "stream_%v.m3u8")]
+    fflog = open(os.path.join(tmpdir, "ffmpeg.log"), "w")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fflog, stderr=subprocess.STDOUT,
+                            creationflags=NO_WINDOW, preexec_fn=_PDEATHSIG)
+    fflog.close()
+
+    def _feed():
+        try:
+            for u in ([init_url] if init_url else []) + seg_urls:
+                data = None
+                for _ in range(3):
+                    try:
+                        with urllib.request.urlopen(urllib.request.Request(u, headers=hdr_map),
+                                                    timeout=30) as r:
+                            data = r.read()
+                        break
+                    except Exception:
+                        time.sleep(1)
+                if data is None:
+                    log(f"transcode: source segment fetch failed; stopping the feed "
+                        f"({u.rsplit('/', 1)[-1][:40]})")
+                    break
+                proc.stdin.write(data)
+            proc.stdin.close()
+        except (BrokenPipeError, ValueError, OSError):
+            pass    # the encoder exited (cast torn down); nothing left to feed
+
+    threading.Thread(target=_feed, daemon=True).start()
+    return proc, base
+
+
+def _hls_duration(url, hdr_map):
+    """Total duration (seconds) of an HLS VOD, summing the media playlist's #EXTINF (following one
+    master -> variant hop). 0 if unknown. Used to declare a transcode's full timeline up front so the
+    receiver shows the duration and a seek bar immediately, before the transcode has finished."""
+    def _get(u):
+        with urllib.request.urlopen(urllib.request.Request(u, headers=hdr_map), timeout=10) as r:
+            return r.read(4000000).decode("utf-8", "replace")
+    try:
+        txt = _get(url)
+        if "#EXT-X-STREAM-INF" in txt and "#EXTINF" not in txt:   # master -> follow the first variant
+            for ln in txt.splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    txt = _get(urllib.parse.urljoin(url, ln)); break
+        return round(sum(float(x) for x in re.findall(r'#EXTINF:([\d.]+)', txt)), 3)
+    except Exception:
+        return 0
+
+
+def _make_transcode_server(root, duration, source_url, hdr_map, seg_dur=4, tv="", state=None):
+    """Serve an on-the-fly transcode as seekable VOD. The receiver loads /manifest.mpd, a static DASH
+    MPD declaring the full duration up front (instant total time + seek bar) with SegmentTemplate
+    mapping segment N of each track to [N*seg_dur, (N+1)*seg_dur); DASH is the delivery the receiver's
+    player places strictly by the segments' internal timestamps (the same path YouTube VOD uses on it).
+    Audio and video are SEPARATE representations so each segments on its own PTS and A/V sync holds
+    (the source interleaves audio behind video, so a muxed output would drift). Each segment fetch
+    long-polls the encoder's matching output; segments are renamed into place when whole (temp_file),
+    so existing == complete. A fetch far outside what the current encode will reach soon relaunches
+    the encoder at the source segment containing the target (a new 0-based epoch subdir); epoch
+    segments are re-timed onto the absolute timeline as they are served (tfdt/sidx shifted by the
+    epoch base), so a far seek starts in seconds instead of waiting for the encode to catch up. The
+    equivalent HLS playlists stay served for debugging. Cast target + loopback only."""
+    import math
+    nseg = int(math.ceil(duration / seg_dur)) if duration > 0 else 0
+    st = state if state is not None else {}
+    st.setdefault("epochs", [{"base": 0.0, "dir": root}])   # oldest -> newest
+    st.setdefault("lock", threading.Lock())
+    st.setdefault("restarted", 0.0)
+    st.setdefault("ts", {})    # per-track fMP4 timescales, read from the root inits
+
+    def _boxes(d, s, e):
+        i = s
+        while i + 8 <= e:
+            sz = int.from_bytes(d[i:i + 4], "big")
+            if sz < 8:
+                break
+            yield d[i + 4:i + 8], i, sz
+            i += sz
+
+    def _timescale(kind):
+        ts = st["ts"].get(kind)
+        if ts:
+            return ts
+        try:
+            d = open(os.path.join(root, f"init_{kind}.mp4"), "rb").read()
+            i = d.find(b"mdhd")
+            ver = d[i + 4]
+            ts = int.from_bytes(d[i + 16:i + 20], "big") if ver == 0 else int.from_bytes(d[i + 24:i + 28], "big")
+        except (OSError, ValueError, IndexError):
+            ts = 48000 if kind == "a" else 12288
+        st["ts"][kind] = ts
+        return ts
+
+    def _retime(data, base, tscale):
+        # shift a 0-based epoch segment onto the absolute timeline: add the epoch base to the tfdt
+        # baseMediaDecodeTime and the sidx earliest_presentation_time (the player places by these)
+        if base <= 0:
+            return data
+        b = bytearray(data)
+        off = int(round(base * tscale))
+        for typ, i, sz in _boxes(b, 0, len(b)):
+            if typ == b"sidx":
+                ver = b[i + 8]
+                sts = int.from_bytes(b[i + 16:i + 20], "big")
+                soff = int(round(base * sts))
+                if ver == 0:
+                    cur = int.from_bytes(b[i + 20:i + 24], "big")
+                    b[i + 20:i + 24] = (cur + soff).to_bytes(4, "big")
+                else:
+                    cur = int.from_bytes(b[i + 20:i + 28], "big")
+                    b[i + 20:i + 28] = (cur + soff).to_bytes(8, "big")
+            elif typ == b"moof":
+                for _t2, i2, s2 in ((t, o, s) for t, o, s in _boxes(b, i + 8, i + sz) if t == b"traf"):
+                    for t3, i3, _s3 in _boxes(b, i2 + 8, i2 + s2):
+                        if t3 == b"tfdt":
+                            ver = b[i3 + 8]
+                            if ver == 0:
+                                cur = int.from_bytes(b[i3 + 12:i3 + 16], "big")
+                                b[i3 + 12:i3 + 16] = (cur + off).to_bytes(4, "big")
+                            else:
+                                cur = int.from_bytes(b[i3 + 12:i3 + 20], "big")
+                                b[i3 + 12:i3 + 20] = (cur + off).to_bytes(8, "big")
+        return bytes(b)
+
+    def _frontier(ep):
+        try:
+            ns = [int(f[6:11]) for f in os.listdir(ep["dir"])
+                  if f.startswith("seg_v_") and f.endswith(".m4s")]
+            return max(ns) if ns else -1
+        except (OSError, ValueError):
+            return -1
+
+    def _maybe_restart(t_abs):
+        # the owning epoch won't produce this segment soon: relaunch the encoder right at the source
+        # segment containing the target instead of making the receiver wait out the encode
+        with st["lock"]:
+            ep = st["epochs"][-1]
+            proc = st.get("proc")
+            alive = proc is not None and proc.poll() is None
+            j = int((t_abs - ep["base"]) // seg_dur)
+            if alive and 0 <= j <= _frontier(ep) + 12:
+                return
+            if time.monotonic() - st["restarted"] < 10:    # a fresh epoch needs a few seconds to flow
+                return
+            nd = os.path.join(root, f"e{int(t_abs)}")
+            os.makedirs(nd, exist_ok=True)
+            tc = _start_transcode_h264(source_url, hdr_map, nd, begin=t_abs)
+            if tc:
+                try:
+                    if alive:
+                        proc.terminate()
+                except Exception:
+                    pass
+                st["proc"] = tc[0]
+                st["epochs"].append({"base": tc[1], "dir": nd})
+                st["restarted"] = time.monotonic()
+                log(f"transcode: {int(t_abs)}s is outside the encode frontier -> "
+                    f"restarting the encoder there (epoch base {tc[1]:.1f}s)")
+
+    def _mpd():
+        return (f'<?xml version="1.0" encoding="utf-8"?>\n'
+                f'<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"'
+                f' profiles="urn:mpeg:dash:profile:isoff-live:2011" type="static"'
+                f' mediaPresentationDuration="PT{duration:.3f}S" minBufferTime="PT{seg_dur}S">\n'
+                f' <Period id="0" start="PT0S">\n'
+                f'  <AdaptationSet id="0" contentType="video" mimeType="video/mp4" segmentAlignment="true">\n'
+                f'   <SegmentTemplate timescale="1" duration="{seg_dur}" startNumber="0"'
+                f' initialization="init_v.mp4" media="seg_v_$Number%05d$.m4s"/>\n'
+                f'   <Representation id="0" codecs="avc1.640028" bandwidth="3000000"/>\n'
+                f'  </AdaptationSet>\n'
+                f'  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" segmentAlignment="true">\n'
+                f'   <SegmentTemplate timescale="1" duration="{seg_dur}" startNumber="0"'
+                f' initialization="init_a.mp4" media="seg_a_$Number%05d$.m4s"/>\n'
+                f'   <Representation id="1" codecs="mp4a.40.2" bandwidth="160000" audioSamplingRate="48000">\n'
+                f'    <AudioChannelConfiguration'
+                f' schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>\n'
+                f'   </Representation>\n'
+                f'  </AdaptationSet>\n'
+                f' </Period>\n'
+                f'</MPD>\n').encode()
+
+    def _master():
+        # Real master: a video rendition + a default audio group, codecs declared so the receiver inits
+        # its H.264/AAC decoders up front. avc1.640028 = H.264 High@4.0 (pinned by ffmpeg's -profile/
+        # -level); mp4a.40.2 = AAC-LC.
+        return ('#EXTM3U\n#EXT-X-VERSION:7\n'
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="au",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,'
+                'URI="stream_a.m3u8"\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=3200000,CODECS="avc1.640028,mp4a.40.2",AUDIO="au"\n'
+                'stream_v.m3u8\n').encode()
+
+    def _playlist(init, seg_prefix):
+        out = ["#EXTM3U", "#EXT-X-VERSION:7", f"#EXT-X-TARGETDURATION:{seg_dur + 1}",
+               "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MEDIA-SEQUENCE:0",
+               f'#EXT-X-MAP:URI="{init}"']
+        for i in range(nseg):
+            d = seg_dur if i < nseg - 1 else max(0.1, duration - (nseg - 1) * seg_dur)
+            out += [f"#EXTINF:{d:.3f},", f"{seg_prefix}{i:05d}.m4s"]
+        out.append("#EXT-X-ENDLIST")
+        return ("\n".join(out) + "\n").encode()
+
+    def _read_whole(fpath):
+        # a segment counts once its top-level MP4 boxes close exactly at EOF (temp_file makes the rename
+        # atomic; the box check also guards against a half-written read)
+        try:
+            with open(fpath, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        i = 0
+        while i + 8 <= len(data):
+            sz = int.from_bytes(data[i:i + 4], "big")
+            if sz < 8 or i + sz > len(data):
+                return None
+            i += sz
+        return data if data and i == len(data) else None
+
+    _dbg = {"pl": False, "seg": False}   # log the first playlist + first segment fetch only
+
+    class _TCHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        def _cors(self, extra=()):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            for k, v in extra:
+                self.send_header(k, v)
+        def _send(self, body, ctype):
+            self.send_response(200); self.send_header("Content-Type", ctype)
+            self._cors([("Content-Length", str(len(body)))]); self.end_headers(); self.wfile.write(body)
+        def do_GET(self):
+            if self.client_address[0] not in (tv, "127.0.0.1"):
+                self.send_error(403); return
+            p = self.path.split("?", 1)[0]
+            if p.endswith("manifest.mpd"):
+                if not _dbg["pl"]:
+                    _dbg["pl"] = True
+                    log(f"transcode: receiver fetched the manifest ({nseg} segs, {int(duration)}s) "
+                        f"client {self.client_address[0]}")
+                self._send(_mpd(), "application/dash+xml"); return
+            if p.endswith("master.m3u8"):
+                self._send(_master(), "application/vnd.apple.mpegurl"); return
+            if p.endswith("stream_v.m3u8"):
+                self._send(_playlist("init_v.mp4", "seg_v_"), "application/vnd.apple.mpegurl"); return
+            if p.endswith("stream_a.m3u8"):
+                self._send(_playlist("init_a.mp4", "seg_a_"), "application/vnd.apple.mpegurl"); return
+            m_init = re.match(r"/(init_[va]\.mp4)$", p)
+            m_seg = re.match(r"/seg_([va])_(\d+)\.m4s$", p)
+            data = None
+            if m_init:
+                fpath = os.path.join(root, m_init.group(1))    # fMP4 init (moov), written before seg 0
+                deadline = time.monotonic() + 30
+                while data is None and time.monotonic() < deadline:
+                    data = _read_whole(fpath)
+                    if data is None:
+                        time.sleep(0.3)
+            elif m_seg:
+                kind, num = m_seg.group(1), int(m_seg.group(2))
+                if num >= nseg + 2:
+                    self.send_error(404); return
+                t_abs = num * seg_dur
+                deadline = time.monotonic() + 40
+                base = 0.0
+                while time.monotonic() < deadline:    # long-poll the encoder's output
+                    with st["lock"]:
+                        ep = st["epochs"][0]
+                        for e in reversed(st["epochs"]):   # newest epoch covering this time
+                            if t_abs >= e["base"] - 0.5:
+                                ep = e
+                                break
+                    j = max(0, int((t_abs - ep["base"]) // seg_dur))
+                    fpath = os.path.join(ep["dir"], f"seg_{kind}_{j:05d}.m4s")
+                    # hold a segment until the same index of the other track exists too, so the receiver
+                    # gets audio and video for a window together (a track appended much later than the
+                    # other desyncs some TVs' MSE); a pair the encoder is long past serves solo
+                    other = os.path.join(ep["dir"], f"seg_{'a' if kind == 'v' else 'v'}_{j:05d}.m4s")
+                    data = _read_whole(fpath)
+                    if data is not None:
+                        if os.path.exists(other):
+                            base = ep["base"]; break
+                        try:
+                            if time.time() - os.path.getmtime(fpath) > 6:
+                                base = ep["base"]; break
+                        except OSError:
+                            pass
+                        data = None
+                    else:
+                        _maybe_restart(t_abs)
+                    time.sleep(0.25)
+                if data is not None and base > 0:
+                    data = _retime(data, base, _timescale(kind))
+            else:
+                self.send_error(404); return
+            if data is None:
+                log(f"transcode: {p} not ready -> 404")
+                self.send_error(404); return
+            if not _dbg["seg"]:
+                _dbg["seg"] = True
+                log(f"transcode: receiver fetched {p} ({len(data)} bytes)")
+            self._send(data, "video/mp4")
+    return _TCHandler
+
+
 def _make_dir_server(root, tv=""):
     """CORS-enabled static file server rooted at root (the ffmpeg HLS output dir and the downloaded
     file), reachable only by the cast target + loopback. Serves byte ranges (206), which the receiver
@@ -3078,9 +3578,8 @@ def run_cast(args):
     _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
     _yt_ff = None
     _yt_dl = None       # parallel yt-dlp download of the complete file (full-seek hand-off)
-    _file_remux = False  # True when a non-fast-start direct file is remuxed: play the event HLS to the
-                         # end and skip the finite-VOD reload (that reload resumes at the receiver's
-                         # reported position, which this receiver often gives as 0 -> restart from top)
+    _tc_dur = None      # source duration (s) when transcoding: declare the full timeline for instant seek
+    _tc_state = None    # transcode server state (current encoder proc + seek-restart epochs)
     _yt_fname = "full.mp4"   # the downloaded file's name in the serve dir (extension per container)
     _yt_dash = None     # (mpd, video_url, audio_url, ua) when YouTube is served as on-demand DASH
     if ("youtube.com" in _page) or ("youtu.be" in _page):
@@ -3189,14 +3688,63 @@ def run_cast(args):
             _rf = tempfile.mkdtemp(prefix="slc-ff-")
             _ff = _start_file_remux(source_url, hdr_map, _rf)
             if _ff:
-                _yt_dir, _yt_ff, _file_remux = _rf, _ff, True
+                _yt_dir, _yt_ff = _rf, _ff
                 log("cast: direct MP4 is not fast-start (moov at end) -> ffmpeg HLS remux")
             else:
                 shutil.rmtree(_rf, ignore_errors=True)
                 log("cast: MP4 not fast-start but ffmpeg is unavailable; casting as-is (may not start)")
+        elif _src_cls[0] == "hls" and not os.environ.get("SLC_ALLOW_AV1"):
+            # A Cast target that can't decode the source codec (AV1 on most TVs) fails the LOAD with a
+            # decode error, not a proxy/manifest problem. Transcode an AV1 source to H.264 on the fly so
+            # it plays; H.264 and unknown codecs keep the direct reverse-proxy (no needless transcode).
+            # SLC_ALLOW_AV1=1 opts out for a TV that does decode AV1.
+            if _hls_video_codec(source_url, hdr_map) == "av1":
+                _rf = tempfile.mkdtemp(prefix="slc-tc-")
+                _tc = _start_transcode_h264(source_url, hdr_map, _rf)
+                if _tc:
+                    _yt_dir, _yt_ff = _rf, _tc[0]
+                    _d = _hls_duration(source_url, hdr_map)
+                    if _d > 0:
+                        _tc_dur = _d      # known duration -> full VOD playlist (instant seek); else event+reload
+                    log("cast: source is AV1 (this TV can't decode it) -> transcoding to H.264"
+                        + (f" ({int(_d)}s VOD, instant seek)" if _d > 0 else ""))
+                else:
+                    _tc = None
+                    shutil.rmtree(_rf, ignore_errors=True)
+                    log("cast: AV1 source but ffmpeg is unavailable; casting as-is (may not play)")
 
     _ct_load = "application/x-mpegurl"
-    if _yt_dash is not None:
+    if _tc_dur is not None:
+        # AV1 transcode with a known duration: serve a static DASH MPD (full timeline up front =
+        # instant duration + seek bar) over long-polled segments, audio and video as separate
+        # representations so A/V sync holds. Pre-buffer a lead of BOTH before LOAD so playback starts
+        # behind the audio frontier (the source interleaves audio late); a far seek relaunches the
+        # encoder at the target (epoch subdirs, re-timed while serving).
+        _tc_state = {"proc": _yt_ff}
+        httpd = ThreadingHTTPServer((ip, args.port),
+                                    _make_transcode_server(_yt_dir, _tc_dur, source_url, hdr_map,
+                                                           tv=args.tv, state=_tc_state))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        _is_vod, _stream_type = True, "BUFFERED"
+        _ct_load = "application/dash+xml"
+        hls_url = f"http://{ip}:{args.port}/manifest.mpd?vod=1&tc=1"
+        _lead = min(8, max(0, int(_tc_dur // 4) - 1))   # audio+video segment index to pre-buffer to
+        for _ in range(160):     # up to ~80s for the encoder to build an audio+video lead
+            _av = (os.path.exists(os.path.join(_yt_dir, f"seg_v_{_lead:05d}.m4s"))
+                   and os.path.exists(os.path.join(_yt_dir, f"seg_a_{_lead:05d}.m4s")))
+            if _av or _yt_ff.poll() is not None:
+                break
+            time.sleep(0.5)
+        if not os.path.exists(os.path.join(_yt_dir, "seg_v_00000.m4s")):
+            log("cast: transcode produced no output (ffmpeg failed); aborting")
+            try:
+                _yt_ff.terminate()
+            except Exception:
+                pass
+            shutil.rmtree(_yt_dir, ignore_errors=True)
+            httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+        log(f"transcode DASH at {hls_url} -> cast (VOD, instant seek) to {args.cast_name or args.tv}")
+    elif _yt_dash is not None:
         httpd = ThreadingHTTPServer((ip, args.port), _make_dash_server(*_yt_dash, tv=args.tv))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _is_vod, _stream_type = True, "BUFFERED"
@@ -3409,7 +3957,7 @@ def run_cast(args):
         # VOD. Re-send the LOAD resuming at the current position so the receiver shows the total
         # duration and seeks freely. The receiver telemetry's t is always 0 (shadow-DOM), so the
         # resume position comes from the MEDIA-namespace status instead.
-        if not _yt_vod_reloaded and not _file_remux:
+        if not _yt_vod_reloaded and _tc_dur is None:
             _file_ready = (not _yt_file_failed and _yt_dl is not None and _yt_dl.poll() == 0
                            and os.path.exists(os.path.join(_yt_dir, _yt_fname)))
             _hls_done = _yt_ff is not None and _yt_ff.poll() == 0
@@ -3493,8 +4041,15 @@ def run_cast(args):
             tele += 1
             if tele >= 7:          # ~ every 10s
                 tele = 0
+                _extra = ""
+                if slc.last.get("vbuf") is not None or slc.last.get("abuf") is not None:
+                    # diagnostic receiver: per-track SourceBuffer ranges + element state + last seek
+                    _extra = (f" rs={slc.last.get('rs')} paused={slc.last.get('paused')}"
+                              f" vbuf={slc.last.get('vbuf')} abuf={slc.last.get('abuf')}"
+                              f" seek={slc.last.get('seek')} waits={slc.last.get('waits')}"
+                              f" relatch={slc.last.get('relatch')}")
                 log(f"cast: telemetry rx={slc.last.get('ver')} state={st} buf={slc.last.get('buf')}s "
-                    f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}")
+                    f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}" + _extra)
 
     _quit()
     if httpd:
@@ -3502,6 +4057,11 @@ def run_cast(args):
     if _yt_ff:
         try:
             _yt_ff.terminate()
+        except Exception:
+            pass
+    if _tc_state and _tc_state.get("proc") is not None:
+        try:
+            _tc_state["proc"].terminate()   # the seek-restarted encoder, when one replaced _yt_ff
         except Exception:
             pass
     if _yt_dl:

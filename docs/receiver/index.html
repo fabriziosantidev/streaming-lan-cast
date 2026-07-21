@@ -42,9 +42,20 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.8';
-    const stats = { stalls: 0, reconnects: 0, lastError: null, lastKey: null };
+    const RX_VERSION = '1.9';
+    const stats = { stalls: 0, waits: 0, reconnects: 0, lastError: null, lastKey: null, lastSeek: null };
     window.__stats = stats;
+
+    // Capture each MSE SourceBuffer as the player creates it, so telemetry can
+    // report the buffered ranges of audio and video separately (the media element's .buffered only
+    // exposes their intersection, which alone can't tell you which track is starving or gapped).
+    const sbs = [];
+    const _addSB = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function (mime) {
+      const sb = _addSB.call(this, mime);
+      sbs.push({ k: /audio/i.test(mime) ? 'a' : (/video/i.test(mime) ? 'v' : '?'), sb });
+      return sb;
+    };
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
@@ -81,6 +92,7 @@
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (req) => {
       try {
         const m = req.media || {};
+        sbs.length = 0;                    // new load -> new MediaSource; drop the old SourceBuffers
         splash.classList.remove('gone');   // show the loading logo while the new stream loads
         m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
         const url = m.contentUrl || '';
@@ -107,6 +119,13 @@
         // Some hosts deliver ALL media through the parts (the full #EXTINF segments are empty markers), so
         // without this Shaka fetches empty segments and never fills its buffer.
         playbackConfig.shakaConfig.streaming.lowLatencyMode = lowLat && !isVod;
+        // A locally transcoded source (tc=1) produces segments on the fly and its server holds a
+        // request open until the segment exists; give those requests time to be answered instead of
+        // aborting at the 5s no-bytes stall cutoff and re-firing each track on its own clock (tracks
+        // then join MSE far apart, which desyncs some TVs).
+        const isTc = url.indexOf('tc=1') !== -1;
+        playbackConfig.shakaConfig.streaming.retryParameters.timeout = isTc ? 50000 : 9000;
+        playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
@@ -126,13 +145,99 @@
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
     playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
+
+    // The media element lives inside <cast-media-player>'s shadow root, so a plain tag lookup finds
+    // nothing (and telemetry then reports t=0/buf=0 forever). Pierce the shadow root.
+    function mediaEl() {
+      let v = document.getElementsByTagName('video')[0];
+      if (!v) {
+        const p = document.querySelector('cast-media-player');
+        if (p && p.shadowRoot) v = p.shadowRoot.querySelector('video, audio');
+      }
+      return v;
+    }
+    let hooked = null;
+    stats.relatch = 0;
+    function sbCovers(kind, t, lead) {
+      for (const x of sbs) {
+        if (x.k !== kind) continue;
+        try {
+          const b = x.sb.buffered;
+          for (let i = 0; i < b.length; i++) if (t >= b.start(i) && t + lead <= b.end(i)) return true;
+        } catch (e) {}
+      }
+      return false;
+    }
+    function bufferedCovers(t) {
+      for (const x of sbs) {
+        try {
+          const b = x.sb.buffered;
+          for (let i = 0; i < b.length; i++) if (t >= b.start(i) && t < b.end(i)) return true;
+        } catch (e) {}
+      }
+      return false;
+    }
+    // A seek INTO buffered content latches this TV's audio/video render clocks correctly; a seek
+    // OUTSIDE the buffer (tracks streaming in while the element waits) latches them apart even though
+    // the appended data is aligned. So turn every unbuffered seek into a buffered one: hold the
+    // element paused, wait until BOTH tracks cover the target, then re-seek into the buffer and play.
+    let fix = null;   // { own, iv } - the pending unbuffered-seek recovery
+    function cancelFix() { if (fix) { clearInterval(fix.iv); fix = null; } }
+    function hookMedia(v) {
+      if (!v || hooked === v) return;
+      hooked = v;
+      v.addEventListener('seeking', () => {
+        stats.lastSeek = 'seeking@' + Math.round(v.currentTime);
+        if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
+        cancelFix();
+        if (bufferedCovers(v.currentTime)) return;
+        const target = v.currentTime;
+        const wasPaused = v.paused;
+        const t0 = Date.now();
+        try { v.pause(); } catch (e) {}
+        stats.relatch++;
+        fix = { own: 0 };
+        fix.iv = setInterval(() => {
+          const lead = Math.max(0.5, Math.min(4, (v.duration || 1e9) - target - 0.3));
+          if (sbCovers('v', target, lead) && sbCovers('a', target, lead)) {
+            clearInterval(fix.iv);
+            fix.own = target + 0.001;
+            try { v.currentTime = fix.own; } catch (e) {}
+            if (!wasPaused) { try { v.play(); } catch (e) {} }
+            setTimeout(cancelFix, 3000);
+          } else if (Date.now() - t0 > 90000) {
+            cancelFix();
+            if (!wasPaused) { try { v.play(); } catch (e) {} }
+          }
+        }, 250);
+      });
+      v.addEventListener('seeked', () => { stats.lastSeek = 'seeked@' + Math.round(v.currentTime); });
+      v.addEventListener('playing', () => {
+        if (fix && !fix.own) { try { v.pause(); } catch (e) {} }   // resumed early mid-fix; keep holding
+      });
+      v.addEventListener('waiting', () => { stats.waits++; });
+    }
+    function rangesOf(b) {
+      const out = [];
+      try { for (let i = 0; i < b.length && out.length < 4; i++) out.push([Math.round(b.start(i) * 10) / 10, Math.round(b.end(i) * 10) / 10]); } catch (e) {}
+      return out;
+    }
     setInterval(() => {
-      const v = document.getElementsByTagName('video')[0];
-      let st = 'idle', t = 0, buf = 0;
+      const v = mediaEl();
+      hookMedia(v);
+      let st = 'idle', t = 0, buf = 0, rs = -1, paused = null;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
-      if (v) { t = Math.round(v.currentTime * 10) / 10; try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {} }
+      if (v) {
+        t = Math.round(v.currentTime * 10) / 10; rs = v.readyState; paused = !!v.paused;
+        try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {}
+      }
+      const bufs = {};
+      for (const x of sbs) { try { bufs[x.k] = rangesOf(x.sb.buffered); } catch (e) {} }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
-      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, rs, paused,
+        vbuf: bufs.v || null, abuf: bufs.a || null, seek: stats.lastSeek || null, waits: stats.waits | 0,
+        relatch: stats.relatch | 0,
+        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
     }, 2000);
 
     // BACK button. The numeric keyCode for "back" isn't consistent across Cast platforms, so match the

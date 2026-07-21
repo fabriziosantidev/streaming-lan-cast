@@ -121,7 +121,7 @@ There are three version numbers, and they are no longer bumped in lockstep:
 `docs/version.json` is the single source of truth for the latest helper:
 
 ```
-{ "helper": "0.5.5", "min_extension": "0.4.0" }
+{ "helper": "0.5.6", "min_extension": "0.4.0" }
 ```
 
 The running helper fetches it in the background and reports `latest` + `min_ext` on `/ping`. The popup

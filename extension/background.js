@@ -71,7 +71,11 @@ function classify(url, ct) {
   ct = (ct || "").toLowerCase();
   if (/\.m3u8(\?|#|$)/.test(u) || ct.includes("mpegurl")) return "hls";
   if (/\.mpd(\?|#|$)/.test(u) || ct.includes("dash+xml")) return "dash";
-  if (/\.(mp4|webm)(\?|#|$)/.test(u) && ct.startsWith("video/")) return "file";
+  // A direct media file: a container extension (mp4/m4v/mov/webm), even when the host serves it as
+  // application/octet-stream or sends no type (common on direct-download hosts). Only a text/* type
+  // rules it out (an HTML page at a .mp4 URL). Segments (.ts/.m4s, video/mp2t) have no container
+  // extension, so they stay ignored.
+  if (/\.(mp4|m4v|mov|webm)(\?|#|$)/.test(u) && !ct.startsWith("text/")) return "file";
   return null;
 }
 // Segment-level playlists whose filenames carry a rolling stream/segment id (live low-latency chunklists).
