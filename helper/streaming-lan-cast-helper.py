@@ -1238,7 +1238,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                 r.close()
                 ch = {k: v for k, v in h.items() if k.lower() not in _IMPERSONATE_OWNS}
                 r = _cffi_sess.get(url, headers=ch, stream=True, timeout=timeout, impersonate="chrome")
-            return r.status_code, r.headers, r.iter_content(65536)
+            return r.status_code, r.headers, r.iter_content(65536), r
     except ImportError:
         def _fetch(url, timeout=10):
             try:
@@ -1261,7 +1261,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                     if not c:
                         break
                     yield c
-            return status, r.headers, _it()
+            return status, r.headers, _it(), r
 
     def _rewrite(text, base):
         # point every URL (segment, variant, key, map) at /p?u=<absolute> so it stays proxied
@@ -1286,7 +1286,88 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
         qs = path.split("?", 1)[1] if "?" in path else ""
         return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
 
-    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False}   # log the first of each event only once
+    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False, "frange": 0}   # log the first of each event only once
+
+    # In-flight direct-file responses. Seeking makes the receiver stop reading the response it has and
+    # open a new range request, so the old one is left blocked writing to a socket nobody drains while
+    # still holding its upstream connection. Hosts that serve a limited number of connections at a time
+    # then keep the new request waiting, which shows up as a seek that hangs. Each new file request
+    # therefore supersedes the ones the receiver left behind.
+    _files, _files_lock, _files_seq = {}, threading.Lock(), [0]
+
+    def _claim_file_stream(sock):
+        """Register this response and drop the ones the receiver stopped reading. A stream still
+        delivering bytes is left alone, so a player that fetches over several connections keeps them."""
+        now = time.monotonic()
+        with _files_lock:
+            _files_seq[0] += 1
+            for st in _files.values():
+                if st["sock"] is sock or now - st["wrote"] < 1:
+                    continue
+                st["live"] = False
+                if st["up"] is not None:
+                    try:
+                        st["up"].close()           # hand the upstream connection back
+                    except Exception:
+                        pass
+                try:
+                    st["sock"].shutdown(socket.SHUT_RDWR)   # release a write that nobody is reading
+                except OSError:
+                    pass
+            _files[_files_seq[0]] = {"sock": sock, "up": None, "live": True, "wrote": now}
+            return _files_seq[0]
+
+    def _track_file_stream(fid, up):
+        """Attach the upstream response to a claimed stream; False once it has been superseded."""
+        with _files_lock:
+            st = _files.get(fid)
+            if st is None:
+                return False
+            st["up"] = up
+            return st["live"]
+
+    def _file_stream_tick(fid):
+        """Mark progress on a stream and report whether it is still wanted."""
+        with _files_lock:
+            st = _files.get(fid)
+            if st is None:
+                return False
+            st["wrote"] = time.monotonic()
+            return st["live"]
+
+    def _drop_file_stream(fid, up):
+        with _files_lock:
+            _files.pop(fid, None)
+        if up is not None:
+            try:
+                up.close()
+            except Exception:
+                pass
+
+    def _align_to_request(req_range, status, uh):
+        """Ranging headers to answer with, plus how many leading bytes to drop, when the host starts a
+        range response earlier than asked (some ignore Range and send the file from the top). Keeping
+        the receiver's own offsets is what lets it seek: bytes delivered under the wrong offset decode
+        at the wrong timestamp, leaving the playhead in a hole. Returns (status, range, length, skip)."""
+        crange, clen = uh.get("Content-Range"), uh.get("Content-Length")
+        m = re.match(r"bytes=(\d+)-", req_range or "")
+        if not m:
+            return status, crange, clen, 0
+        want = int(m.group(1))
+        got = re.match(r"bytes\s+(\d+)-\d*/(\d+|\*)", crange or "")
+        if got:
+            start, total = int(got.group(1)), (None if got.group(2) == "*" else int(got.group(2)))
+        elif status == 200:
+            start = 0
+            total = int(clen) if (clen or "").isdigit() else None
+        else:
+            return status, crange, clen, 0
+        if start >= want:
+            return status, crange, clen, 0
+        skip = want - start
+        if total is None:
+            return status, crange, clen, skip
+        return 206, f"bytes {want}-{total - 1}/{total}", str(total - want), skip
 
     class HlsProxy(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1318,27 +1399,44 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                 if media_kind == "file":
                     # Direct media file: forward the receiver's Range so it can seek; relay the ranging
                     # headers (status 206 + Content-Range) the player needs.
-                    status, uh, body_it = _fetch_ranged(source_url, self.headers.get("Range"))
-                    ct = uh.get("Content-Type") or ""
-                    if not ct.startswith("video/"):   # many direct-download hosts serve the file as
-                        ct = "video/webm" if p.endswith(".webm") else "video/mp4"   # octet-stream; the receiver needs a video type
-                    extra = [("Accept-Ranges", "bytes")]
-                    crange, clen = uh.get("Content-Range"), uh.get("Content-Length")
-                    if crange:
-                        extra.append(("Content-Range", crange))
-                    if clen is not None:
-                        extra.append(("Content-Length", clen))
-                    else:
-                        extra.append(("Connection", "close"))
-                    if not dbg["seg"]:
-                        dbg["seg"] = True
-                        log(f"proxy: receiver fetching direct file (status {status}, client {self.client_address[0]})")
-                    self.send_response(status)
-                    self.send_header("Content-Type", ct)
-                    self._cors(extra); self.end_headers()
-                    for chunk in body_it:
-                        if chunk:
+                    req_range = self.headers.get("Range")
+                    fid, up = _claim_file_stream(self.connection), None
+                    try:
+                        status, uh, body_it, up = _fetch_ranged(source_url, req_range)
+                        if not _track_file_stream(fid, up):
+                            return
+                        ct = uh.get("Content-Type") or ""
+                        if not ct.startswith("video/"):   # many direct-download hosts serve the file as
+                            ct = "video/webm" if p.endswith(".webm") else "video/mp4"   # octet-stream; the receiver needs a video type
+                        status, crange, clen, skip = _align_to_request(req_range, status, uh)
+                        extra = [("Accept-Ranges", "bytes")]
+                        if crange:
+                            extra.append(("Content-Range", crange))
+                        if clen is not None:
+                            extra.append(("Content-Length", clen))
+                        else:
+                            extra.append(("Connection", "close"))
+                        if dbg["frange"] < 60:
+                            dbg["frange"] += 1
+                            log(f"proxy: file {req_range or 'from the top'} -> upstream {status} "
+                                f"{uh.get('Content-Range') or 'unranged'}"
+                                + (f", trimming {skip}B to line up" if skip else ""))
+                        self.send_response(status)
+                        self.send_header("Content-Type", ct)
+                        self._cors(extra); self.end_headers()
+                        for chunk in body_it:
+                            if not _file_stream_tick(fid):
+                                self.close_connection = True
+                                break
+                            if not chunk:
+                                continue
+                            if skip:
+                                if len(chunk) <= skip:
+                                    skip -= len(chunk); continue
+                                chunk, skip = chunk[skip:], 0
                             self.wfile.write(chunk)
+                    finally:
+                        _drop_file_stream(fid, up)
                     return
                 if p == "/live.m3u8":
                     # Forward only the receiver's blocking-reload params, dropping the source's stale ones
