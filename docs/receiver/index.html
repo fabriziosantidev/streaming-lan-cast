@@ -42,9 +42,10 @@
   <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.9';
+    const RX_VERSION = '1.10';
     const stats = { stalls: 0, waits: 0, reconnects: 0, lastError: null, lastKey: null, lastSeek: null };
     window.__stats = stats;
+    let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
     // Capture each MSE SourceBuffer as the player creates it, so telemetry can
     // report the buffered ranges of audio and video separately (the media element's .buffered only
@@ -124,6 +125,7 @@
         // aborting at the 5s no-bytes stall cutoff and re-firing each track on its own clock (tracks
         // then join MSE far apart, which desyncs some TVs).
         const isTc = url.indexOf('tc=1') !== -1;
+        tcMode = isTc;
         playbackConfig.shakaConfig.streaming.retryParameters.timeout = isTc ? 50000 : 9000;
         playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
@@ -190,6 +192,9 @@
         stats.lastSeek = 'seeking@' + Math.round(v.currentTime);
         if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
         cancelFix();
+        // Only a transcode feeds MSE here; anything else (a progressive file) is seeked by the player
+        // itself against its own buffer, which these SourceBuffer checks cannot see.
+        if (!tcMode || !sbs.length) return;
         if (bufferedCovers(v.currentTime)) return;
         const target = v.currentTime;
         const wasPaused = v.paused;
