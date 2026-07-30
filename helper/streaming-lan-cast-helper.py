@@ -2750,6 +2750,11 @@ def _classify_stream(urls, hdr_map, probe_media=True):
         probe = fresh or (variants[0]["url"] if variants else src)
         probe = re.sub(r"&_HLS_[^&]*", "", probe) if probe else probe
         mt = master_text if (master_text and not variants) else (_fetch_playlist(probe, hdr_map, timeout=3) if probe else None)
+        if mt is None:
+            # the probe couldn't read the media playlist (a signed chunklist can refuse a second fetch);
+            # fall back to VOD rather than the initial live guess, since casting a VOD as live drops the
+            # seek bar entirely, the worse outcome
+            model["live"] = False
     else:
         # Don't fetch the media just to classify it: its signed URL can be single-use (some hosts' per-quality
         # variant playlist 410s on the 2nd fetch), and the proxy fetches it exactly once when it serves - so a
