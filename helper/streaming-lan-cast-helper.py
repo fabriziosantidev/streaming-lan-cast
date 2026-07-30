@@ -2687,6 +2687,30 @@ def _media_signature(buf):
     if not buf:
         return "", -1
     n = len(buf)
+
+    def _kind_at(o):                                    # what media, if any, begins exactly at o
+        if o + 8 <= n and buf[o + 4:o + 8] in (b"ftyp", b"styp", b"moof", b"sidx"):
+            return "fmp4"
+        if 0 <= o < n and buf[o] == 0x47 and o + 376 < n and buf[o + 188] == 0x47 and buf[o + 376] == 0x47:
+            return "ts"
+        return ""
+
+    if buf[:8] == b"\x89PNG\r\n\x1a\n":
+        # a leading PNG: walk its chunks to IEND for the exact end. A byte scan can match a false sync
+        # inside a larger PNG's data and cut the media at the wrong offset; the media begins right after
+        # the PNG, so take that offset when a container actually starts there.
+        i = 8
+        while i + 12 <= n:
+            ln = int.from_bytes(buf[i:i + 4], "big")
+            typ = buf[i + 4:i + 8]
+            i += 12 + ln
+            if typ == b"IEND":
+                k = _kind_at(i)
+                if k:
+                    return k, i
+                break
+            if i > n:
+                break
     for tag in (b"ftyp", b"styp", b"moof", b"sidx"):    # an ISO-BMFF box: 4-byte size then the type
         i = buf.find(tag, 4)
         while i >= 4:
