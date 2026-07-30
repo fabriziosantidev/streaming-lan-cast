@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.6"   # reported to the extension via /ping; for a release bump this and the .iss
+HELPER_VERSION = "0.5.7"   # reported to the extension via /ping; for a release bump this and the .iss
                            # (the extension version is independent now; see version.json / checkHelperVersion)
 # Canonical "latest published helper" manifest, checked in the background so /ping can tell the
 # extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
@@ -4049,10 +4049,17 @@ def run_cast(args):
     last_err = None
     load_attempts = 1              # the initial play_media above is attempt 1
     last_load_at = time.monotonic()
+    last_progress_at = last_load_at   # when the receiver's buffer last grew under the current LOAD
+    deepest_buf = -1.0                # deepest buffer it has reported under the current LOAD
     gave_up = False
     MAX_LOAD_ATTEMPTS = 5          # if the receiver reports a load error before playback starts, the
                                    # session just sits idle; re-send the LOAD ourselves up to this many
                                    # times (a source that's slow to start often succeeds on a later try)
+    LOAD_RETRY_AFTER = 12          # a LOAD reaches playback anywhere from ~4s to ~25s in, so hold a
+                                   # re-send until well past the usual start, else a source that is
+                                   # merely slow never gets to finish starting
+    LOAD_STUCK_AFTER = 6           # ...and only once the buffer has stopped growing for this long: a
+                                   # LOAD still filling its buffer is working, however long it takes
     while True:
         time.sleep(POLL)
         app = getattr(cc, "app_id", None)
@@ -4147,13 +4154,31 @@ def run_cast(args):
         # re-send the LOAD. It hits the same warm proxy for a fresh live playlist, so a source that's
         # slow to start usually catches on a later attempt. Bounded and cooled down so a lingering error
         # (or a genuinely dead source) can't storm.
+        #
+        # A re-send aborts the LOAD in flight, and the receiver reports that abort as a load error in
+        # turn, so retrying on the error alone feeds itself: each attempt restarts buffering from zero
+        # and the source never gets a full start out of any of them. Track buffer growth and only
+        # re-send a LOAD that has both aged out and stopped making progress.
+        if not played:
+            buf_now = 0.0
+            if slc.last:
+                try:
+                    buf_now = float(slc.last.get("buf") or 0)
+                except (TypeError, ValueError):
+                    buf_now = 0.0
+            if buf_now > deepest_buf:
+                deepest_buf = buf_now
+                last_progress_at = time.monotonic()
         if not played and err and err.startswith("shaka/"):
-            if load_attempts < MAX_LOAD_ATTEMPTS and (time.monotonic() - last_load_at) > 4:
+            now = time.monotonic()
+            if (load_attempts < MAX_LOAD_ATTEMPTS and (now - last_load_at) > LOAD_RETRY_AFTER
+                    and (now - last_progress_at) > LOAD_STUCK_AFTER):
                 load_attempts += 1
                 log(f"cast: load failed ({err}); auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
                 try:
                     mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
-                    last_load_at = time.monotonic()
+                    last_load_at = last_progress_at = time.monotonic()
+                    deepest_buf = -1.0      # the new LOAD buffers from zero
                 except Exception as e:
                     log(f"cast: auto-retry LOAD send failed: {type(e).__name__}: {str(e)[:60]}")
             elif load_attempts >= MAX_LOAD_ATTEMPTS and not gave_up:
