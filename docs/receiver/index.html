@@ -34,7 +34,7 @@
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.11';
+    const RX_VERSION = '1.12';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -126,15 +126,31 @@
 
     // telemetry so the helper log shows whether Shaka plays or chokes (and why)
     const EV = cast.framework.events.EventType;
+    // Name whatever fields an object actually carries. CAF nests the underlying player error under
+    // several shapes, so reading fixed keys off it reports nothing; listing the keys that are there
+    // shows what was rejected (network / manifest / media / codec) whichever shape arrived.
+    function describe(o, depth) {
+      if (o == null || typeof o !== 'object') return String(o).slice(0, 48);
+      const out = [];
+      for (const k of Object.keys(o).slice(0, 8)) {
+        const v = o[k];
+        if (v == null || typeof v === 'function') continue;
+        out.push(k + '=' + (typeof v === 'object' ? (depth > 0 ? describe(v, depth - 1) : '{}')
+                                                  : String(v).slice(0, 32)));
+      }
+      return '{' + out.join(' ') + '}';
+    }
     playerManager.addEventListener(EV.ERROR, (e) => {
-      // capture the internal Shaka error (category.code + data) so the log shows exactly what was
-      // rejected (network / manifest / media / codec).
       let d = 'shaka/' + (e && e.detailedErrorCode);
       try {
+        if (e && e.reason != null) d += ' reason=' + e.reason;
         const er = e && (e.error || (e.errorInfo && e.errorInfo.error));
-        if (er) d += ' [' + (er.category != null ? er.category : '?') + '.' + (er.code != null ? er.code : '?') + ' ' + JSON.stringify(er.data || []).slice(0, 80) + ']';
-      } catch (x) {}
-      stats.lastError = d;
+        if (er) d += ' err=' + describe(er, 1);
+        // the media element keeps its own error, which survives when the event carries none
+        const v = mediaEl();
+        if (v && v.error) d += ' media=' + v.error.code + '/' + String(v.error.message || '').slice(0, 32);
+      } catch (x) { d += ' describe/' + x.message; }
+      stats.lastError = d.slice(0, 200);
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
     playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
