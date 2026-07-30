@@ -27,29 +27,20 @@
   #splash img { width: 168px; height: 168px; }
   #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
   #splash.gone { display: none; }
-  /* On-screen key readout for debugging remote input; hidden until toggled from the remote. */
-  #keydbg {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999; display: none;
-    padding: 10px 18px; text-align: center;
-    background: rgba(0, 0, 0, 0.72); color: #fff;
-    font: 700 2.6vw/1.3 monospace; letter-spacing: 0.03em;
-  }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
-  <div id="keydbg"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.10';
-    const stats = { stalls: 0, waits: 0, reconnects: 0, lastError: null, lastKey: null, lastSeek: null };
-    window.__stats = stats;
+    const RX_VERSION = '1.11';
+    const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
-    // Capture each MSE SourceBuffer as the player creates it, so telemetry can
-    // report the buffered ranges of audio and video separately (the media element's .buffered only
-    // exposes their intersection, which alone can't tell you which track is starving or gapped).
+    // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
+    // whether audio and video separately cover a seek target (the media element's .buffered only
+    // exposes their intersection).
     const sbs = [];
     const _addSB = MediaSource.prototype.addSourceBuffer;
     MediaSource.prototype.addSourceBuffer = function (mime) {
@@ -149,7 +140,7 @@
     playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
 
     // The media element lives inside <cast-media-player>'s shadow root, so a plain tag lookup finds
-    // nothing (and telemetry then reports t=0/buf=0 forever). Pierce the shadow root.
+    // nothing. Pierce the shadow root to hook it and to read its position/buffer for the status telemetry.
     function mediaEl() {
       let v = document.getElementsByTagName('video')[0];
       if (!v) {
@@ -159,7 +150,6 @@
       return v;
     }
     let hooked = null;
-    stats.relatch = 0;
     function sbCovers(kind, t, lead) {
       for (const x of sbs) {
         if (x.k !== kind) continue;
@@ -189,7 +179,6 @@
       if (!v || hooked === v) return;
       hooked = v;
       v.addEventListener('seeking', () => {
-        stats.lastSeek = 'seeking@' + Math.round(v.currentTime);
         if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
         cancelFix();
         // Only a transcode feeds MSE here; anything else (a progressive file) is seeked by the player
@@ -200,7 +189,6 @@
         const wasPaused = v.paused;
         const t0 = Date.now();
         try { v.pause(); } catch (e) {}
-        stats.relatch++;
         fix = { own: 0 };
         fix.iv = setInterval(() => {
           const lead = Math.max(0.5, Math.min(4, (v.duration || 1e9) - target - 0.3));
@@ -216,33 +204,22 @@
           }
         }, 250);
       });
-      v.addEventListener('seeked', () => { stats.lastSeek = 'seeked@' + Math.round(v.currentTime); });
       v.addEventListener('playing', () => {
         if (fix && !fix.own) { try { v.pause(); } catch (e) {} }   // resumed early mid-fix; keep holding
       });
-      v.addEventListener('waiting', () => { stats.waits++; });
-    }
-    function rangesOf(b) {
-      const out = [];
-      try { for (let i = 0; i < b.length && out.length < 4; i++) out.push([Math.round(b.start(i) * 10) / 10, Math.round(b.end(i) * 10) / 10]); } catch (e) {}
-      return out;
     }
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
-      let st = 'idle', t = 0, buf = 0, rs = -1, paused = null;
+      let st = 'idle', t = 0, buf = 0;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) {
-        t = Math.round(v.currentTime * 10) / 10; rs = v.readyState; paused = !!v.paused;
+        t = Math.round(v.currentTime * 10) / 10;
         try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {}
       }
-      const bufs = {};
-      for (const x of sbs) { try { bufs[x.k] = rangesOf(x.sb.buffered); } catch (e) {} }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
-      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, rs, paused,
-        vbuf: bufs.v || null, abuf: bufs.a || null, seek: stats.lastSeek || null, waits: stats.waits | 0,
-        relatch: stats.relatch | 0,
-        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null, key: stats.lastKey || null }); } catch (e) {}
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf,
+        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
     // BACK button. The numeric keyCode for "back" isn't consistent across Cast platforms, so match the
@@ -255,42 +232,12 @@
       return e.keyCode === 166 || e.keyCode === 461 || e.keyCode === 10009;
     }
 
-    // Debug readout: press Up, Up, Down, Down on the remote to toggle an on-screen panel showing the
-    // code/key of each press - handy to read what an unfamiliar device sends for BACK. Off by default,
-    // so normal playback shows nothing. The last key also rides along in the status telemetry above.
-    const keyDbg = document.getElementById('keydbg');
-    let dbgOn = false;
-    const combo = [];
-    function dirOf(e) {
-      const k = (e.key || '').toLowerCase();
-      if (k === 'arrowup' || e.keyCode === 38) return 'up';
-      if (k === 'arrowdown' || e.keyCode === 40) return 'down';
-      return '';
-    }
-    function showKey(e) {
-      stats.lastKey = { code: e.keyCode, key: e.key || '' };
-      if (dbgOn) keyDbg.textContent = 'keyCode ' + e.keyCode + '   key "' + (e.key || '') + '"   back=' + isBackKey(e);
-    }
-    function toggleCheck(e) {
-      const d = dirOf(e);
-      if (!d) return;
-      combo.push(d);
-      if (combo.length > 4) combo.shift();
-      if (combo.join(',') === 'up,up,down,down') {
-        dbgOn = !dbgOn;
-        keyDbg.style.display = dbgOn ? 'block' : 'none';
-        keyDbg.textContent = dbgOn ? 'key debug ON' : '';
-        combo.length = 0;
-      }
-    }
-
     // With the player controls visible, a back press just hides them (CAF's default); with them already
     // hidden it exits. CAF shows the controls on any remote key and auto-hides them a few seconds later,
     // so "time since the last key" stands in for the controls being visible. Capture phase, so this runs
     // before <cast-media-player> consumes the key.
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
-      showKey(e);
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
       if (isBackKey(e)) {
         if (controlsVisible) {
@@ -301,7 +248,6 @@
         }
       } else {
         lastKeyAt = Date.now();                    // any other remote key shows the controls
-        toggleCheck(e);
       }
     }, true);
 

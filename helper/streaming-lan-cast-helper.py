@@ -4168,15 +4168,8 @@ def run_cast(args):
             tele += 1
             if tele >= 7:          # ~ every 10s
                 tele = 0
-                _extra = ""
-                if slc.last.get("vbuf") is not None or slc.last.get("abuf") is not None:
-                    # diagnostic receiver: per-track SourceBuffer ranges + element state + last seek
-                    _extra = (f" rs={slc.last.get('rs')} paused={slc.last.get('paused')}"
-                              f" vbuf={slc.last.get('vbuf')} abuf={slc.last.get('abuf')}"
-                              f" seek={slc.last.get('seek')} waits={slc.last.get('waits')}"
-                              f" relatch={slc.last.get('relatch')}")
                 log(f"cast: telemetry rx={slc.last.get('ver')} state={st} buf={slc.last.get('buf')}s "
-                    f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}" + _extra)
+                    f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}")
 
     _quit()
     if httpd:
