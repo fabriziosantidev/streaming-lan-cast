@@ -78,7 +78,18 @@ async function call(path, opts) {
     init.body = opts.body;
     init.headers["Content-Type"] = "application/x-www-form-urlencoded";
   }
-  const r = await fetch(CONTROL + path, init);
+  // A caller that is holding up the first view can cap the wait: a connection to a port nothing
+  // listens on is refused immediately on some systems and left hanging on others, and the popup has
+  // nothing to show until this answers.
+  let timer;
+  if (opts && opts.timeoutMs) {
+    const ac = new AbortController();
+    init.signal = ac.signal;
+    timer = setTimeout(() => ac.abort(), opts.timeoutMs);
+  }
+  let r;
+  try { r = await fetch(CONTROL + path, init); }
+  finally { clearTimeout(timer); }
   if (r.status === 401 || r.status === 403) {
     const e = new Error("unauthorized"); e.unauthorized = true; throw e;
   }
@@ -86,6 +97,7 @@ async function call(path, opts) {
 }
 function whatOf(s) { return (s.title || "").trim() || (s.url || ""); }
 function view(name) {
+  $("booting").hidden = true;            // a real view is up; the first-paint stand-in is done
   $("noHelper").hidden = name !== "noHelper";
   $("needToken").hidden = name !== "needToken";
   $("pickerView").hidden = name !== "picker";
@@ -103,7 +115,7 @@ async function activeTab() {
 
 async function init() {
   let ping;
-  try { ping = await call("/ping"); }
+  try { ping = await call("/ping", { timeoutMs: 2500 }); }
   catch (e) { stopAll(); setLive(false); return view(e && e.unauthorized ? "needToken" : "noHelper"); }
   checkHelperVersion(ping);
   let status = {};

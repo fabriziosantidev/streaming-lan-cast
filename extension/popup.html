@@ -117,6 +117,12 @@
     <button id="themeBtn" class="themebtn" title="" aria-label="theme"></button>
   </div>
 
+  <!-- First paint. Every view below starts hidden and which one applies is only known after the
+       helper probe answers, so without something laid out here the popup opens as tall as the bar
+       alone. Firefox keeps that opening height when the real view appears, leaving the body clipped
+       out of sight. Standing in at roughly a view's height gets the popup sized right from the start. -->
+  <div id="booting" class="center" style="padding:38px 4px"><span class="spin on"></span></div>
+
   <!-- inline notice (click to dismiss); replaces native alert() -->
   <div id="notice" class="notice" hidden></div>
 
