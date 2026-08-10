@@ -102,29 +102,53 @@ case "$OS" in
   *) die "unsupported OS '$OS'. This installer is for Linux and macOS; on Windows use the Inno Setup installer." ;;
 esac
 
-if ! command -v python3 >/dev/null 2>&1; then
+# streamlink needs Python 3.10+, so pick the interpreter here and reuse it for every call below.
+# Searching by name matters: macOS ships its own python3 that is too old and sits ahead of a newer
+# one on PATH, so the plain name can keep resolving to the old one no matter what else is installed.
+py_ok()  { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; }
+py_ver() { "$1" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null; }
+
+py_candidates="python3 python3.14 python3.13 python3.12 python3.11 python3.10"
+if command -v brew >/dev/null 2>&1; then
+  brew_prefix="$(brew --prefix 2>/dev/null || true)"
+  [ -n "$brew_prefix" ] && py_candidates="$py_candidates $brew_prefix/bin/python3"
+fi
+py_candidates="$py_candidates /opt/homebrew/bin/python3 /usr/local/bin/python3"
+
+PY=""
+for cand in $py_candidates; do
+  if py_ok "$cand"; then PY="$cand"; break; fi
+done
+
+if [ -z "$PY" ]; then
+  # Name the version that is actually there: "install Python" reads as nonsense to someone who
+  # just did, when the problem is which one the name resolves to.
+  on_path="$(command -v python3 >/dev/null 2>&1 && py_ver python3 || true)"
+  [ -n "$on_path" ] && warn "python3 on your PATH is $on_path, but 3.10 or newer is required."
   if [ "$OS" = "Darwin" ]; then
-    if ask_yn "python3 not found. Install Apple's Command Line Tools now (they include Python)?"; then
+    if [ -n "$on_path" ] && command -v brew >/dev/null 2>&1; then
+      say "  A newer Python is installed under Homebrew but is not what 'python3' runs."
+      say "  Put it first for this shell, then re-run:"
+      say "    ${BOLD}eval \"\$(brew shellenv)\"${RST}"
+      die "no Python 3.10+ found (searched: $py_candidates)."
+    fi
+    if [ -z "$on_path" ] && ask_yn "python3 not found. Install Apple's Command Line Tools now (they include Python)?"; then
       xcode-select --install 2>/dev/null || true
       say ""
       warn "A Command Line Tools installer opened in a separate window."
       say "Finish it, then re-run this installer."
-      say "(If its Python turns out older than 3.10, install a newer one with: brew install python.)"
+      say "(Its Python may be older than 3.10; if so, install a newer one with: brew install python.)"
       exit 1
     fi
-    die "python3 not found. Install it with Homebrew (brew install python) or 'xcode-select --install', then re-run."
-  else
-    die "python3 not found. Install Python 3 (Debian/Ubuntu: python3 python3-venv; Fedora: python3; Arch: python)."
+    die "Python 3.10+ is required (streamlink needs it). Install it with 'brew install python', then re-run."
   fi
+  die "Python 3.10+ is required (streamlink needs it). Install it (Debian/Ubuntu: python3 python3-venv; Fedora: python3; Arch: python), then re-run."
 fi
-# streamlink requires Python 3.10+, so fail fast rather than partway through the install.
-python3 - <<'PY' || die "Python 3.10+ is required (streamlink needs it)."
-import sys
-sys.exit(0 if sys.version_info >= (3, 10) else 1)
-PY
+say "  ${DIM}python $(py_ver "$PY") ($PY)${RST}"
+
 # The venv module itself must be importable; pip is handled later (with a get-pip.py
 # fallback when ensurepip is missing, so no sudo is required).
-python3 -c "import venv" 2>/dev/null || \
+"$PY" -c "import venv" 2>/dev/null || \
   die "the 'venv' module is missing. Install your distro's python venv package (Debian/Ubuntu: python3-venv; Fedora/Arch/macOS: ships with python)."
 
 if [ "$OS" = "Linux" ]; then
@@ -142,7 +166,7 @@ fi
 step "[1/4] Python environment"
 mkdir -p "$DATA_DIR"
 pyver() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true; }
-sys_pyver="$(pyver python3)"
+sys_pyver="$(pyver "$PY")"
 venv_pyver=""
 [ -x "$VENV/bin/python" ] && venv_pyver="$(pyver "$VENV/bin/python")"
 if [ -n "$venv_pyver" ] && [ "$venv_pyver" = "$sys_pyver" ]; then
@@ -152,12 +176,12 @@ else
   # Absent, or stale after a Python minor-version upgrade (the old venv points at a
   # removed interpreter): rebuild from scratch and drop the orphaned tree.
   [ -e "$VENV" ] && rm -rf "$VENV"
-  if python3 -c "import ensurepip" 2>/dev/null; then
+  if "$PY" -c "import ensurepip" 2>/dev/null; then
     say "  creating venv at $VENV"
-    python3 -m venv "$VENV"
+    "$PY" -m venv "$VENV"
   else
     say "  creating venv at $VENV (bootstrapping pip without ensurepip)"
-    python3 -m venv --without-pip "$VENV"
+    "$PY" -m venv --without-pip "$VENV"
     bootstrap_pip "$VENV"
   fi
 fi
