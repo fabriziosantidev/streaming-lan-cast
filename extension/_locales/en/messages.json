@@ -14,6 +14,9 @@
   "castButton": {
     "message": "Cast this tab"
   },
+  "castUrlButton": {
+    "message": "Cast this URL"
+  },
   "stopButton": {
     "message": "Stop"
   },
@@ -101,8 +104,17 @@
   "enableDetect": {
     "message": "Enable source detection"
   },
+  "manualToggle": {
+    "message": "Cast a stream address"
+  },
+  "manualTitle": {
+    "message": "Stream"
+  },
   "noSourceFound": {
     "message": "No video source detected. Play the video and try again."
+  },
+  "errBlobSource": {
+    "message": "This page's video has no address that can be cast."
   },
   "enableDetectHint": {
     "message": "Enable source detection, then reload the page and try again."

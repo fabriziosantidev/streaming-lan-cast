@@ -1,6 +1,14 @@
 // Streaming LAN Cast popup: loopback fetch to the local helper (127.0.0.1:9988).
 // CONTROL / TOKEN_HEADER / DETECT_PERM come from constants.js (loaded first in popup.html).
+// Pages the helper resolves itself. Everything else goes through the sniffer, which is the general
+// path, so this list routes rather than restricts. Matched on the host: a page that carries another
+// address in its query string is not that host and must not be routed as if it were.
 const SUPPORTED = ["kick.com", "twitch.tv", "youtube.com", "youtu.be"];
+function isSupported(u) {
+  let h;
+  try { h = new URL(u).hostname.toLowerCase(); } catch { return false; }
+  return SUPPORTED.some(s => h === s || h.endsWith("." + s));
+}
 const $ = (id) => document.getElementById(id);
 
 let selectedId = null;
@@ -26,6 +34,8 @@ const ICON = {
 
 // ---- i18n ----
 function t(key, subs) { return browser.i18n.getMessage(key, subs) || key; }
+// For a string that reaches a screen: a missing catalogue entry falls back to readable text, never the key name.
+function tOr(key, fallback) { return browser.i18n.getMessage(key) || fallback; }
 
 // ---- inline notice (replaces native alert(): it renders clipped in this 300px popup) ----
 let noticeTimer = 0;
@@ -269,7 +279,7 @@ async function populateCastQuality(url, current) {
   if (!url) return;
   setQSpin(true);
   try {
-    if (SUPPORTED.some(s => url.includes(s))) {
+    if (isSupported(url)) {
       const res = await call("/qualities?url=" + encodeURIComponent(url));
       if ($("castingView").hidden || qCtx.castQuality.url !== url) return;   // view changed / a newer populate won
       qCtx.castQuality.matrix = res.matrix || [];
@@ -280,6 +290,9 @@ async function populateCastQuality(url, current) {
       // re-fetch and without depending on which tab is active.
       let cq = null;
       try { cq = (await browser.storage.session.get("castQuals")).castQuals; } catch {}
+      // A supplied-address cast has no rendition list to offer; deriving one from whatever tab is
+      // open would list renditions of a different source, and picking one re-casts that source.
+      if (cq && cq.url === url && cq.manual) return;
       if (cq && cq.url === url && (cq.qualities || []).length) {
         if ($("castingView").hidden || qCtx.castQuality.url !== url) return;
         qCtx.castQuality.qualities = cq.qualities;
@@ -319,7 +332,7 @@ async function changeCastQuality(val) {
   setQSpin(true);
   suppressUntil = Date.now() + RECAST_SUPPRESS_MS;             // cover the helper's ~10s relaunch grace
   try {
-    if (url && !SUPPORTED.some(s => url.includes(s))) {
+    if (url && !isSupported(url)) {
       const tb = await activeTab();
       if (tb && tb.url === url) { qCtx.quality.value = val; await castCurrentTab(); }   // re-cast at the new quality
     } else {
@@ -485,7 +498,7 @@ async function loadQualities() {
   setPickQSpin(true);                                      // show it's loading so the menu isn't opened empty
   try {
     let body = "url=" + encodeURIComponent(activeUrl || "");
-    if (!activeUrl || !SUPPORTED.some(s => activeUrl.includes(s))) {
+    if (!activeUrl || !isSupported(activeUrl)) {
       // not a streamlink-resolvable page: read the sniffed HLS sources; the helper finds the master among
       // them and lists its variants, plus reads any full ladder the watch page inlines in its HTML.
       const tb = await activeTab();
@@ -565,10 +578,67 @@ async function updateSourceStatus() {
   const st = $("status");
   const tb = await activeTab();
   const url = tb.url || "";
-  if (!url || SUPPORTED.some(s => url.includes(s))) { st.textContent = ""; return; }
+  if (!url || isSupported(url)) { st.textContent = ""; return; }
   if (!(await hasDetectPermission())) { st.textContent = ""; return; }   // enableDetect button covers this
   const src = await detectedSource(tb.id);
   st.textContent = src ? `${t("sourceDetected")} (${src.type.toUpperCase()})` : t("sourceNone");
+}
+
+// A stream address supplied in the picker, for a page whose media the sniffer cannot reach. Only
+// counts while the field is showing, so a leftover value can't silently override a normal cast.
+function manualMedia() {
+  const row = $("manualRow"), inp = $("manualUrl");
+  const v = row && !row.hidden && inp ? inp.value.trim() : "";
+  return /^https?:\/\//i.test(v) ? v : "";
+}
+
+// What the page's own <video> elements point at, for a source that never crossed the wire. Only an
+// ordinary address is usable: a MediaSource-fed element carries a blob: url, a buffer inside that
+// page, which can be neither re-fetched nor opened by a target. The largest element across every
+// reachable frame wins (players commonly live in an embed); blobOnly = a video exists, unreachable.
+async function readPageMedia(tabId) {
+  if (!(browser.scripting && browser.scripting.executeScript)) return { url: "", blobOnly: false };
+  const probe = () => {
+    let best = "", bestArea = -1, blobOnly = false;
+    for (const v of document.querySelectorAll("video")) {
+      const s = v.currentSrc || v.src || "";
+      if (/^https?:\/\//i.test(s)) {
+        const a = (v.videoWidth || v.clientWidth || 0) * (v.videoHeight || v.clientHeight || 0);
+        if (a > bestArea) { bestArea = a; best = s; }
+      } else if (s) {
+        blobOnly = true;
+      }
+    }
+    return { url: best, area: bestArea, blobOnly };
+  };
+  let res;
+  try {
+    res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: probe });
+  } catch {
+    try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
+    catch { return { url: "", blobOnly: false }; }
+  }
+  let url = "", area = -1, blobOnly = false;
+  for (const f of res || []) {
+    const r = f && f.result;
+    if (!r) continue;
+    if (r.url && r.area > area) { area = r.area; url = r.url; }
+    blobOnly = blobOnly || !!r.blobOnly;
+  }
+  return { url, blobOnly };
+}
+
+// Read off the path, so a signed query string does not hide the extension.
+function isHlsPlaylist(u) {
+  let p;
+  try { p = new URL(u).pathname.toLowerCase(); } catch { return false; }
+  return p.endsWith(".m3u8") || p.endsWith(".m3u");
+}
+
+// The button casts whichever source is in play, so its label follows the field.
+function syncCastLabel() {
+  $("castBtn").textContent = manualMedia() ? tOr("castUrlButton", "Cast this URL")
+                                           : tOr("castButton", "Cast this tab");
 }
 
 async function castCurrentTab() {
@@ -578,26 +648,48 @@ async function castCurrentTab() {
   $("castBtn").disabled = true;
   const tb = await activeTab();
   const url = tb.url || "";
-  const what = (tb.title || "").trim() || url;
   const quality = qCtx.quality.value || "best";
   let media = "", headers = "", medias = "", ladder = "";
-  if (!SUPPORTED.some(s => url.includes(s))) {
+  const supplied = manualMedia();
+  // A supplied address is unrelated to the open page, so the tab's title names the wrong thing; sent
+  // empty, the helper reads a title off the page url, which is the tab again. So send a fixed label.
+  const what = supplied ? tOr("manualTitle", "Stream") : ((tb.title || "").trim() || url);
+  if (supplied) {
+    media = supplied;
+    // The source list is what has the helper read the stream from its content, so an on-demand one
+    // keeps its seek bar (a bare media url is treated as live). The list is read as HLS playlists:
+    // a direct file or a DASH manifest in it would be served through the wrong proxy.
+    if (isHlsPlaylist(supplied)) medias = JSON.stringify([supplied]);
+    // Carry over the headers the sniffer captured on this tab. A host that checks Referer or Origin
+    // refuses a request arriving without them, so the address alone is not enough to fetch it.
+    const det = await browser.runtime.sendMessage({ cmd: "getDetected", tabId: tb.id }).catch(() => null);
+    const seen = (det && det.sources || []).find(s => s.headers && Object.keys(s.headers).length);
+    headers = JSON.stringify((seen && seen.headers) || {});
+  } else if (!isSupported(url)) {
     // unknown site -> use the media the background sniffer captured. Prefer the HLS sources (the helper
     // casts the master among them); fall back to any single sniffed source (e.g. a direct file).
     const det = await browser.runtime.sendMessage({ cmd: "getDetected", tabId: tb.id }).catch(() => null);
     const hls = ((det && det.sources) || []).filter(s => s.type === "hls");
     const src = hls[0] || (det && det.sources && det.sources[0]) || null;
     if (!src) {
-      castEnabled();
-      notify((await hasDetectPermission()) ? t("noSourceFound") : t("enableDetectHint"));
-      return;
+      // Nothing crossed the wire; ask the page what its own elements point at.
+      const el = await readPageMedia(tb.id);
+      if (!el.url) {
+        castEnabled();
+        notify(el.blobOnly
+          ? tOr("errBlobSource", "This page's video has no address that can be cast.")
+          : ((await hasDetectPermission()) ? t("noSourceFound") : t("enableDetectHint")));
+        return;
+      }
+      media = el.url;
+    } else {
+      media = src.url;
+      headers = JSON.stringify(src.headers || {});
+      if (hls.length) medias = JSON.stringify(hls.map(s => s.url));
+      // per-quality URLs read from the page (inline, or resolved in-page from a remote list endpoint) so a
+      // picked quality can be cast by its own url. For a remote list this re-fetches -> fresh, unexpired urls.
+      ladder = JSON.stringify((await readPageLadder(tb.id)).ladder || {});
     }
-    media = src.url;
-    headers = JSON.stringify(src.headers || {});
-    if (hls.length) medias = JSON.stringify(hls.map(s => s.url));
-    // per-quality URLs read from the page (inline, or resolved in-page from a remote list endpoint) so a
-    // picked quality can be cast by its own url. For a remote list this re-fetches -> fresh, unexpired urls.
-    ladder = JSON.stringify((await readPageLadder(tb.id)).ladder || {});
   }
   try {
     // POST: the captured request headers (incl. Cookie) go in the body, never the URL/query.
@@ -612,7 +704,8 @@ async function castCurrentTab() {
     if (r.ok) {
       // remember this cast's quality list extension-wide so the cast view shows it in any window/tab
       // without re-deriving it (the renditions don't change for the life of the cast).
-      try { await browser.storage.session.set({ castQuals: { url: r.url || url, qualities: qCtx.quality.qualities || [] } }); } catch {}
+      try { await browser.storage.session.set({ castQuals: { url: r.url || url, manual: !!supplied,
+        qualities: supplied ? [] : (qCtx.quality.qualities || []) } }); } catch {}
       showCasting(r.name || dev.name, whatOf(r) || what, r.url || url, r.quality || quality);
     }
     else { castEnabled(); notify(castFailMsg(r), "err"); }
@@ -639,6 +732,18 @@ $("stopBtn").addEventListener("click", stopCast);
 $("retryHelper").addEventListener("click", init);
 $("getHelper").addEventListener("click", () => browser.tabs.create({ url: SITE_URL }));
 $("openOptions").addEventListener("click", () => browser.runtime.openOptionsPage());
+$("manualToggle").addEventListener("click", () => {
+  const row = $("manualRow");
+  row.hidden = !row.hidden;
+  if (!row.hidden) $("manualUrl").focus();
+  syncCastLabel();
+});
+$("manualUrl").addEventListener("input", syncCastLabel);
+$("manualPaste").addEventListener("click", async () => {
+  try { $("manualUrl").value = (await navigator.clipboard.readText()).trim(); }
+  catch { $("manualUrl").focus(); }   // clipboard read blocked -> the keyboard paste still works
+  syncCastLabel();
+});
 $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTimeout(noticeTimer); });
 $("helperOld").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL + "#update" }); });
 

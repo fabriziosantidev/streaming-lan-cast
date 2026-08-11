@@ -14,6 +14,9 @@
   "castButton": {
     "message": "Castear esta pestaña"
   },
+  "castUrlButton": {
+    "message": "Castear esta URL"
+  },
   "stopButton": {
     "message": "Parar"
   },
@@ -101,8 +104,17 @@
   "enableDetect": {
     "message": "Activar detección de fuentes"
   },
+  "manualToggle": {
+    "message": "Castear una dirección de stream"
+  },
+  "manualTitle": {
+    "message": "Transmisión"
+  },
   "noSourceFound": {
     "message": "No detecté una fuente de video. Reproducí el video y reintentá."
+  },
+  "errBlobSource": {
+    "message": "El video de esta página no tiene una dirección que se pueda castear."
   },
   "enableDetectHint": {
     "message": "Activá la detección de fuentes y recargá la página."

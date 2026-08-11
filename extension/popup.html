@@ -61,6 +61,9 @@
   .qrow > .muted { flex:0 0 58px; }   /* fixed label column so Quality/Buffer selects line up */
   .qrow select { flex:1; min-width:0; padding:6px; border-radius:7px; font-size:12px;
                  background:var(--card); color:var(--fg); border:1px solid var(--border); }
+  .qrow input { flex:1; min-width:0; padding:6px; border-radius:7px; font-size:12px;
+                background:var(--card); color:var(--fg); border:1px solid var(--border); }
+  .qrow button.ghost { flex:none; padding:6px 10px; font-size:12px; }
   .row { display:flex; gap:8px; margin-top:8px; }
   button {
     flex:1; padding:9px; border:0; border-radius:8px; cursor:pointer;
@@ -166,6 +169,12 @@
       <span id="qSpin" class="spin"></span>
     </div>
     <div id="qualityMenu" class="qmenu" hidden></div>
+    <!-- a stream address the user supplies; the cast button casts it instead of the page -->
+    <button id="manualToggle" class="linkbtn" data-i18n="manualToggle">Cast a stream address</button>
+    <div id="manualRow" class="qrow" hidden>
+      <input id="manualUrl" type="url" spellcheck="false" autocomplete="off" placeholder="https://…/stream.m3u8">
+      <button type="button" id="manualPaste" class="ghost" data-i18n="paste">Paste</button>
+    </div>
     <div class="row"><button id="castBtn" data-i18n="castButton">Cast this tab</button></div>
     <div id="status"></div>
     <button id="enableDetect" class="linkbtn" data-i18n="enableDetect" hidden>Enable source detection</button>
