@@ -73,6 +73,7 @@
   button.danger { background:var(--danger); color:#fff; }
   button:disabled { opacity:.5; cursor:default; }
   #status { margin-top:10px; font-size:12px; min-height:16px; color:var(--muted); }
+  #status:empty { display:none; }   /* it only carries text on sniffed sites; empty it is dead space */
   /* inline notice: replaces native alert(), which renders clipped in this narrow popup */
   .notice { margin:0 0 10px; padding:9px 10px; border-radius:8px;
             font-size:12px; line-height:1.45; word-break:break-word; white-space:pre-line;
