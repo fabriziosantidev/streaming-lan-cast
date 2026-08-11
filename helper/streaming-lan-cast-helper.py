@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.7"   # reported to the extension via /ping; for a release bump this and the .iss
+HELPER_VERSION = "0.5.8"   # reported to the extension via /ping; for a release bump this and the .iss
                            # (the extension version is independent now; see version.json / checkHelperVersion)
 # Canonical "latest published helper" manifest, checked in the background so /ping can tell the
 # extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
@@ -2425,7 +2425,7 @@ def _fetch_playlist(url, hdr_map, timeout=8):
             return r.read(2_000_000).decode("utf-8", "replace")
     except Exception as e:
         code = getattr(e, "code", None)
-        log(f"variants: fetch {url.split('?')[0][-52:]} -> {('HTTP ' + str(code)) if code else type(e).__name__}")
+        log(f"variants: fetch {_redact_url(url)} -> {('HTTP ' + str(code)) if code else type(e).__name__}")
         return None
 
 
