@@ -1163,12 +1163,42 @@ def _ll_fetch_url(source, req_path):
     return base + ("?" + q if q else "")
 
 
+def _absolutize_mpd(text, manifest_url):
+    """A DASH manifest served from the proxy must keep resolving its media against the source, not the
+    proxy: a player resolves relative URLs from wherever it fetched the manifest. Top-level relative
+    BaseURLs (direct under <MPD>, i.e. before the first Period) are joined onto the manifest URL; a
+    manifest with no top-level base gets the manifest URL injected as one, which restores the original
+    resolution root for everything deeper (a root-relative path keeps the source host, a
+    directory-relative one the manifest's directory, and an absolute URL is never affected)."""
+    from xml.sax.saxutils import escape, unescape
+    m = re.search(r"<MPD\b[^>]*>", text)
+    if not m:
+        return text
+    top_end = text.find("<Period")
+    if top_end < 0:
+        top_end = len(text)
+    top = text[m.end():top_end]
+    base_re = re.compile(r"(<BaseURL[^>]*>)([^<]*)(</BaseURL>)")
+    tops = [t.strip() for _o, t, _c in base_re.findall(top)]
+    if any(t and "://" not in unescape(t) for t in tops):
+        def _fix(mo):
+            t = unescape(mo.group(2).strip())
+            if not t or "://" in t:
+                return mo.group(0)
+            return mo.group(1) + escape(urllib.parse.urljoin(manifest_url, t)) + mo.group(3)
+        return text[:m.end()] + base_re.sub(_fix, top) + text[top_end:]
+    if any(tops):
+        return text                      # top-level bases are absolute; nothing resolves off the proxy
+    return text[:m.end()] + "<BaseURL>" + escape(manifest_url) + "</BaseURL>" + text[m.end():]
+
+
 def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
     """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
     requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
     endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
     nested playlists inherit those headers + CORS); 'file' streams a direct media file at /live.<ext>
-    and forwards byte-range requests so the receiver can seek."""
+    and forwards byte-range requests so the receiver can seek; 'dash' serves the manifest at /live.mpd
+    with its URLs resolved against the source, and the receiver fetches the media from the origin."""
     HDRS = dict(hdr_map or {})
     HDRS.setdefault("User-Agent", "Mozilla/5.0")
     # Mimic a browser's in-player fetch. Some CDNs hotlink-protect their segments by requiring the
@@ -1438,6 +1468,22 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                     finally:
                         _drop_file_stream(fid, up)
                     return
+                if media_kind == "dash" and p == "/live.mpd":
+                    # Fetched from the source per request, so a dynamic manifest refreshes through the
+                    # proxy; the media itself is fetched by the receiver straight from the origin, which
+                    # the absolutized URLs point at.
+                    r = _fetch(source_url)
+                    text = r.read().decode("utf-8", "replace")
+                    if not dbg["m3u8"]:
+                        dbg["m3u8"] = True
+                        log(f"proxy: receiver fetched /live.mpd [{len(text)}B manifest] (client {self.client_address[0]})")
+                    body = _absolutize_mpd(text, source_url).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/dash+xml")
+                    self._cors([("Content-Length", str(len(body))), ("Connection", "close")])
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if p == "/live.m3u8":
                     # Forward only the receiver's blocking-reload params, dropping the source's stale ones
                     # (see _ll_fetch_url). The rewrite base stays source_url.
@@ -1501,10 +1547,10 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                 if dbg["err"] < 4:               # the CDN rejected a segment/playlist -> the receiver can't play it
                     dbg["err"] += 1
                     log(f"proxy: upstream {e.code} for {res_tail}")
-                if p == "/live.m3u8" and e.code in (403, 404, 410):
+                if p in ("/live.m3u8", "/live.mpd") and e.code in (403, 404, 410):
                     # the MAIN source is gone (a signed url that expired) - flag it so the control server's
                     # /status can tell the popup the stream expired and to reload the page. A per-segment
-                    # error (the /p path) isn't fatal, so only flag /live.m3u8.
+                    # error (the /p path) isn't fatal, so only flag the manifest paths.
                     try:
                         with open(PROXY_ERR_FILE, "w", encoding="utf-8") as _ef:
                             json.dump({"code": e.code, "ts": time.time()}, _ef)
@@ -2840,9 +2886,10 @@ def _classify_stream(urls, hdr_map, probe_media=True):
 
 def _classify_source(url, hdr_map):
     """Probe the cast source once. Returns (kind, is_vod, container, low_latency): kind 'file' for a direct
-    media file (served with byte-range seeking) or 'hls' for a playlist (reverse-proxied); container is the
-    extension to expose for a file ('mp4'/'webm'); low_latency marks an LL-HLS media playlist. A direct
-    file is always seekable; an HLS with #EXT-X-ENDLIST is too; a live HLS is not. Falls back to
+    media file (served with byte-range seeking), 'hls' for a playlist (reverse-proxied), or 'dash' for a
+    DASH manifest (served rewritten at /live.mpd; the receiver fetches the media from the origin);
+    container is the extension to expose ('mp4'/'webm'/'mpd'); low_latency marks an LL-HLS media playlist.
+    A direct file is always seekable; an HLS with #EXT-X-ENDLIST or a static DASH is too. Falls back to
     ('hls', False, 'mp4', False) on any error, i.e. the current live behavior."""
     try:
         h = dict(hdr_map or {}); h.setdefault("User-Agent", "Mozilla/5.0")
@@ -2858,6 +2905,11 @@ def _classify_source(url, hdr_map):
         # the cast must ride near the edge with a shallow buffer or Shaka can't find enough to start.
         ll = b"CAN-BLOCK-RELOAD" in head or b"#EXT-X-PART" in head or b"PRELOAD-HINT" in head
         return ("hls", _hls_is_vod(url, hdr_map), "mp4", ll)
+    # A DASH manifest travels under its own type, a bare .mpd path, or just as XML whose root is <MPD>
+    # (hosts serve it as text/xml or octet-stream too). type="dynamic" marks a live presentation; a
+    # static one (the default) is a seekable VOD.
+    if "dash+xml" in ct or u.endswith(".mpd") or (head.lstrip()[:1] == b"<" and b"<MPD" in head):
+        return ("dash", b'type="dynamic"' not in head, "mpd", False)
     if ct.startswith(("video/", "audio/")) or u.endswith((".mp4", ".webm", ".m4v", ".mov", ".mkv")):
         return ("file", True, "webm" if ("webm" in ct or u.endswith(".webm")) else "mp4", False)
     return ("hls", False, "mp4", False)
@@ -3932,7 +3984,7 @@ def run_cast(args):
             _marks.append("ll=1")
         if _is_vod:
             _marks.append("vod=1")
-        _path = f"/live.{_container}" if _kind == "file" else "/live.m3u8"
+        _path = f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"
         hls_url = f"http://{ip}:{args.port}{_path}" + ("?" + "&".join(_marks) if _marks else "")
         log(f"{_kind} proxy at {hls_url} -> cast ({'VOD/seekable' if _is_vod else 'live'}) to {args.cast_name or args.tv}")
 
