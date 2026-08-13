@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.8"   # reported to the extension via /ping; for a release bump this and the .iss
+HELPER_VERSION = "0.5.9"   # reported to the extension via /ping; for a release bump this and the .iss
                            # (the extension version is independent now; see version.json / checkHelperVersion)
 # Canonical "latest published helper" manifest, checked in the background so /ping can tell the
 # extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
@@ -730,11 +730,12 @@ def probe_stream(target, header_cfg=""):
 
 def _source_reachable(url, headers):
     """True if a small authenticated GET of url succeeds, i.e. the cast's own reverse-proxy could serve
-    it. Used to override a streamlink 'unplayable' verdict for an already-resolved CDN playlist that
-    streamlink's resolver rejects but the proxy fetches fine (some hosts only hand their fragmented-MP4
-    media playlist to a plain GET). headers is the replay list ('Name=Value'); a manifest needs only
-    Referer/Origin/User-Agent, so the Cookie is not sent. A media playlist that declares SAMPLE-AES key
-    delivery is reported unreachable so the DRM rejection stands."""
+    it. Used to override a streamlink 'unplayable' verdict for an already-resolved CDN playlist or DASH
+    manifest that streamlink's resolver rejects but the proxy serves fine (streamlink has no handler for
+    a bare manifest; some hosts only hand their fragmented-MP4 media playlist to a plain GET). headers is
+    the replay list ('Name=Value'); a manifest needs only Referer/Origin/User-Agent, so the Cookie is not
+    sent. A source that declares its own key delivery (SAMPLE-AES, ContentProtection) is reported
+    unreachable so the DRM rejection stands."""
     try:
         h = {}
         for x in (headers or []):
@@ -750,6 +751,8 @@ def _source_reachable(url, headers):
         return False
     if body[:64].lstrip().startswith(b"#EXTM3U"):
         return b"SAMPLE-AES" not in body          # plain/AES-128 HLS is castable; SAMPLE-AES is DRM
+    if "dash+xml" in ct or (body.lstrip()[:1] == b"<" and b"<MPD" in body[:4096]):
+        return b"ContentProtection" not in body   # a protected presentation stands rejected, like SAMPLE-AES
     return "mpegurl" in ct or ct.startswith("video/")
 
 
@@ -1192,7 +1195,28 @@ def _absolutize_mpd(text, manifest_url):
     return text[:m.end()] + "<BaseURL>" + escape(manifest_url) + "</BaseURL>" + text[m.end():]
 
 
-def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
+def _mpd_video_heights(text):
+    """Distinct video heights a DASH manifest offers, tallest first. Representations carry height=;
+    audio ones carry none, and AdaptationSet-level maxHeight is a different (capitalised) attribute."""
+    return sorted({int(h) for h in re.findall(r'\bheight="(\d+)"', text)}, reverse=True)
+
+
+def _mpd_filter_height(text, height):
+    """The manifest reduced to the video Representations at the chosen height (every codec at that
+    height stays, so the player still picks one it can decode); audio is untouched. When no
+    Representation matches, the full manifest comes back: a stale pick must not black out the cast."""
+    blocks = re.compile(r"<Representation\b[^>]*?/>|<Representation\b.*?</Representation>", re.S)
+    hexp = re.compile(r'\bheight="(\d+)"')
+    if not any(m and int(m.group(1)) == height
+               for m in (hexp.search(b) for b in blocks.findall(text))):
+        return text
+    def _keep(mo):
+        m = hexp.search(mo.group(0))
+        return mo.group(0) if (not m or int(m.group(1)) == height) else ""
+    return blocks.sub(_keep, text)
+
+
+def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
     """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
     requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
     endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
@@ -1477,7 +1501,11 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls"):
                     if not dbg["m3u8"]:
                         dbg["m3u8"] = True
                         log(f"proxy: receiver fetched /live.mpd [{len(text)}B manifest] (client {self.client_address[0]})")
-                    body = _absolutize_mpd(text, source_url).encode("utf-8")
+                    text = _absolutize_mpd(text, source_url)
+                    _qm = re.match(r"(\d+)", quality or "")
+                    if _qm:
+                        text = _mpd_filter_height(text, int(_qm.group(1)))
+                    body = text.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/dash+xml")
                     self._cors([("Content-Length", str(len(body))), ("Connection", "close")])
@@ -2012,11 +2040,14 @@ def serve_control(port):
             headers = parse_replay_headers(q.get("headers", [""])[0])
             media_probed = False
             src_kind, src_vod, src_ll = "", False, False   # the classifier's verdict -> the proxy skips re-probing
-            if not (url.startswith("http://") or url.startswith("https://")):
-                self._json({"ok": False, "error": "invalid URL: " + url[:60]})
-                return
             if media and not (media.startswith("http://") or media.startswith("https://")):
                 media = ""    # ignore a bogus media URL -> fall back to resolving the page
+            # A player living on a browser-internal page (an extension-hosted viewer) has no fetchable
+            # page url, but its sniffed media is castable all the same; the page url is then only
+            # display context, and everything downstream that touches it already falls back.
+            if not (url.startswith("http://") or url.startswith("https://") or media):
+                self._json({"ok": False, "error": "invalid URL: " + url[:60]})
+                return
             # Cast a rendition by its OWN url from the page's ladder (the extension reads it - inline, or
             # resolved in-page - so it's freshly minted). A numeric pick -> that height; "best"/no pick ->
             # the highest. This also avoids casting the sniffed VARIANT playlist, whose signed url some hosts
@@ -2199,11 +2230,30 @@ def serve_control(port):
                     ladder = {}
                 by_h, vs = {}, []                          # height -> label, richest label kept
                 if not ladder:
-                    _mu, vs, _t = _resolve_sniffed_master(urls, hmap)
-                    for v in vs:
-                        mm = re.match(r"(\d+)", v["quality"])
-                        if mm:
-                            by_h[int(mm.group(1))] = v["quality"]
+                    # A DASH manifest lists its heights itself, and guessing master-playlist siblings
+                    # against one burns seconds of 404s. When the first url doesn't even claim to be an
+                    # HLS playlist, one content probe decides the family before any guessing starts.
+                    probed = {}
+                    _first = urls[0] if urls else ""
+                    if _first and not _first.split("?")[0].lower().endswith((".m3u8", ".m3u")):
+                        probed[_first] = _fetch_playlist(_first, hmap)
+                    if probed.get(_first) and "<MPD" in probed[_first]:
+                        for hgt in _mpd_video_heights(probed[_first]):
+                            by_h[hgt] = f"{hgt}p"
+                    else:
+                        _mu, vs, _t = _resolve_sniffed_master(urls, hmap)
+                        for v in vs:
+                            mm = re.match(r"(\d+)", v["quality"])
+                            if mm:
+                                by_h[int(mm.group(1))] = v["quality"]
+                        if not by_h:
+                            # no HLS among the urls; a DASH manifest later in the list still counts
+                            for _u in urls:
+                                _t2 = probed[_u] if _u in probed else _fetch_playlist(_u, hmap)
+                                if _t2 and "<MPD" in _t2:
+                                    for hgt in _mpd_video_heights(_t2):
+                                        by_h[hgt] = f"{hgt}p"
+                                    break
                 for hgt in ladder:
                     by_h.setdefault(hgt, f"{hgt}p")
                 quals = [by_h[hgt] for hgt in sorted(by_h, reverse=True)] or [v["quality"] for v in vs]
@@ -3976,7 +4026,8 @@ def run_cast(args):
         if _ll and not _is_vod:
             _low_latency = True   # LL-HLS live: ride near the edge with a shallow buffer so it can start
         httpd = ThreadingHTTPServer((ip, args.port),
-                                    make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind))
+                                    make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
+                                                   quality="" if args.quality == "best" else args.quality))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _stream_type = "BUFFERED" if _is_vod else "LIVE"
         _marks = []
