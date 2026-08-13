@@ -111,7 +111,7 @@ function record(tabId, src) {
   // A newly-seen HLS playlist on the focused tab -> warm the quality list so the popup opens instantly.
   // A running live stream re-fetches its chunklists under the same query-less key (not "fresh"), so it
   // doesn't re-trigger this; only a genuinely new playlist (the master, a new rendition) does.
-  if (fresh && src.type === "hls" && tabId === activeTabId) scheduleQualPrecompute(tabId);
+  if (fresh && (src.type === "hls" || src.type === "dash") && tabId === activeTabId) scheduleQualPrecompute(tabId);
 }
 
 function pickHeaderCI(headers, name) {   // sniffed headers keep original casing; match case-insensitively
@@ -179,15 +179,15 @@ function scheduleQualPrecompute(tabId) {
 }
 
 // Compute the quality list the popup would, and cache it. Same inputs as popup.loadQualities: the sniffed
-// HLS sources' replay headers + the page's inlined ladder, POSTed to the helper (which short-circuits on
-// the ladder when present). The Cookie never rides in a URL; it goes in the POST body via the page headers.
+// manifest sources' replay headers + the page's inlined ladder, POSTed to the helper (which short-circuits
+// on the ladder when present). The Cookie never rides in a URL; it goes in the POST body via the page headers.
 async function precomputeQualities(tabId) {
   const last = qualLast.get(tabId) || 0;
   if (Date.now() - last < 5000) { scheduleQualPrecompute(tabId); return; }   // rate-limit; retry later
   qualLast.set(tabId, Date.now());
   try {
     const m = perTab.get(tabId);
-    const srcs = m ? [...m.values()].filter(s => s.type === "hls") : [];
+    const srcs = m ? [...m.values()].filter(s => s.type === "hls" || s.type === "dash") : [];
     if (!srcs.length) return;
     const hs = {};   // Referer/Origin/UA the host needs to serve the master (never the Cookie, in a URL)
     for (const k of ["Referer", "Origin", "User-Agent"]) { const v = pickHeaderCI(srcs[0].headers, k); if (v) hs[k] = v; }

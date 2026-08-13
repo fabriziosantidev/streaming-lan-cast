@@ -518,7 +518,7 @@ async function loadQualities() {
         if (!qValid("quality")) qCtx.quality.value = "best";
         qSyncTrig("quality"); qRefresh("quality"); setPickQSpin(false);
       }
-      const srcs = ((det && det.sources) || []).filter(s => s.type === "hls");
+      const srcs = ((det && det.sources) || []).filter(s => s.type === "hls" || s.type === "dash");
       if (!srcs.length) {
         if (!(qCtx.quality.qualities || []).length) { qCtx.quality.value = "best"; qSyncTrig("quality"); }
         return;
