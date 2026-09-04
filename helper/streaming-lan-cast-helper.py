@@ -1216,7 +1216,7 @@ def _mpd_filter_height(text, height):
     return blocks.sub(_keep, text)
 
 
-def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
+def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fallbacks=None):
     """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
     requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
     endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
@@ -1248,8 +1248,9 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
     try:
         import requests
         _sess = requests.Session()
-        # curl_cffi fetches with a real browser's TLS/HTTP2 fingerprint, which a CDN bot-check that 403s a
-        # plain HTTP client accepts. Optional dependency: when it's absent the 403 stands (no retry).
+        # curl_cffi fetches with a real browser's TLS/HTTP2 fingerprint, which a CDN bot-check that
+        # refuses a plain HTTP client accepts. Hosts signal that refusal as 403 or 410. Optional
+        # dependency: when it's absent the refusal stands (no retry).
         try:
             from curl_cffi import requests as _cffi_requests
             _cffi_sess = _cffi_requests.Session()
@@ -1275,7 +1276,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
 
         def _fetch(url, timeout=10):
             r = _sess.get(url, headers=HDRS, stream=True, timeout=timeout)
-            if r.status_code == 403 and _cffi_sess is not None:
+            if r.status_code in (403, 410) and _cffi_sess is not None:
                 r.close()
                 hdrs = {k: v for k, v in HDRS.items() if k.lower() not in _IMPERSONATE_OWNS}
                 r = _cffi_sess.get(url, headers=hdrs, stream=True, timeout=timeout, impersonate="chrome")
@@ -1288,7 +1289,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
             if range_hdr:
                 h["Range"] = range_hdr
             r = _sess.get(url, headers=h, stream=True, timeout=timeout)
-            if r.status_code == 403 and _cffi_sess is not None:
+            if r.status_code in (403, 410) and _cffi_sess is not None:
                 r.close()
                 ch = {k: v for k, v in h.items() if k.lower() not in _IMPERSONATE_OWNS}
                 r = _cffi_sess.get(url, headers=ch, stream=True, timeout=timeout, impersonate="chrome")
@@ -1341,6 +1342,9 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
         return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
 
     dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False, "frange": 0}   # log the first of each event only once
+    cur = {"src": source_url}      # the playlist being served; recovery below may move it to a fallback
+    _spawned = time.monotonic()
+    _fallbacks = [f for f in (fallbacks or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
 
     # In-flight direct-file responses. Seeking makes the receiver stop reading the response it has and
     # open a new range request, so the old one is left blocked writing to a socket nobody drains while
@@ -1514,13 +1518,41 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality=""):
                     return
                 if p == "/live.m3u8":
                     # Forward only the receiver's blocking-reload params, dropping the source's stale ones
-                    # (see _ll_fetch_url). The rewrite base stays source_url.
-                    r = _fetch(_ll_fetch_url(source_url, self.path))
+                    # (see _ll_fetch_url). The rewrite base stays the playlist being served.
+                    try:
+                        r = _fetch(_ll_fetch_url(cur["src"], self.path))
+                    except _UpstreamError as e:
+                        # A host that mints per-request signatures can kill the chosen url between the
+                        # classify fetch and this one. Name the timing (it separates a spent/expired
+                        # signature from a dead source), give the same url one more chance for a flaky
+                        # edge, then move to a sniffed sibling: the stream the page itself is playing
+                        # provably serves.
+                        log(f"proxy: source playlist {e.code} {time.monotonic() - _spawned:.0f}s after "
+                            f"spawn; retrying once")
+                        time.sleep(1.0)
+                        r = None
+                        try:
+                            r = _fetch(_ll_fetch_url(cur["src"], self.path))
+                        except _UpstreamError as e2:
+                            log(f"proxy: retry -> {e2.code}")
+                            for fb in _fallbacks:
+                                if fb == cur["src"]:
+                                    continue
+                                try:
+                                    r = _fetch(fb)
+                                except _UpstreamError as e3:
+                                    log(f"proxy: fallback {_redact_url(fb).rsplit('/', 1)[-1][:40]} -> {e3.code}")
+                                    continue
+                                cur["src"] = fb
+                                log("proxy: source url stayed dead; casting the stream the page is playing instead")
+                                break
+                        if r is None:
+                            raise e
                     text = r.read().decode("utf-8", "replace")
                     if not dbg["m3u8"]:
                         dbg["m3u8"] = True
                         log(f"proxy: receiver fetched /live.m3u8 [{_proxy_playlist_note(text)}] (client {self.client_address[0]})")
-                    self._serve_m3u8(text, source_url)
+                    self._serve_m3u8(text, cur["src"])
                     return
                 if p == "/p":
                     if not dbg["seg"]:
@@ -1863,7 +1895,7 @@ def serve_control(port):
         clear_cast_state()   # stale state from a proxy that already exited
 
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
-                        src_kind="", src_vod=False, src_ll=False):
+                        src_kind="", src_vod=False, src_ll=False, fallbacks=None):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -1874,6 +1906,8 @@ def serve_control(port):
             extra += ["--quality", qy]
         if media:
             extra += ["--media-url", media]
+        if fallbacks:
+            extra += ["--fallback-media", json.dumps(fallbacks[:4])]
         if src_kind:                          # classifier's verdict -> proxy skips its own source probe
             extra += ["--src-kind", src_kind]
             if src_vod:
@@ -2039,6 +2073,7 @@ def serve_control(port):
             medias_raw = (q.get("medias", [""])[0]).strip()  # all sniffed HLS URLs (JSON): understand + cast the master
             headers = parse_replay_headers(q.get("headers", [""])[0])
             media_probed = False
+            medias = []                                    # sniffed sibling playlists (fallbacks for the proxy)
             src_kind, src_vod, src_ll = "", False, False   # the classifier's verdict -> the proxy skips re-probing
             if media and not (media.startswith("http://") or media.startswith("https://")):
                 media = ""    # ignore a bogus media URL -> fall back to resolving the page
@@ -2162,8 +2197,12 @@ def serve_control(port):
             if kind == "cast":
                 cinfo = {"port": (dev or {}).get("port", 8009), "uuid": (dev or {}).get("uuid", ""),
                          "name": (dev or {}).get("name", name), "model": (dev or {}).get("model", "")}
+            # Sniffed sibling playlists ride along as fallbacks: a host that mints per-request
+            # signatures can kill the chosen url between the classify fetch and the proxy's own,
+            # while the stream the page itself is playing provably serves.
+            _fb = [m for m in medias if m != media]
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
-                                    src_kind, src_vod, src_ll)
+                                    src_kind, src_vod, src_ll, fallbacks=_fb)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -4025,9 +4064,14 @@ def run_cast(args):
             _kind, _is_vod, _container, _ll = _classify_source(source_url, hdr_map)
         if _ll and not _is_vod:
             _low_latency = True   # LL-HLS live: ride near the edge with a shallow buffer so it can start
+        try:
+            _fbs = json.loads(args.fallback_media) if args.fallback_media else []
+        except Exception:
+            _fbs = []
         httpd = ThreadingHTTPServer((ip, args.port),
                                     make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
-                                                   quality="" if args.quality == "best" else args.quality))
+                                                   quality="" if args.quality == "best" else args.quality,
+                                                   fallbacks=_fbs))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _stream_type = "BUFFERED" if _is_vod else "LIVE"
         _marks = []
@@ -4416,6 +4460,7 @@ def main():
     ap.add_argument("--low-latency", action="store_true", help="aggressive: live-edge 1")
     ap.add_argument("--stop", action="store_true", help="just stop playback on the TV")
     ap.add_argument("--media-url", default="", help="direct media URL (HLS/DASH/file) to cast instead of resolving the page")
+    ap.add_argument("--fallback-media", default="", help=argparse.SUPPRESS)  # sniffed sibling playlists (JSON) for the proxy's source recovery
     ap.add_argument("--src-kind", default="", help=argparse.SUPPRESS)       # control's source classification (hls) -> skip the proxy re-probe
     ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--src-ll", action="store_true", help=argparse.SUPPRESS)
