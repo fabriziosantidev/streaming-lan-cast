@@ -34,7 +34,7 @@
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.12';
+    const RX_VERSION = '1.13';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -222,6 +222,18 @@
       });
       v.addEventListener('playing', () => {
         if (fix && !fix.own) { try { v.pause(); } catch (e) {} }   // resumed early mid-fix; keep holding
+      });
+      // Report a backward playhead jump the moment it happens. timeupdate ticks ~4x a second for
+      // free, so this catches what the 2s status samples can slide past, and it costs nothing while
+      // playback moves forward. One message per jump, never a stream of them.
+      let lastT = 0;
+      v.addEventListener('timeupdate', () => {
+        const t = v.currentTime;
+        if (lastT && t < lastT - 0.5) {
+          try { context.sendCustomMessage(NS, undefined, { type: 'tjump', ver: RX_VERSION,
+            from: Math.round(lastT * 10) / 10, to: Math.round(t * 10) / 10 }); } catch (e) {}
+        }
+        lastT = t;
       });
     }
     setInterval(() => {
