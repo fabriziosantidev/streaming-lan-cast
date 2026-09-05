@@ -4108,6 +4108,11 @@ def run_cast(args):
                 self.last = data
                 self.last_at = time.time()
                 return True
+            if isinstance(data, dict) and data.get("type") == "tjump":
+                # receiver-detected backward playhead jump (its media element watches itself at
+                # ~250ms, so this catches what the 2s status samples slide past)
+                log(f"cast: playhead jumped back {data.get('from')}s -> {data.get('to')}s")
+                return True
             return False
 
     slc = _SlcChannel()
@@ -4199,6 +4204,10 @@ def run_cast(args):
     last_progress_at = last_load_at   # when the receiver's buffer last grew under the current LOAD
     deepest_buf = -1.0                # deepest buffer it has reported under the current LOAD
     gave_up = False
+    mid_reloads = 0                # mid-play recoveries used (see the watchdog in the loop)
+    MAX_MID_RELOADS = 3
+    playing_since = 0.0            # start of the current uninterrupted playing stretch
+    err_changed_at = 0.0           # when the receiver's error report last changed
     MAX_LOAD_ATTEMPTS = 5          # if the receiver reports a load error before playback starts, the
                                    # session just sits idle; re-send the LOAD ourselves up to this many
                                    # times (a source that's slow to start often succeeds on a later try)
@@ -4233,6 +4242,13 @@ def run_cast(args):
         if st == "playing" and not played:
             played = True
             log(f"cast: playing (receiver rx={slc.last.get('ver')})")
+        if st == "playing":
+            if playing_since == 0.0:
+                playing_since = time.monotonic()
+            elif mid_reloads and (time.monotonic() - playing_since) > 300:
+                mid_reloads = 0        # a long stable stretch earns the recoveries back
+        else:
+            playing_since = 0.0
         # Full-seek hand-off: the parallel download landing a complete local .mp4 (served with byte
         # ranges), or the remux finishing (#EXT-X-ENDLIST -> finite HLS), turns the cast into a real
         # VOD. Re-send the LOAD resuming at the current position so the receiver shows the total
@@ -4297,6 +4313,7 @@ def run_cast(args):
         if err and err != last_err:
             log(f"cast: receiver err -> {err}")
             last_err = err
+            err_changed_at = time.monotonic()
         # Auto-retry a failed initial LOAD: if the receiver reports a load error before playback starts,
         # re-send the LOAD. It hits the same warm proxy for a fresh live playlist, so a source that's
         # slow to start usually catches on a later attempt. Bounded and cooled down so a lingering error
@@ -4332,6 +4349,36 @@ def run_cast(args):
                 gave_up = True
                 log(f"cast: still failing after {MAX_LOAD_ATTEMPTS} loads ({err}); source may be down "
                     f"or too slow to start; re-cast to retry")
+        # A stream that errors out MID-play parks the session idle even though the source usually
+        # recovers: a live playlist can advertise a segment its CDN never serves, which kills playback
+        # with plenty still buffered, while a fresh LOAD re-anchors past the hole at the live edge (a
+        # VOD resumes at its position). Fire only on a fresh fatal error, so a stream that simply
+        # finished (idle with a long-stale error report) is left alone; bounded, so one dying over and
+        # over ends up parked instead of looping.
+        if (played and st == "idle" and err and err.startswith("shaka/")
+                and err_changed_at and (time.monotonic() - err_changed_at) < 30
+                and mid_reloads < MAX_MID_RELOADS):
+            mid_reloads += 1
+            pos = 0.0
+            if _stream_type == "BUFFERED":
+                try:
+                    mc.update_status()
+                    time.sleep(0.3)
+                    pos = float(mc.status.current_time or 0)
+                except Exception:
+                    pos = 0.0
+            log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading "
+                f"({mid_reloads}/{MAX_MID_RELOADS})" + (f" at t={int(pos)}s" if pos else ""))
+            try:
+                if pos:
+                    mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type,
+                                  current_time=max(0.0, pos - 2))
+                else:
+                    mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
+                last_load_at = time.monotonic()
+            except Exception as e:
+                log(f"cast: mid-play reload failed: {type(e).__name__}: {str(e)[:60]}")
+            err_changed_at = 0.0       # armed again only by the next error transition
         if slc.last:
             stalls = int(slc.last.get("stalls") or 0)
             if stalls > last_stalls:
