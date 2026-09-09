@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.21';
+    const RX_VERSION = '1.22';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -273,8 +273,8 @@
     // the longer the key stays down, falling back to the smallest once it is released. Only for a
     // finite, seekable stream long enough to need it; a short piece and a live edge keep the player's
     // own behaviour.
-    const SEEK_STEPS = [10, 30, 60];       // seconds per tick, by how long the key has been held
-    const SEEK_TIERS = [3000, 6000];       // ms held before the next step takes over
+    const SEEK_STEPS = [10, 30, 60, 300];  // seconds per tick, by how long the key has been held
+    const SEEK_TIERS = [3000, 6000, 9000]; // ms held before each next step takes over
     const SEEK_TICK = 400;                 // how often a held key moves the playhead
     const SEEK_END = 700;                  // no key for this long ends the gesture, so it starts small again
     let holdFrom = 0, lastSeekKey = 0, lastTick = 0, spdHide = 0, settleTimer = 0;
@@ -349,7 +349,8 @@
       if (now - lastTick >= SEEK_TICK) {
         lastTick = now;
         const held = now - holdFrom;
-        const tier = held < SEEK_TIERS[0] ? 1 : held < SEEK_TIERS[1] ? 2 : 3;
+        let tier = 1;                      // one step per threshold passed, so the list sets the pace
+        while (tier < SEEK_STEPS.length && held >= SEEK_TIERS[tier - 1]) tier++;
         const target = Math.min(Math.max(0, v.currentTime + dir * SEEK_STEPS[tier - 1]),
                                 Math.max(0, dur - 5));
         // Seek through the player, not the media element: its own clock, scrubber and time readout
