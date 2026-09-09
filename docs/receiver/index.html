@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.22';
+    const RX_VERSION = '1.23';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -190,6 +190,11 @@
       }
       return false;
     }
+    function splitTracks() {
+      let a = false, v = false;
+      for (const x of sbs) { if (x.k === 'a') a = true; else if (x.k === 'v') v = true; }
+      return a && v;
+    }
     function bufferedCovers(t) {
       for (const x of sbs) {
         try {
@@ -203,6 +208,8 @@
     // OUTSIDE the buffer (tracks streaming in while the element waits) latches them apart even though
     // the appended data is aligned. So turn every unbuffered seek into a buffered one: hold the
     // element paused, wait until BOTH tracks cover the target, then re-seek into the buffer and play.
+    // Only two separate SourceBuffers can latch apart - a single muxed buffer carries one clock for
+    // both tracks - so the hold is skipped there, where it could only ever delay playback.
     let fix = null;   // { own, iv } - the pending unbuffered-seek recovery
     function cancelFix() { if (fix) { clearInterval(fix.iv); fix = null; } }
     function hookMedia(v) {
@@ -210,36 +217,44 @@
       hooked = v;
       v.addEventListener('seeking', () => {
         if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
+        // A hold in flight is itself what paused the element, so its captured flag is the only record
+        // of whether the viewer had this playing; carry that forward rather than reading back the
+        // pause we made. Whatever ends a hold owes playback its state back, early returns included.
+        const wasPaused = fix ? fix.wasPaused : v.paused;
+        const resume = fix && !wasPaused ? () => { try { v.play(); } catch (e) {} } : () => {};
         cancelFix();
         // Any source fed through MSE, not only a locally transcoded one, can land with its two tracks
         // covering different ranges, which plays as audio adrift from the picture. A progressive file
         // creates no SourceBuffers and is seeked by the player against its own buffer, so it is left
         // alone. A held seek steps every few hundred ms, and settling on each step would fight the
         // gesture, so wait until it ends; the nudge in tryAcceleratedSeek brings us back here then.
-        if (!sbs.length) return;
-        if (Date.now() - lastSeekKey < SEEK_END) return;
-        if (bufferedCovers(v.currentTime)) return;
+        if (!splitTracks()) return resume();
+        if (Date.now() - lastSeekKey < SEEK_END) return resume();
+        if (bufferedCovers(v.currentTime)) return resume();
         const target = v.currentTime;
-        const wasPaused = v.paused;
         const t0 = Date.now();
         try { v.pause(); } catch (e) {}
-        fix = { own: 0 };
+        fix = { own: 0, wasPaused, at: t0 };
         fix.iv = setInterval(() => {
-          const lead = Math.max(0.5, Math.min(4, (v.duration || 1e9) - target - 0.3));
+          const room = (v.duration || 0) - target - 0.3;   // 0 for an unknown duration, so: floor
+          const lead = room > 0 ? Math.max(0.4, Math.min(1.5, room)) : 0.4;
           if (sbCovers('v', target, lead) && sbCovers('a', target, lead)) {
             clearInterval(fix.iv);
             fix.own = target + 0.001;
             try { v.currentTime = fix.own; } catch (e) {}
             if (!wasPaused) { try { v.play(); } catch (e) {} }
             setTimeout(cancelFix, 3000);
-          } else if (Date.now() - t0 > 90000) {
+          } else if (Date.now() - t0 > 6000) {
             cancelFix();
             if (!wasPaused) { try { v.play(); } catch (e) {} }
           }
         }, 250);
       });
       v.addEventListener('playing', () => {
-        if (fix && !fix.own) { try { v.pause(); } catch (e) {} }   // resumed early mid-fix; keep holding
+        // The player auto-resumes off its own buffering state right after the hold pauses it, which
+        // would defeat the hold; a play arriving later than that is the viewer's, and it wins.
+        if (fix && !fix.own && Date.now() - fix.at < 2000) { try { v.pause(); } catch (e) {} }
+        else if (fix && !fix.own) cancelFix();
       });
       // Report a backward playhead jump the moment it happens. timeupdate ticks ~4x a second for
       // free, so this catches what the 2s status samples can slide past, and it costs nothing while
@@ -365,7 +380,7 @@
         clearTimeout(settleTimer);
         settleTimer = setTimeout(() => {
           const el = mediaEl();
-          if (el && sbs.length) { try { el.currentTime = el.currentTime + 0.001; } catch (x) {} }
+          if (el && splitTracks()) { try { el.currentTime = el.currentTime + 0.001; } catch (x) {} }
         }, SEEK_END + 60);
       }
       e.preventDefault(); e.stopPropagation();
