@@ -84,6 +84,7 @@ PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-e
 PROXY_CTL_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-ctl.json")    # control->proxy: switch the cast between live and the recording
 PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-nolive")         # proxy->control: this cast has no live edge to return to
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
+YTDLP_STAMP = os.path.join(TOKEN_DIR, "ytdlp-refreshed")   # touched each time _refresh_ytdlp runs
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
 LOGFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast.log")   # caster diagnostics (pythonw has no console)
 LOG_MAX = 50 * 1024 * 1024   # at this size the log rotates to LOGFILE.old (fresh log, never mixed with
@@ -1892,6 +1893,40 @@ def _update_check_loop():
         time.sleep(6 * 3600)
 
 
+def _refresh_ytdlp():
+    """Upgrade the pip-managed yt-dlp, at most once a week. YouTube stops honouring the urls an
+    out-of-date yt-dlp resolves: its CDN serves the first stretch of a VOD and then refuses every
+    further range, so a cast dies part-way in. A helper installed months ago needs a newer yt-dlp
+    than it shipped with. The frozen Windows build has no pip, and its bundled yt-dlp.exe is
+    replaced by the installer on each release, so it sits this out."""
+    if getattr(sys, "frozen", False) or not _ytdlp_cmd():
+        return
+    try:
+        if time.time() - os.path.getmtime(YTDLP_STAMP) < 7 * 86400:
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(TOKEN_DIR, exist_ok=True)
+        open(YTDLP_STAMP, "w").close()   # stamped before the attempt, so a failure waits its turn too
+        def _ver():
+            return subprocess.run(_ytdlp_cmd() + ["--version"], capture_output=True, text=True,
+                                  timeout=30).stdout.strip()
+        was = _ver()
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
+                       capture_output=True, text=True, timeout=300)
+        now = _ver()
+        log(f"yt-dlp {was} is current" if was == now else f"yt-dlp {was} -> {now}")
+    except Exception as e:
+        log(f"yt-dlp refresh skipped: {type(e).__name__}: {str(e)[:60]}")
+
+
+def _refresh_ytdlp_loop():
+    while True:
+        _refresh_ytdlp()
+        time.sleep(24 * 3600)
+
+
 def serve_control(port):
     self_script = os.path.abspath(__file__)
     _rotate_log_on_version_change()   # a helper update starts a fresh log (old one -> LOGFILE.old)
@@ -2577,6 +2612,7 @@ def serve_control(port):
     threading.Thread(target=_dev_loop, daemon=True).start()
 
     threading.Thread(target=_update_check_loop, daemon=True).start()   # keeps /ping's latest/min_ext fresh
+    threading.Thread(target=_refresh_ytdlp_loop, daemon=True).start()  # keeps YouTube resolves working
     httpd = ThreadingHTTPServer(("127.0.0.1", port), CtrlHandler)
     log(f"control server on http://127.0.0.1:{port}  (/cast?url=  /stop  /ping  /devices)")
     httpd.serve_forever()
@@ -3161,9 +3197,11 @@ def _classify_source(url, hdr_map):
 
 
 def _ytdlp_cmd():
-    """argv prefix to run yt-dlp (SLC_YTDLP override, else on PATH, else next to the helper/exe), or
-    None if it isn't installed. Used only for YouTube VODs, where streamlink caps at 360p."""
-    cand = os.environ.get("SLC_YTDLP") or shutil.which("yt-dlp")
+    """argv prefix to run yt-dlp (SLC_YTDLP override, else the copy shipped beside the helper/exe,
+    else one on PATH), or None if it isn't installed. Used only for YouTube VODs, where streamlink
+    caps at 360p. The shipped copy comes first because YouTube refuses the urls an out-of-date
+    yt-dlp resolves, and that copy is the one the installer and _refresh_ytdlp keep current."""
+    cand = os.environ.get("SLC_YTDLP")
     if not cand:
         for d in (os.path.dirname(sys.executable or ""), os.path.dirname(os.path.abspath(__file__))):
             for name in ("yt-dlp", "yt-dlp.exe"):   # .exe covers the bundled Windows binary
@@ -3173,13 +3211,15 @@ def _ytdlp_cmd():
                     break
             if cand:
                 break
+    cand = cand or shutil.which("yt-dlp")
     return [cand] if cand else None
 
 
 def _ffmpeg_bin():
-    """Path to ffmpeg (SLC_FFMPEG override, else on PATH, else the binary bundled next to the
-    helper/exe, else /usr/bin/ffmpeg), or None."""
-    cand = os.environ.get("SLC_FFMPEG") or shutil.which("ffmpeg")
+    """Path to ffmpeg (SLC_FFMPEG override, else the binary shipped next to the helper/exe, else one
+    on PATH, else /usr/bin/ffmpeg), or None. The shipped binary comes first for the same reason
+    yt-dlp's does: it is the one this release was built and tested against."""
+    cand = os.environ.get("SLC_FFMPEG")
     if not cand:
         for d in (os.path.dirname(sys.executable or ""), os.path.dirname(os.path.abspath(__file__))):
             for name in ("ffmpeg", "ffmpeg.exe"):   # .exe covers the bundled Windows binary
@@ -3189,6 +3229,7 @@ def _ffmpeg_bin():
                     break
             if cand:
                 break
+    cand = cand or shutil.which("ffmpeg")
     if not cand and os.path.exists("/usr/bin/ffmpeg"):
         cand = "/usr/bin/ffmpeg"
     return cand or None
@@ -3381,8 +3422,28 @@ def _make_dash_server(mpd_text, upstreams, ua, tv=""):
             hdrs = {"User-Agent": ua}
             if self.headers.get("Range"):
                 hdrs["Range"] = self.headers["Range"]
+            def _refuse(code):
+                # The receiver reads this cross-origin, so an error carrying no CORS headers reaches it
+                # as an opaque transport failure instead of the status the source actually sent.
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Length", "0")
+                    self._cors()
+                    self.end_headers()
+                except Exception:
+                    pass
             try:
-                with urllib.request.urlopen(urllib.request.Request(up, headers=hdrs), timeout=20) as r:
+                r = urllib.request.urlopen(urllib.request.Request(up, headers=hdrs), timeout=20)
+            except urllib.error.HTTPError as e:
+                log(f"cast: DASH {path} refused by the source: {e.code}")
+                _refuse(e.code)
+                return
+            except OSError as e:
+                log(f"cast: DASH {path} unreachable: {type(e).__name__}: {str(e)[:60]}")
+                _refuse(502)
+                return
+            try:
+                with r:
                     self.send_response(r.status)
                     for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
                         if r.headers.get(h):
@@ -3394,13 +3455,10 @@ def _make_dash_server(mpd_text, upstreams, ua, tv=""):
                         if not chunk:
                             break
                         self.wfile.write(chunk)
-            except urllib.error.HTTPError as e:
-                try:
-                    self.send_error(e.code)
-                except Exception:
-                    pass
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            except (BrokenPipeError, ConnectionResetError):
+                pass                   # the receiver dropped the request, which a seek does routinely
+            except OSError as e:
+                log(f"cast: DASH {path} broke mid-body: {type(e).__name__}: {str(e)[:60]}")
     return _DashHandler
 
 

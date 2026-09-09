@@ -193,7 +193,8 @@ say "  installing streamlink + pychromecast (this downloads a few MB)"
 "$VENV/bin/python" -m pip install --quiet --upgrade streamlink pychromecast curl_cffi
 # yt-dlp resolves high-res YouTube VODs (streamlink caps them at 360p). It is invoked as a tool, not
 # imported, so it stays out of requirements.txt; its venv console script sits next to the venv python,
-# where the helper looks for it.
+# where the helper looks for it. YouTube refuses the urls an out-of-date yt-dlp resolves, so the
+# helper upgrades this copy itself once a week; this install is only the starting point.
 "$VENV/bin/python" -m pip install --quiet --upgrade yt-dlp
 say "  ${DIM}$("$VENV/bin/python" -m streamlink --version 2>/dev/null || echo streamlink)${RST}"
 
