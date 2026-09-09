@@ -208,8 +208,8 @@
     // OUTSIDE the buffer (tracks streaming in while the element waits) latches them apart even though
     // the appended data is aligned. So turn every unbuffered seek into a buffered one: hold the
     // element paused, wait until BOTH tracks cover the target, then re-seek into the buffer and play.
-    // Only two separate SourceBuffers can latch apart - a single muxed buffer carries one clock for
-    // both tracks - so the hold is skipped there, where it could only ever delay playback.
+    // Two SourceBuffers are what makes that possible. A muxed buffer carries one clock for both
+    // tracks, so the hold is skipped there; it would only add a wait.
     let fix = null;   // { own, iv } - the pending unbuffered-seek recovery
     function cancelFix() { if (fix) { clearInterval(fix.iv); fix = null; } }
     function hookMedia(v) {
