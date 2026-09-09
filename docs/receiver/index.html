@@ -28,20 +28,27 @@
   #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
   #splash.gone { display: none; }
   /* transient readout for the accelerating seek, so the step in use is visible while holding a key */
-  #jump { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-          padding: 18px 34px; border-radius: 14px; background: rgba(0,0,0,.72);
-          color: #fff; font: 600 40px/1 system-ui, sans-serif; letter-spacing: .02em;
+  #jump { position: fixed; left: 50%; bottom: 12%; transform: translateX(-50%);
+          width: 62%; padding: 22px 28px; border-radius: 16px; background: rgba(0,0,0,.78);
+          color: #fff; font: 600 30px/1 system-ui, sans-serif; letter-spacing: .02em;
           opacity: 0; transition: opacity .12s; pointer-events: none; }
   #jump.on { opacity: 1; }
+  #jumpBar { height: 8px; border-radius: 4px; background: rgba(255,255,255,.22); overflow: hidden; }
+  #jumpFill { height: 100%; width: 0; background: #e30f0f; border-radius: 4px; }
+  #jumpTxt { display: flex; justify-content: space-between; gap: 20px; margin-top: 16px; }
+  #jumpTxt .sp { color: #b9bec7; font-size: 24px; }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
-  <div id="jump"></div>
+  <div id="jump">
+    <div id="jumpBar"><div id="jumpFill"></div></div>
+    <div id="jumpTxt"><span id="jumpAt"></span><span class="sp" id="jumpSp"></span></div>
+  </div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.16';
+    const RX_VERSION = '1.17';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -260,26 +267,40 @@
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
-    // Skipping through a long recording. A fixed step makes hours of stream unreachable, so a held or
-    // repeated seek key climbs three steps: a nudge, then minutes, then a quarter hour, dropping back
-    // to the nudge once the key is released. Only for a finite, seekable stream long enough to need it;
-    // a short piece and a live edge keep the player's own behaviour.
-    const SEEK_STEPS = [30, 300, 900];
+    // Skipping through a long recording. The remote's key auto-repeat fires far faster than a person
+    // can judge, so the jump does not follow it: holding advances a target on a clock of its own,
+    // stepping up the longer it is held, and the media only seeks once the key is released. That keeps
+    // one seek per gesture instead of dozens, and the readout below shows where the target sits.
+    // Only for a finite, seekable stream long enough to need it; a short piece and a live edge keep the
+    // player's own behaviour.
+    const SEEK_STEPS = [30, 60, 300];      // seconds added per tick, by how long the key has been held
+    const SEEK_TIERS = [5000, 15000];      // ms held before the next step takes over
+    const SEEK_TICK = 250;                 // how often the target advances while the key is down
+    const SEEK_END = 600;                  // no key for this long means the gesture is over
     const jumpEl = document.getElementById('jump');
-    let seekRun = 0, seekAt = 0, jumpHide = 0;
+    const jumpFill = document.getElementById('jumpFill');
+    const jumpAt = document.getElementById('jumpAt');
+    const jumpSp = document.getElementById('jumpSp');
+    let holdFrom = 0, lastKeyAtSeek = 0, lastTick = 0, target = null, commitTimer = 0;
+
     function seekKeyDir(e) {
       const k = (e.key || '').toLowerCase();
       if (k === 'mediafastforward' || k === 'arrowright' || e.keyCode === 417 || e.keyCode === 39) return 1;
       if (k === 'mediarewind' || k === 'arrowleft' || e.keyCode === 412 || e.keyCode === 37) return -1;
       return 0;
     }
-    function showJump(txt) {
-      jumpEl.textContent = txt;
-      jumpEl.classList.add('on');
-      clearTimeout(jumpHide);
-      jumpHide = setTimeout(() => jumpEl.classList.remove('on'), 900);
+    function hms(sec) {
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), x = sec % 60;
+      return h ? h + 'h ' + m + 'm ' + x + 's' : m ? m + 'm ' + x + 's' : x + 's';
     }
     function stepLabel(sec) { return sec >= 60 ? (sec / 60) + ' min' : sec + ' s'; }
+    function commitSeek() {
+      const v = mediaEl();
+      if (v && target != null) { try { v.currentTime = target; } catch (x) {} }
+      target = null; holdFrom = 0;
+      jumpEl.classList.remove('on');
+    }
     function tryAcceleratedSeek(e) {
       const dir = seekKeyDir(e);
       if (!dir) return false;
@@ -287,14 +308,22 @@
       const dur = v && v.duration;
       if (!v || !isFinite(dur) || dur < 600) return false;   // short or live: leave the player alone
       const now = Date.now();
-      seekRun = (now - seekAt < 900) ? seekRun + 1 : 0;       // a released key falls back to the nudge
-      seekAt = now;
-      const step = SEEK_STEPS[seekRun < 4 ? 0 : seekRun < 10 ? 1 : 2];
-      const target = Math.min(Math.max(0, v.currentTime + dir * step), Math.max(0, dur - 5));
-      try { v.currentTime = target; } catch (x) { return false; }
-      const p2 = (n) => String(n).padStart(2, '0');
-      const at = Math.floor(target / 3600) + ':' + p2(Math.floor(target % 3600 / 60)) + ':' + p2(Math.floor(target % 60));
-      showJump((dir > 0 ? '\u00bb ' : '\u00ab ') + stepLabel(step) + '   ' + at);
+      if (now - lastKeyAtSeek > SEEK_END || target == null) {   // a fresh gesture starts where playback is
+        holdFrom = now; target = v.currentTime; lastTick = 0;
+      }
+      lastKeyAtSeek = now;
+      if (now - lastTick >= SEEK_TICK) {
+        lastTick = now;
+        const held = now - holdFrom;
+        const step = held < SEEK_TIERS[0] ? SEEK_STEPS[0] : held < SEEK_TIERS[1] ? SEEK_STEPS[1] : SEEK_STEPS[2];
+        target = Math.min(Math.max(0, target + dir * step), Math.max(0, dur - 5));
+        jumpFill.style.width = (100 * target / dur).toFixed(2) + '%';
+        jumpAt.textContent = hms(target);
+        jumpSp.textContent = (dir > 0 ? '\u00bb ' : '\u00ab ') + stepLabel(step);
+        jumpEl.classList.add('on');
+      }
+      clearTimeout(commitTimer);
+      commitTimer = setTimeout(commitSeek, SEEK_END);
       e.preventDefault(); e.stopPropagation();
       return true;
     }
