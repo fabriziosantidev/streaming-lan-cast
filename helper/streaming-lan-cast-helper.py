@@ -81,6 +81,8 @@ PIDFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy.pid")
 STATEFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-state.json")  # survives --serve restarts
 PROXY_LOG = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-cast.log")  # last cast proxy's output (debug)
 PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-error.json")  # proxy->control: source expired (410/403)
+PROXY_CTL_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-ctl.json")    # control->proxy: switch the cast between live and the recording
+PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-nolive")         # proxy->control: this cast has no live edge to return to
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
 LOGFILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast.log")   # caster diagnostics (pythonw has no console)
@@ -1216,7 +1218,8 @@ def _mpd_filter_height(text, height):
     return blocks.sub(_keep, text)
 
 
-def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fallbacks=None):
+def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fallbacks=None,
+                   dvr_urls=None):
     """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
     requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
     endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
@@ -1341,10 +1344,12 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
         qs = path.split("?", 1)[1] if "?" in path else ""
         return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
 
-    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False, "frange": 0}   # log the first of each event only once
+    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False, "frange": 0, "paths": set()}   # log the first of each event only once
     cur = {"src": source_url}      # the playlist being served; recovery below may move it to a fallback
     _spawned = time.monotonic()
     _fallbacks = [f for f in (fallbacks or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
+    _dvrs = [f for f in (dvr_urls or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
+    _dvr = {"src": None, "text": None, "at": 0.0}   # resolved recording playlist, briefly cached
 
     # In-flight direct-file responses. Seeking makes the receiver stop reading the response it has and
     # open a new range request, so the old one is left blocked writing to a socket nobody drains while
@@ -1453,6 +1458,9 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                 self.send_error(403); return
             p = self.path.split("?", 1)[0]
             res_tail = p                      # what we're serving, for an upstream-error log
+            if _dvrs and len(dbg["paths"]) < 6 and p not in dbg["paths"]:
+                dbg["paths"].add(p)
+                log(f"proxy: target requested {p}")
             try:
                 if media_kind == "file":
                     # Direct media file: forward the receiver's Range so it can seek; relay the ranging
@@ -1495,6 +1503,31 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                             self.wfile.write(chunk)
                     finally:
                         _drop_file_stream(fid, up)
+                    return
+                if p == "/dvr.m3u8" and _dvrs:
+                    # The recording of the broadcast being cast live. Resolved lazily (first candidate
+                    # whose fetch is an HLS playlist) and cached briefly: a rewound player refetches
+                    # nothing, and a growing snapshot stays reasonably fresh across seeks.
+                    now = time.time()
+                    if _dvr["text"] is None or now - _dvr["at"] > 8:
+                        def _txt(u):
+                            try:
+                                return _fetch(u).read().decode("utf-8", "replace")
+                            except Exception:
+                                return None
+                        if _dvr["src"] is None:
+                            _dvr["src"] = _recording_among(_dvrs, _txt) or None
+                        if _dvr["src"]:
+                            t = _txt(_dvr["src"])
+                            if t:
+                                _dvr.update(text=t, at=now)
+                    if _dvr["text"] is None:
+                        self.send_error(404)
+                        return
+                    if not dbg.get("dvr"):
+                        dbg["dvr"] = True
+                        log(f"proxy: receiver fetched /dvr.m3u8 [{_proxy_playlist_note(_dvr['text'])}]")
+                    self._serve_m3u8(_dvr["text"], _dvr["src"])
                     return
                 if media_kind == "dash" and p == "/live.mpd":
                     # Fetched from the source per request, so a dynamic manifest refreshes through the
@@ -1875,6 +1908,9 @@ def serve_control(port):
     grace = {"until": 0.0}  # during a quality re-cast the proxy briefly looks dead; don't drop state then
     stopping = {"until": 0.0}  # during a clean Stop, report idle while --stop tears the proxy down (SOAP-then-kill)
     epoch = {"n": 0}           # bumped each (re)cast so a stale title worker can detect it's outdated
+    _rec_cache = {}            # candidate set -> (recording url, when), so a repeat ask is free
+    _rec_by_page = {}          # page url -> recording url, so a re-cast keeps offering the jump
+    dvr_state = {"urls": [], "told": False}   # the current cast's recording, once the extension names one
     _state_lock = threading.Lock()  # serialize all state read-modify-write (ThreadingHTTPServer = parallel handlers)
 
     # recover an in-flight cast after a --serve restart (crash / code update / reboot of just the server)
@@ -1895,7 +1931,8 @@ def serve_control(port):
         clear_cast_state()   # stale state from a proxy that already exited
 
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
-                        src_kind="", src_vod=False, src_ll=False, fallbacks=None):
+                        src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
+                        dvr_start=-1.0):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -1908,6 +1945,10 @@ def serve_control(port):
             extra += ["--media-url", media]
         if fallbacks:
             extra += ["--fallback-media", json.dumps(fallbacks[:4])]
+        if dvr:
+            extra += ["--dvr-media", json.dumps(dvr[:4])]
+            if dvr_start is not None and dvr_start >= 0:
+                extra += ["--dvr-start", str(dvr_start)]
         if src_kind:                          # classifier's verdict -> proxy skips its own source probe
             extra += ["--src-kind", src_kind]
             if src_vod:
@@ -1961,7 +2002,8 @@ def serve_control(port):
 
     def relaunch_current(u, d, qy, media, headers, kind="dlna", cast=None, title=""):
         """Re-cast the given stream at quality qy (snapshot args, not live state reads)."""
-        return _spawn_proxy(build_cast_args(u, d, qy, media, kind, cast, title), headers)
+        return _spawn_proxy(build_cast_args(u, d, qy, media, kind, cast, title,
+                                            dvr=dvr_state["urls"]), headers)
 
     class CtrlHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # no keep-alive: each request closes cleanly
@@ -2030,6 +2072,7 @@ def serve_control(port):
                 "/qualities": self._qualities,
                 "/quality": self._quality,
                 "/stop": self._stop,
+                "/rewind": self._rewind,
                 "/status": self._status,
                 "/ping": self._ping,
             }.get(u.path)
@@ -2058,6 +2101,8 @@ def serve_control(port):
                 self._cast(q)
             elif u.path == "/qualities":       # POST so the page's Cookie (for reading its ladder) stays out of the URL
                 self._qualities(q)
+            elif u.path == "/recording":       # POST for the same reason: the candidates carry page headers
+                self._recording(q)
             elif u.path == "/quit":
                 self._quit(q)
             else:
@@ -2201,8 +2246,25 @@ def serve_control(port):
             # signatures can kill the chosen url between the classify fetch and the proxy's own,
             # while the stream the page itself is playing provably serves.
             _fb = [m for m in medias if m != media]
+            # The recording of the ongoing broadcast, when the page has one. The extension resolves it
+            # while the page plays and sends the answer here; the proxy then serves it at /dvr.m3u8, so
+            # the cast can rewind across the whole stream while watching live stays on the edge.
+            dvr_state["urls"], dvr_state["told"] = [], False
+            _dvr_done = (q.get("dvrrec", [""])[0]).strip()
+            if not _dvr_done.startswith(("http://", "https://")):
+                _dvr_done = _rec_by_page.get(url, "")     # resolved on an earlier cast of this page
+            if _dvr_done.startswith(("http://", "https://")):
+                dvr_state["urls"] = [_dvr_done]
+                _rec_by_page[url] = _dvr_done
+                while len(_rec_by_page) > 24:
+                    _rec_by_page.pop(next(iter(_rec_by_page)))
+            try:
+                _dvr_start = float((q.get("dvrstart", [""])[0]) or -1)
+            except ValueError:
+                _dvr_start = -1.0
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
-                                    src_kind, src_vod, src_ll, fallbacks=_fb)
+                                    src_kind, src_vod, src_ll, fallbacks=_fb,
+                                    dvr=dvr_state["urls"], dvr_start=_dvr_start)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -2210,6 +2272,7 @@ def serve_control(port):
                 else:
                     stopping["until"] = 0  # a fresh cast cancels any pending stop-suppression
                     _safe_unlink(PROXY_ERR_FILE)         # clear a stale expired-source flag from a prior cast
+                    _safe_unlink(PROXY_NOLIVE_FILE)      # and a stale "no live edge" marker
                     _spawn_proxy(extra, headers)        # kill old (if any) + launch + record pid
                     epoch["n"] += 1
                     this_epoch = epoch["n"]
@@ -2303,6 +2366,67 @@ def serve_control(port):
                 return
             m = stream_meta(qurl) if qurl else {"qualities": []}
             self._json({"ok": True, "qualities": m.get("qualities", []), "matrix": m.get("matrix", [])})
+
+        def _recording(self, q):
+            """Which of a tab's sniffed playlists is the recording of the broadcast it is playing, if
+            any. Answered here rather than at cast time so the sniffer can ask while the page plays and
+            the popup opens already knowing; the answer is cached per candidate set, since resolving it
+            costs one fetch per candidate."""
+            try:
+                urls = json.loads((q.get("urls", [""])[0]).strip() or "[]")
+            except Exception:
+                urls = []
+            urls = [u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://"))][:6]
+            if not urls:
+                self._json({"ok": True, "rec": ""})
+                return
+            try:
+                hmap = json.loads((q.get("h", [""])[0]).strip() or "{}")
+            except Exception:
+                hmap = {}
+            if not isinstance(hmap, dict):
+                hmap = {}
+            key = "\n".join(sorted(urls))
+            hit = _rec_cache.get(key)
+            if hit and time.time() - hit[1] < 300:
+                self._json({"ok": True, "rec": hit[0]})
+                return
+            rec = _recording_among(urls, lambda u: _fetch_playlist(u, hmap))
+            _rec_cache[key] = (rec, time.time())
+            while len(_rec_cache) > 24:
+                _rec_cache.pop(next(iter(_rec_cache)))
+            log(f"recording: {'resolved' if rec else 'none'} among {len(urls)} sniffed playlist(s)")
+            self._json({"ok": True, "rec": rec})
+
+        def _rewind(self, q):
+            # Switch the running cast between the live edge and the recording. Written for the proxy
+            # to pick up on its next tick: the swap is one player load inside the cast that is already
+            # running, so neither a relaunch nor a fresh page resolve has to happen first.
+            with _state_lock:
+                active = proxy_alive() and state.get("url") and state.get("kind") == "cast"
+                has_dvr = bool(dvr_state["urls"])
+            if not active:
+                self._json({"ok": False, "error": "not casting"})
+                return
+            if (q.get("live", [""])[0]).strip():
+                req = {"go": "live"}
+            elif has_dvr:
+                try:
+                    t = max(0.0, float((q.get("t", ["0"])[0]) or 0))
+                except ValueError:
+                    t = 0.0
+                req = {"go": "dvr", "t": t}
+            else:
+                self._json({"ok": False, "error": "no recording for this cast"})
+                return
+            try:
+                with open(PROXY_CTL_FILE, "w", encoding="utf-8") as f:
+                    json.dump(req, f)
+            except OSError as e:
+                self._json({"ok": False, "error": f"ctl write failed: {e}"})
+                return
+            log(f"control: rewind -> {req}")
+            self._json({"ok": True, **req})
 
         def _relaunch_locked(self, **changes):
             """Apply state changes and re-cast the current stream (caller holds _state_lock).
@@ -2400,7 +2524,15 @@ def serve_control(port):
                     perror = _pe.get("code", 410)
             except Exception:
                 pass
-            self._json({"ok": True, "casting": alive, **snap, **({"perror": perror} if perror else {})})
+            _nolive = os.path.exists(PROXY_NOLIVE_FILE)
+            _dvr_on = bool(alive and dvr_state["urls"])
+            if _dvr_on and not dvr_state.get("told"):
+                dvr_state["told"] = True
+                log("control: offering rewind to the popup (recording resolved)")
+            self._json({"ok": True, "casting": alive, **snap,
+                        **({"perror": perror} if perror else {}),
+                        **({"dvr": True} if _dvr_on else {}),
+                        **({"nolive": True} if (alive and _nolive) else {})})
 
         def _ping(self, q):
             resp = {"ok": True, "pong": True, "version": HELPER_VERSION}
@@ -2549,6 +2681,30 @@ def _hls_is_vod(url, hdr_map):
         return False
     except Exception:
         return False
+
+
+def _recording_among(candidates, fetch_text):
+    """The recording of a broadcast among sniffed playlists, told apart by content: a media playlist
+    that ends in #EXT-X-ENDLIST (the window of a live stream never carries one), or a master whose
+    first variant does. A media playlist wins: it names its segments directly, while a master adds a
+    level of indirection whose own url can be session-scoped and outlive its usefulness. The cast
+    already carries a chosen quality, so adapting across the recording's renditions buys little.
+    fetch_text(url) returns the playlist text or None. Returns the chosen url, or ''."""
+    master = ""
+    for u in candidates:
+        t = fetch_text(u)
+        if not t or not t.lstrip().startswith("#EXTM3U"):
+            continue
+        if "#EXT-X-STREAM-INF" in t:
+            if master:
+                continue
+            v = next((ln.strip() for ln in t.splitlines() if ln.strip() and not ln.startswith("#")), "")
+            vt = fetch_text(urllib.parse.urljoin(u, v)) if v else None
+            if vt and "#EXT-X-ENDLIST" in vt:
+                master = u
+        elif "#EXT-X-ENDLIST" in t:
+            return u
+    return master
 
 
 def _fetch_playlist(url, hdr_map, timeout=8):
@@ -3929,7 +4085,19 @@ def run_cast(args):
             source_url = resolved
             _low_latency = True   # these sources are stable enough to ride closer to the live edge
         else:
-            log(f"cast: could not resolve {_page[:48]} via streamlink; proxying {source_url[:36]} as-is")
+            # A broadcast that has ended leaves nothing to resolve. Record that this cast has no live
+            # edge behind it, whatever it ends up playing, so nothing offers a way back to one.
+            try:
+                open(PROXY_NOLIVE_FILE, "w").close()
+            except OSError:
+                pass
+            if getattr(args, "dvr_media", "") and getattr(args, "dvr_start", -1) < 0:
+                # The recording of it is right here, so open that from its beginning rather than
+                # proxying a page url that serves no media. A named starting point is kept as asked.
+                args.dvr_start = 0.0
+                log(f"cast: no live stream at {_page[:44]}; opening its recording instead")
+            else:
+                log(f"cast: could not resolve {_page[:48]} via streamlink; proxying {source_url[:36]} as-is")
 
     # A sniffed HLS master + a resolution picked in the menu -> serve just that variant (no adaptive).
     # Skip this when the control server already resolved the exact media to cast (--src-kind): re-resolving
@@ -4068,10 +4236,14 @@ def run_cast(args):
             _fbs = json.loads(args.fallback_media) if args.fallback_media else []
         except Exception:
             _fbs = []
+        try:
+            _dvrs = json.loads(args.dvr_media) if args.dvr_media else []
+        except Exception:
+            _dvrs = []
         httpd = ThreadingHTTPServer((ip, args.port),
                                     make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
                                                    quality="" if args.quality == "best" else args.quality,
-                                                   fallbacks=_fbs))
+                                                   fallbacks=_fbs, dvr_urls=_dvrs))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _stream_type = "BUFFERED" if _is_vod else "LIVE"
         _marks = []
@@ -4172,9 +4344,19 @@ def run_cast(args):
     # Standard CAF media LOAD -> the receiver's native player (Shaka) plays the proxied HLS, so the
     # native UI + TV-remote/phone controls + BACK/exit all work. The receiver's shakaConfig keeps
     # playback tolerant of segment gaps and stalls (retries / stall-skip / gap-jump / deep buffer).
+    # A cast asked to start inside the recording opens there instead of on the live edge. Opening the
+    # edge first suits a cast that is live and gets rewound later; once the broadcast is over there is
+    # no edge to open, so that first load fails and the recording is never reached.
+    _dvr_base = f"http://{ip}:{args.port}/dvr.m3u8?vod=1" if (httpd and getattr(args, "dvr_media", "")) else ""
+    _start_in_dvr = getattr(args, "dvr_start", -1) >= 0 and bool(_dvr_base)
+    _first = ((_dvr_base, "application/x-mpegurl", "BUFFERED") if _start_in_dvr
+              else (hls_url, _ct_load, _stream_type))
+    if _start_in_dvr:
+        log(f"cast: opening the recording at t={int(args.dvr_start)}s (not the live edge)")
     mc = cc.media_controller
     try:
-        mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
+        mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2],
+                      **({"current_time": max(0.0, args.dvr_start)} if _start_in_dvr else {}))
         try:
             mc.block_until_active(timeout=10)
         except Exception:
@@ -4208,6 +4390,15 @@ def run_cast(args):
     MAX_MID_RELOADS = 3
     playing_since = 0.0            # start of the current uninterrupted playing stretch
     err_changed_at = 0.0           # when the receiver's error report last changed
+    # Rewind support: the switch between the live edge and the recording is one player LOAD inside
+    # this running cast. sw=1 tells the receiver to keep the screen as is instead of showing the
+    # loading logo, so the swap reads as a brief gap, not a restart.
+    _sw_sep = "&" if "?" in hls_url else "?"
+    hls_url_sw = hls_url + _sw_sep + "sw=1"
+    dvr_url_sw = (_dvr_base + "&sw=1") if _dvr_base else ""
+    cur_src = "dvr" if _start_in_dvr else "live"   # which source the receiver is on
+    _safe_unlink(PROXY_CTL_FILE)   # a stale switch request from an earlier cast must not fire here
+    _ctl_seen = 0.0
     MAX_LOAD_ATTEMPTS = 5          # if the receiver reports a load error before playback starts, the
                                    # session just sits idle; re-send the LOAD ourselves up to this many
                                    # times (a source that's slow to start often succeeds on a later try)
@@ -4367,18 +4558,67 @@ def run_cast(args):
                     pos = float(mc.status.current_time or 0)
                 except Exception:
                     pos = 0.0
+            cur_src = "live"           # a failed recording falls back to the edge too
             log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading "
                 f"({mid_reloads}/{MAX_MID_RELOADS})" + (f" at t={int(pos)}s" if pos else ""))
             try:
                 if pos:
-                    mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type,
+                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type,
                                   current_time=max(0.0, pos - 2))
                 else:
-                    mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
+                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
                 last_load_at = time.monotonic()
             except Exception as e:
                 log(f"cast: mid-play reload failed: {type(e).__name__}: {str(e)[:60]}")
             err_changed_at = 0.0       # armed again only by the next error transition
+        # A rewind request from the popup, relayed by the control server through the ctl file: swap
+        # the LOAD between the live edge and the recording within this same cast.
+        try:
+            _cmt = os.path.getmtime(PROXY_CTL_FILE)
+        except OSError:
+            _cmt = 0.0
+        if _cmt and _cmt != _ctl_seen:
+            _ctl_seen = _cmt
+            try:
+                with open(PROXY_CTL_FILE, encoding="utf-8") as _cf:
+                    _creq = json.load(_cf)
+            except Exception:
+                _creq = {}
+            if _creq.get("go") == "dvr" and dvr_url_sw:
+                try:
+                    _t = max(0.0, float(_creq.get("t") or 0))
+                except (TypeError, ValueError):
+                    _t = 0.0
+                cur_src = "dvr"
+                log(f"cast: rewinding onto the recording at t={int(_t)}s")
+                try:
+                    mc.play_media(dvr_url_sw, "application/x-mpegurl", title=_title,
+                                  stream_type="BUFFERED", current_time=_t)
+                    last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: rewind load failed: {type(e).__name__}: {str(e)[:60]}")
+            elif _creq.get("go") == "live":
+                cur_src = "live"
+                log("cast: back to the live edge")
+                try:
+                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
+                    last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: live load failed: {type(e).__name__}: {str(e)[:60]}")
+        # A rewound cast that reaches the end of its snapshot has caught up with the broadcast, so
+        # carry on at the edge. The watchdog above handles the failing case; this one is a clean finish,
+        # meaning idle with no fresh fatal error.
+        if (cur_src == "dvr" and st == "idle" and not _start_in_dvr
+                and (time.monotonic() - last_load_at) > 15
+                and not (err and err.startswith("shaka/") and err_changed_at
+                         and (time.monotonic() - err_changed_at) < 30)):
+            cur_src = "live"
+            log("cast: recording caught up; back to the live edge")
+            try:
+                mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
+                last_load_at = time.monotonic()
+            except Exception as e:
+                log(f"cast: live load failed: {type(e).__name__}: {str(e)[:60]}")
         if slc.last:
             stalls = int(slc.last.get("stalls") or 0)
             if stalls > last_stalls:
@@ -4508,6 +4748,8 @@ def main():
     ap.add_argument("--stop", action="store_true", help="just stop playback on the TV")
     ap.add_argument("--media-url", default="", help="direct media URL (HLS/DASH/file) to cast instead of resolving the page")
     ap.add_argument("--fallback-media", default="", help=argparse.SUPPRESS)  # sniffed sibling playlists (JSON) for the proxy's source recovery
+    ap.add_argument("--dvr-start", type=float, default=-1.0, help=argparse.SUPPRESS)  # open the recording here instead of the live edge
+    ap.add_argument("--dvr-media", default="", help=argparse.SUPPRESS)       # recording of the ongoing broadcast (JSON), served at /dvr.m3u8 for rewinding
     ap.add_argument("--src-kind", default="", help=argparse.SUPPRESS)       # control's source classification (hls) -> skip the proxy re-probe
     ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--src-ll", action="store_true", help=argparse.SUPPRESS)
