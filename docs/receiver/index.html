@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.24';
+    const RX_VERSION = '1.25';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -276,14 +276,27 @@
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
-      let st = 'idle', t = 0, buf = 0;
+      let st = 'idle', t = 0, buf = 0, cov = null, b0 = null;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) {
         t = Math.round(v.currentTime * 10) / 10;
-        try { if (v.buffered.length) buf = Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10; } catch (e) {}
+        // buf reaches to the end of the last range, which holds whether or not the playhead is inside
+        // one: a playhead parked in a gap ahead of the media reads as a deep buffer that never plays.
+        // cov says whether the playhead sits in buffered content, b0 where the content starts.
+        try {
+          const b = v.buffered;
+          if (b.length) {
+            buf = Math.round((b.end(b.length - 1) - v.currentTime) * 10) / 10;
+            b0 = Math.round(b.start(0) * 10) / 10;
+            cov = false;
+            for (let i = 0; i < b.length; i++) {
+              if (v.currentTime >= b.start(i) && v.currentTime < b.end(i)) cov = true;
+            }
+          }
+        } catch (e) {}
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
-      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf,
+      try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
