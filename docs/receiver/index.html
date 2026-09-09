@@ -85,13 +85,13 @@
       try {
         const m = req.media || {};
         sbs.length = 0;                    // new load -> new MediaSource; drop the old SourceBuffers
+        m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
+        const url = m.contentUrl || '';
+        const path = url.split('?')[0];
         // Show the loading logo for a fresh cast only. A LOAD tagged sw=1 swaps the source of a cast
         // already on screen (a rewind, or a recovery), where the logo would turn a short gap into a
         // full restart cue.
         if (url.indexOf('sw=1') === -1) splash.classList.remove('gone');
-        m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
-        const url = m.contentUrl || '';
-        const path = url.split('?')[0];
         // A direct file plays through CAF's own player; an HLS playlist plays through Shaka. contentType
         // picks which.
         if (path.endsWith('.webm')) m.contentType = 'video/webm';
