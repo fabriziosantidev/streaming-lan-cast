@@ -67,7 +67,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
-HELPER_VERSION = "0.5.10"  # reported to the extension via /ping; for a release bump this and the .iss
+HELPER_VERSION = "0.5.11"  # reported to the extension via /ping; for a release bump this and the .iss
                            # (the extension version is independent now; see version.json / checkHelperVersion)
 # Canonical "latest published helper" manifest, checked in the background so /ping can tell the
 # extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
