@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.20';
+    const RX_VERSION = '1.21';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -211,9 +211,13 @@
       v.addEventListener('seeking', () => {
         if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
         cancelFix();
-        // Only a transcode feeds MSE here; anything else (a progressive file) is seeked by the player
-        // itself against its own buffer, which these SourceBuffer checks cannot see.
-        if (!tcMode || !sbs.length) return;
+        // Any source fed through MSE, not only a locally transcoded one, can land with its two tracks
+        // covering different ranges, which plays as audio adrift from the picture. A progressive file
+        // creates no SourceBuffers and is seeked by the player against its own buffer, so it is left
+        // alone. A held seek steps every few hundred ms, and settling on each step would fight the
+        // gesture, so wait until it ends; the nudge in tryAcceleratedSeek brings us back here then.
+        if (!sbs.length) return;
+        if (Date.now() - lastSeekKey < SEEK_END) return;
         if (bufferedCovers(v.currentTime)) return;
         const target = v.currentTime;
         const wasPaused = v.paused;
@@ -273,7 +277,7 @@
     const SEEK_TIERS = [3000, 6000];       // ms held before the next step takes over
     const SEEK_TICK = 400;                 // how often a held key moves the playhead
     const SEEK_END = 700;                  // no key for this long ends the gesture, so it starts small again
-    let holdFrom = 0, lastSeekKey = 0, lastTick = 0, spdHide = 0;
+    let holdFrom = 0, lastSeekKey = 0, lastTick = 0, spdHide = 0, settleTimer = 0;
     const spdEl = document.getElementById('spd');
     const spdT = document.getElementById('spdT');
     const spdA = document.getElementById('spdA');
@@ -355,6 +359,13 @@
         }
         wakeControls();
         showSpeed(tier, target / dur, target, dir);
+        // Once the gesture is over, a hair's move re-fires seeking with no gesture in flight, which
+        // is what runs the track alignment above on where the seek actually settled.
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          const el = mediaEl();
+          if (el && sbs.length) { try { el.currentTime = el.currentTime + 0.001; } catch (x) {} }
+        }, SEEK_END + 60);
       }
       e.preventDefault(); e.stopPropagation();
       return true;
