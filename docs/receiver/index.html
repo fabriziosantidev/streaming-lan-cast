@@ -34,7 +34,7 @@
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.13';
+    const RX_VERSION = '1.14';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -85,7 +85,10 @@
       try {
         const m = req.media || {};
         sbs.length = 0;                    // new load -> new MediaSource; drop the old SourceBuffers
-        splash.classList.remove('gone');   // show the loading logo while the new stream loads
+        // Show the loading logo for a fresh cast only. A LOAD tagged sw=1 swaps the source of a cast
+        // already on screen (a rewind, or a recovery), where the logo would turn a short gap into a
+        // full restart cue.
+        if (url.indexOf('sw=1') === -1) splash.classList.remove('gone');
         m.contentUrl = m.contentUrl || m.contentId;   // pychromecast sets contentId; the player loads contentUrl
         const url = m.contentUrl || '';
         const path = url.split('?')[0];
