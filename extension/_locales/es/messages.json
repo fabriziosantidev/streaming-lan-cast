@@ -20,6 +20,18 @@
   "stopButton": {
     "message": "Parar"
   },
+  "rewindStart": {
+    "message": "Inicio"
+  },
+  "castFromStart": {
+    "message": "Desde el inicio"
+  },
+  "rewindHere": {
+    "message": "Posición"
+  },
+  "backLive": {
+    "message": "Vivo"
+  },
   "searching": {
     "message": "Buscando dispositivos..."
   },

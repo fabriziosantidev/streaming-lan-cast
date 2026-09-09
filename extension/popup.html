@@ -82,6 +82,14 @@
   #helperOld { white-space:normal; }
   #helperOld a { display:inline-block; margin-top:4px; color:var(--accent); font-weight:600; }
   [hidden] { display:none !important; }   /* a class display rule must not override the hidden attribute */
+  /* Jump controls for a cast that has a recording behind it. An icon carries the meaning and the
+     label stays short, so three fit the popup width without truncating. */
+  #rewindRow, #startRow { gap:6px; }
+  #rewindRow button, #startRow button { display:flex; align-items:center; justify-content:center; gap:5px;
+                      padding:8px 4px; font-size:12px; font-weight:600; }
+  #rewindRow svg, #startRow svg { width:14px; height:14px; flex:none; }
+  #rewindRow .lbl, #startRow .lbl { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #backLive .dot { width:8px; height:8px; border-radius:50%; background:#e5484d; flex:none; }
   .linkbtn { display:block; width:100%; margin-top:6px; padding:6px; background:none; border:0;
              color:var(--muted); font-size:12px; cursor:pointer; text-decoration:underline; font-weight:500; }
   .linkbtn:hover { color:var(--fg); }
@@ -176,7 +184,19 @@
       <input id="manualUrl" type="url" spellcheck="false" autocomplete="off" placeholder="https://…/stream.m3u8">
       <button type="button" id="manualPaste" class="ghost" data-i18n="paste">Paste</button>
     </div>
-    <div class="row"><button id="castBtn" data-i18n="castButton">Cast this tab</button></div>
+    <div id="castRow" class="row"><button id="castBtn" data-i18n="castButton">Cast this tab</button></div>
+    <!-- the page exposes a recording of what it is playing, so the cast starts inside it: these stand
+         in for the plain cast button, which has nothing to reach when the broadcast is over -->
+    <div id="startRow" class="row" hidden>
+      <button id="startAtZero">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 19 8 12l10-7z" fill="currentColor"/><path d="M6 5v14"/></svg>
+        <span class="lbl" data-i18n="castFromStart">From start</span>
+      </button>
+      <button id="startAtHere">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10a9 9 0 1 1 2 6"/><path d="M3 4v6h6"/></svg>
+        <span class="lbl" data-i18n="rewindHere">Position</span>
+      </button>
+    </div>
     <div id="status"></div>
     <button id="enableDetect" class="linkbtn" data-i18n="enableDetect" hidden>Enable source detection</button>
   </div>
@@ -195,6 +215,22 @@
     </div>
     <div id="castQualityMenu" class="qmenu" hidden></div>
     <div class="row"><button id="stopBtn" class="danger" data-i18n="stopButton">Stop</button></div>
+    <!-- shown when the cast's page exposed a recording of the ongoing broadcast: jump the cast to the
+         beginning, to where the page's own player sits, or back to the live edge -->
+    <div id="rewindRow" class="row" hidden>
+      <button id="rewindStart" class="ghost">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 19 8 12l10-7z" fill="currentColor"/><path d="M6 5v14"/></svg>
+        <span class="lbl" data-i18n="rewindStart">Start</span>
+      </button>
+      <button id="rewindHere" class="ghost">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10a9 9 0 1 1 2 6"/><path d="M3 4v6h6"/></svg>
+        <span class="lbl" data-i18n="rewindHere">Position</span>
+      </button>
+      <button id="backLive" class="ghost">
+        <span class="dot"></span>
+        <span class="lbl" data-i18n="backLive">Live</span>
+      </button>
+    </div>
   </div>
 </body>
 <script src="browser-polyfill.js"></script>

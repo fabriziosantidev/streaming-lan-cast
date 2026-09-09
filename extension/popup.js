@@ -18,6 +18,9 @@ let statusTimer = null;
 let activeUrl = "";
 let themeMode = "auto";
 let suppressUntil = 0;   // ignore casting:false during a quality re-cast (brief proxy gap)
+let pagePos = 0;         // where the page's own player sits, offered as a starting point
+let posTick = 0;         // throttles re-reading that position while the popup stays open
+let castFrom = -1;       // a point inside the recording to open the cast at, -1 = the live edge
 // quality menu state per trigger: current value ("best" or "itag:NNN") + the /qualities format matrix
 const qCtx = { quality: { value: "best", matrix: [], qualities: [] }, castQuality: { value: "best", matrix: [], qualities: [], url: "" } };
 let authToken = "";           // per-install secret shared with the helper (set in options)
@@ -106,6 +109,36 @@ async function call(path, opts) {
   return r.json();
 }
 function whatOf(s) { return (s.title || "").trim() || (s.url || ""); }
+// The recording of what this tab is playing, if it has one. The sniffer resolves it in the background
+// while the page runs; when it has not got there yet, ask the helper directly rather than offering
+// nothing. A page only fetches its recording once the viewer rewinds, so a lookup that comes up empty
+// is worth repeating while the picker is open.
+let recUrl = "";            // the recording once known; kept for the life of the popup
+let recTried = 0;           // when the last fruitless lookup ran, so retries stay cheap but keep coming
+async function tabRecording(tabId) {
+  if (recUrl) return recUrl;
+  if (Date.now() - recTried < 4000) return "";
+  recTried = Date.now();
+  const det = await browser.runtime.sendMessage({ cmd: "getDetected", tabId }).catch(() => null);
+  if (det && det.rec) return (recUrl = det.rec);
+  const srcs = ((det && det.sources) || []).filter(s => s.type === "hls");
+  if (!srcs.length) return "";
+  const hs = {};
+  for (const k of ["Referer", "Origin", "User-Agent"]) { const v = pickHeader(srcs[0].headers, k); if (v) hs[k] = v; }
+  const body = "urls=" + encodeURIComponent(JSON.stringify(srcs.map(s => s.url).slice(0, 6)))
+             + "&h=" + encodeURIComponent(JSON.stringify(hs));
+  try {
+    const r = await call("/recording", { method: "POST", body });
+    return (recUrl = (r && r.rec) || "");
+  } catch { return ""; }
+}
+// A point in a recording, spelled out: 45s, 12m 34s, 1h 13m 13s. Empty units are dropped from the
+// front, so a short position stays short.
+function hms(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), x = sec % 60;
+  return h ? h + "h " + m + "m " + x + "s" : m ? m + "m " + x + "s" : x + "s";
+}
 function view(name) {
   $("booting").hidden = true;            // a real view is up; the first-paint stand-in is done
   $("noHelper").hidden = name !== "noHelper";
@@ -170,6 +203,19 @@ function startStatusPoll() {
       try { await browser.storage.session.remove("castQuals"); } catch {}
       notify(t("errStreamExpired"), "err");
       return showPicker();
+    }
+    const dv = !!(s.casting && s.dvr);
+    $("rewindRow").hidden = !dv;
+    // A cast that opened inside a recording because the broadcast is over has no edge to return to.
+    $("backLive").hidden = !!s.nolive;
+    if (dv && posTick-- <= 0) {          // the page keeps playing, so refresh the point on offer
+      posTick = 5;
+      const tb = await activeTab();
+      const pm = tb.id != null ? await readPageMedia(tb.id) : { t: 0 };
+      pagePos = pm.t || 0;
+      $("rewindHere").querySelector(".lbl").textContent =
+        pagePos > 30 ? hms(pagePos) : tOr("rewindHere", "Position");
+      $("rewindHere").disabled = !(pagePos > 30);
     }
     if (s.casting && !inCasting) showCasting(s.name || s.device || "", whatOf(s), s.url, s.quality);
     else if (!s.casting && inCasting) { if (Date.now() < suppressUntil) return; showPicker(); }
@@ -342,6 +388,25 @@ async function changeCastQuality(val) {
   setTimeout(() => setQSpin(false), RECAST_REENABLE_MS);       // proxy is up by then
 }
 
+// Offer to start a cast inside the recording, when this tab has one.
+async function refreshStartRow() {
+  const row = $("startRow");
+  const tb = await activeTab();
+  if (tb.id == null || !isSupported(tb.url || "")) { row.hidden = true; $("castRow").hidden = false; return; }
+  const shown = readPageMedia(tb.id).then((pm) => {
+    pagePos = pm.t || 0;
+    $("startAtHere").querySelector(".lbl").textContent =
+      pagePos > 30 ? hms(pagePos) : tOr("rewindHere", "Position");
+    $("startAtHere").disabled = !(pagePos > 30);
+  }).catch(() => {});
+  const rec = await tabRecording(tb.id);
+  await shown;
+  // With a recording in hand these replace the plain cast: on a page whose broadcast has ended there
+  // is no live to cast, and where there is one the casting view still offers a way back to it.
+  row.hidden = !rec;
+  $("castRow").hidden = !!rec;
+}
+
 async function showPicker() {
   setLive(false);
   view("picker");
@@ -349,6 +414,7 @@ async function showPicker() {
   deviceMap.clear(); elMap.clear(); $("devices").replaceChildren();
   selectedId = (await browser.storage.local.get("lastDevice")).lastDevice || null;
   const tb = await activeTab();
+  if ((tb.url || "") !== activeUrl) { recUrl = ""; recTried = 0; }   // another page, another recording
   activeUrl = tb.url || "";
   try { mergeDevices((await call("/devices")).devices || []); }
   catch { stopAll(); setLive(false); return view("noHelper"); }
@@ -356,6 +422,7 @@ async function showPicker() {
   loadQualities();
   refreshDetectUI();
   updateSourceStatus();
+  refreshStartRow();
 }
 
 function startScan() { if (pickerActive) return; pickerActive = true; setSpin(true); scanLoop(); }
@@ -368,6 +435,7 @@ async function scanLoop() {
   if (!pickerActive) return;
   mergeDevices(res.devices || []);
   updateSourceStatus();              // refresh the detected-source line while the picker is open
+  refreshStartRow();                 // the recording may only surface once the page fetches it
   scanTimer = setTimeout(scanLoop, 1200);
 }
 
@@ -599,17 +667,18 @@ function manualMedia() {
 async function readPageMedia(tabId) {
   if (!(browser.scripting && browser.scripting.executeScript)) return { url: "", blobOnly: false };
   const probe = () => {
-    let best = "", bestArea = -1, blobOnly = false;
+    let best = "", bestArea = -1, blobOnly = false, bestT = 0;
     for (const v of document.querySelectorAll("video")) {
       const s = v.currentSrc || v.src || "";
+      const a = (v.videoWidth || v.clientWidth || 0) * (v.videoHeight || v.clientHeight || 0);
       if (/^https?:\/\//i.test(s)) {
-        const a = (v.videoWidth || v.clientWidth || 0) * (v.videoHeight || v.clientHeight || 0);
-        if (a > bestArea) { bestArea = a; best = s; }
+        if (a > bestArea) { bestArea = a; best = s; bestT = v.currentTime || 0; }
       } else if (s) {
-        blobOnly = true;
+        blobOnly = true;                       // a MediaSource src still reports a usable position
+        if (a > bestArea) { bestArea = a; bestT = v.currentTime || 0; }
       }
     }
-    return { url: best, area: bestArea, blobOnly };
+    return { url: best, area: bestArea, blobOnly, t: bestT };
   };
   let res;
   try {
@@ -618,14 +687,15 @@ async function readPageMedia(tabId) {
     try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
     catch { return { url: "", blobOnly: false }; }
   }
-  let url = "", area = -1, blobOnly = false;
+  let url = "", area = -1, blobOnly = false, t = 0;
   for (const f of res || []) {
     const r = f && f.result;
     if (!r) continue;
     if (r.url && r.area > area) { area = r.area; url = r.url; }
+    if (r.t > t) t = r.t;
     blobOnly = blobOnly || !!r.blobOnly;
   }
-  return { url, blobOnly };
+  return { url, blobOnly, t };
 }
 
 // Read off the path, so a signed query string does not hide the extension.
@@ -649,7 +719,7 @@ async function castCurrentTab() {
   const tb = await activeTab();
   const url = tb.url || "";
   const quality = qCtx.quality.value || "best";
-  let media = "", headers = "", medias = "", ladder = "";
+  let media = "", headers = "", medias = "", ladder = "", dvrRec = "";
   const supplied = manualMedia();
   // A supplied address is unrelated to the open page, so the tab's title names the wrong thing; sent
   // empty, the helper reads a title off the page url, which is the tab again. So send a fixed label.
@@ -690,6 +760,12 @@ async function castCurrentTab() {
       // picked quality can be cast by its own url. For a remote list this re-fetches -> fresh, unexpired urls.
       ladder = JSON.stringify((await readPageLadder(tb.id)).ladder || {});
     }
+  } else {
+    // A helper-resolved page may also expose a recording of the ongoing broadcast, which its player
+    // fetches over the wire once the viewer rewinds. Every sniffed playlist goes along as a candidate;
+    // the helper tells the recording apart from the live window by content, and only then offers a
+    // rewind. Watching live stays on the low-latency edge either way.
+    dvrRec = await tabRecording(tb.id);
   }
   try {
     // POST: the captured request headers (incl. Cookie) go in the body, never the URL/query.
@@ -699,7 +775,10 @@ async function castCurrentTab() {
       `&quality=${encodeURIComponent(quality)}&kind=${encodeURIComponent(dev.kind || "dlna")}` +
       (media ? `&media=${encodeURIComponent(media)}&headers=${encodeURIComponent(headers)}` : ``) +
       (medias ? `&medias=${encodeURIComponent(medias)}` : ``) +
-      (ladder ? `&ladder=${encodeURIComponent(ladder)}` : ``);
+      (ladder ? `&ladder=${encodeURIComponent(ladder)}` : ``) +
+      (dvrRec ? `&dvrrec=${encodeURIComponent(dvrRec)}` : ``) +
+      (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``);
+    castFrom = -1;                      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
       // remember this cast's quality list extension-wide so the cast view shows it in any window/tab
@@ -743,6 +822,18 @@ $("manualPaste").addEventListener("click", async () => {
   try { $("manualUrl").value = (await navigator.clipboard.readText()).trim(); }
   catch { $("manualUrl").focus(); }   // clipboard read blocked -> the keyboard paste still works
   syncCastLabel();
+});
+$("startAtZero").addEventListener("click", () => { castFrom = 0; castCurrentTab(); });
+$("startAtHere").addEventListener("click", () => { castFrom = pagePos; castCurrentTab(); });
+$("rewindStart").addEventListener("click", async () => {
+  try { await call("/rewind?t=0"); } catch { notify(t("errNoHelper"), "err"); }
+});
+$("rewindHere").addEventListener("click", async () => {
+  try { await call("/rewind?t=" + Math.max(0, Math.floor(pagePos))); }
+  catch { notify(t("errNoHelper"), "err"); }
+});
+$("backLive").addEventListener("click", async () => {
+  try { await call("/rewind?live=1"); } catch { notify(t("errNoHelper"), "err"); }
 });
 $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTimeout(noticeTimer); });
 $("helperOld").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL + "#update" }); });

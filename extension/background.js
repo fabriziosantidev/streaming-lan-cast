@@ -24,6 +24,10 @@ let activeTabId = -1;        // the focused tab; quality precompute is limited t
 // it appear instantly (like the already-warm device list) precompute it here in the background as the
 // user watches, and hand the popup the cached answer. Keyed by tab; dropped on navigation / tab close.
 const qualCache = new Map(); // tabId -> {qualities, matrix, ts}
+// Which of a tab's sniffed playlists is the recording of the broadcast it plays, resolved here while
+// the page runs so a cast can offer to jump back through it without a wait at cast time.
+const recCache = new Map();  // tabId -> {rec, ts}
+const recLast = new Map();   // tabId -> last resolve time (a running stream keeps minting playlists)
 const qualTimer = new Map(); // tabId -> debounce timer id
 const qualLast = new Map();  // tabId -> last precompute time (rate-limit a busy live stream)
 // Loopback control server + auth header (mirrors constants.js, which the popup loads; keep in sync).
@@ -111,7 +115,10 @@ function record(tabId, src) {
   // A newly-seen HLS playlist on the focused tab -> warm the quality list so the popup opens instantly.
   // A running live stream re-fetches its chunklists under the same query-less key (not "fresh"), so it
   // doesn't re-trigger this; only a genuinely new playlist (the master, a new rendition) does.
-  if (fresh && (src.type === "hls" || src.type === "dash") && tabId === activeTabId) scheduleQualPrecompute(tabId);
+  if (fresh && (src.type === "hls" || src.type === "dash") && tabId === activeTabId) {
+    scheduleQualPrecompute(tabId);
+    resolveRecording(tabId);
+  }
 }
 
 function pickHeaderCI(headers, name) {   // sniffed headers keep original casing; match case-insensitively
@@ -206,12 +213,36 @@ async function precomputeQualities(tabId) {
   } catch {}
 }
 
+// Ask the helper which sniffed playlist is the recording. Cheap to repeat: the helper caches its
+// answer per candidate set, and a page that exposes no recording answers with nothing.
+async function resolveRecording(tabId) {
+  const last = recLast.get(tabId) || 0;
+  if (Date.now() - last < 8000) return;
+  recLast.set(tabId, Date.now());
+  try {
+    const m = perTab.get(tabId);
+    const srcs = m ? [...m.values()].filter(s => s.type === "hls") : [];
+    if (!srcs.length) return;
+    const hs = {};
+    for (const k of ["Referer", "Origin", "User-Agent"]) { const v = pickHeaderCI(srcs[0].headers, k); if (v) hs[k] = v; }
+    const body = "urls=" + encodeURIComponent(JSON.stringify(srcs.map(s => s.url).slice(0, 6)))
+      + "&h=" + encodeURIComponent(JSON.stringify(hs));
+    let token = "";
+    try { token = (await browser.storage.local.get("token")).token || ""; } catch {}
+    const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+    if (token) headers[HELPER_TOKEN_HEADER] = token;
+    const r = await fetch(HELPER_CTRL + "/recording", { method: "POST", cache: "no-store", headers, body });
+    const j = await r.json().catch(() => null);
+    if (j && j.ok && j.rec) recCache.set(tabId, { rec: j.rec, ts: Date.now() });
+  } catch {}
+}
+
 function clearTabDirs(tabId) {   // drop this tab's stream-directory ownerships so they can't outlive its stream
   for (const [dir, t] of dirTab) if (t === tabId) dirTab.delete(dir);
 }
 function onBeforeRequest(d) {
   if (d.type === "main_frame") {                         // navigation -> reset this tab
-    perTab.delete(d.tabId); clearTabDirs(d.tabId); qualCache.delete(d.tabId);
+    perTab.delete(d.tabId); clearTabDirs(d.tabId); qualCache.delete(d.tabId); recCache.delete(d.tabId); recLast.delete(d.tabId);
     clearTimeout(qualTimer.get(d.tabId)); qualTimer.delete(d.tabId);
     persistTab(d.tabId);
   }
@@ -305,6 +336,7 @@ browser.permissions.onRemoved.addListener(() => { if (!browser.webRequest) remov
 browser.tabs.onRemoved.addListener((tabId) => {
   perTab.delete(tabId); clearTabDirs(tabId);
   qualCache.delete(tabId); clearTimeout(qualTimer.get(tabId)); qualTimer.delete(tabId); qualLast.delete(tabId);
+  recCache.delete(tabId); recLast.delete(tabId);
   persistTab(tabId);
 });
 // Track the focused tab so quality precompute only ever scans the page the user is actually on.
@@ -336,7 +368,8 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       }
       const rank = (t) => (t === "hls" ? 0 : t === "dash" ? 1 : 2);
       arr = [...arr].sort((a, b) => rank(a.type) - rank(b.type) || b.ts - a.ts);
-      return { sources: arr, qualities: qualCache.get(msg.tabId) || null };
+      return { sources: arr, qualities: qualCache.get(msg.tabId) || null,
+               rec: (recCache.get(msg.tabId) || {}).rec || "" };
     })();
   }
 });
