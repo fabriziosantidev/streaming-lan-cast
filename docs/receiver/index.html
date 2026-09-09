@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.23';
+    const RX_VERSION = '1.24';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -220,7 +220,11 @@
         // A hold in flight is itself what paused the element, so its captured flag is the only record
         // of whether the viewer had this playing; carry that forward rather than reading back the
         // pause we made. Whatever ends a hold owes playback its state back, early returns included.
-        const wasPaused = fix ? fix.wasPaused : v.paused;
+        // An element that has not started yet also reads as paused, which is how the opening seek to
+        // a live edge arrives, so a played range is what marks a pause as the viewer's.
+        let everPlayed = false;
+        try { everPlayed = v.played.length > 0; } catch (e) {}
+        const wasPaused = fix ? fix.wasPaused : (v.paused && everPlayed);
         const resume = fix && !wasPaused ? () => { try { v.play(); } catch (e) {} } : () => {};
         cancelFix();
         // Any source fed through MSE, not only a locally transcoded one, can land with its two tracks
