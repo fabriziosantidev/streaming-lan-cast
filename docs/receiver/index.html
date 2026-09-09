@@ -27,21 +27,25 @@
   #splash img { width: 168px; height: 168px; }
   #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
   #splash.gone { display: none; }
-  /* Speed marks for a held seek: one arrow per step, sitting just above the scrubber they follow. */
+  /* Held-seek marker riding above the scrubber: where the seek has reached, and one arrow per step.
+     It carries its own time because the player's controls fade to a bare bar while a seek runs. */
   #spd { position: fixed; z-index: 15; transform: translate(-50%, -100%);
-         color: #fff; font: 700 22px/1 system-ui, sans-serif; letter-spacing: 2px;
+         display: flex; align-items: baseline; gap: 10px; white-space: nowrap;
+         padding: 6px 12px; border-radius: 10px; background: rgba(0,0,0,.72);
          text-shadow: 0 1px 4px rgba(0,0,0,.85);
          opacity: 0; transition: opacity .15s; pointer-events: none; }
-  #spd.on { opacity: .92; }
+  #spd.on { opacity: .95; }
+  #spdT { color: #fff; font: 600 24px/1 system-ui, sans-serif; }
+  #spdA { color: #e30f0f; font: 700 22px/1 system-ui, sans-serif; letter-spacing: 2px; }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
-  <div id="spd"></div>
+  <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.19';
+    const RX_VERSION = '1.20';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -271,6 +275,13 @@
     const SEEK_END = 700;                  // no key for this long ends the gesture, so it starts small again
     let holdFrom = 0, lastSeekKey = 0, lastTick = 0, spdHide = 0;
     const spdEl = document.getElementById('spd');
+    const spdT = document.getElementById('spdT');
+    const spdA = document.getElementById('spdA');
+    function hms(sec) {
+      sec = Math.max(0, Math.floor(sec));
+      const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), x = sec % 60;
+      return h ? h + 'h ' + m + 'm ' + x + 's' : m ? m + 'm ' + x + 's' : x + 's';
+    }
 
     function seekKeyDir(e) {
       const k = (e.key || '').toLowerCase();
@@ -307,14 +318,15 @@
       barBox = best; barAt = now;
       return best;
     }
-    function showSpeed(tier, frac) {
+    function showSpeed(tier, frac, at, dir) {
       // Ride the player's scrubber when it can be located. Its markup is not ours, so when the shape
       // search comes up empty the marks still appear, over the strip the bar occupies.
       const b = scrubberRect();
       const W = innerWidth || 1280, H = innerHeight || 720;
       const box = b && b.width > 0 ? b : { left: W * 0.06, width: W * 0.88, top: H - 86 };
       frac = Math.min(1, Math.max(0, frac || 0));
-      spdEl.textContent = '\u25b8'.repeat(tier);
+      spdT.textContent = hms(at);
+      spdA.textContent = (dir < 0 ? '\u25c2' : '\u25b8').repeat(tier);
       spdEl.style.left = Math.round(box.left + box.width * frac) + 'px';
       spdEl.style.top = Math.round(box.top - 6) + 'px';
       spdEl.classList.add('on');
@@ -342,7 +354,7 @@
           try { v.currentTime = target; } catch (y) {}
         }
         wakeControls();
-        showSpeed(tier, target / dur);
+        showSpeed(tier, target / dur, target, dir);
       }
       e.preventDefault(); e.stopPropagation();
       return true;
