@@ -27,14 +27,21 @@
   #splash img { width: 168px; height: 168px; }
   #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
   #splash.gone { display: none; }
+  /* Speed marks for a held seek: one arrow per step, sitting just above the scrubber they follow. */
+  #spd { position: fixed; z-index: 15; transform: translate(-50%, -100%);
+         color: #fff; font: 700 22px/1 system-ui, sans-serif; letter-spacing: 2px;
+         text-shadow: 0 1px 4px rgba(0,0,0,.85);
+         opacity: 0; transition: opacity .15s; pointer-events: none; }
+  #spd.on { opacity: .92; }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
+  <div id="spd"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.18';
+    const RX_VERSION = '1.19';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -255,16 +262,15 @@
 
     // Skipping through a long recording. The remote's key auto-repeat fires far faster than a person
     // can judge, so the jump runs on a clock of its own instead of once per repeat, and the step grows
-    // the longer the key stays down, falling back to the smallest once it is released. The seek is real
-    // on every tick so the player's own progress bar tracks it; that bar only appears on a key the
-    // player itself receives, and the seek keys never reach it, so each tick sends it a harmless one.
-    // Only for a finite, seekable stream long enough to need it; a short piece and a live edge keep the
-    // player's own behaviour.
+    // the longer the key stays down, falling back to the smallest once it is released. Only for a
+    // finite, seekable stream long enough to need it; a short piece and a live edge keep the player's
+    // own behaviour.
     const SEEK_STEPS = [10, 30, 60];       // seconds per tick, by how long the key has been held
     const SEEK_TIERS = [3000, 6000];       // ms held before the next step takes over
     const SEEK_TICK = 400;                 // how often a held key moves the playhead
     const SEEK_END = 700;                  // no key for this long ends the gesture, so it starts small again
-    let holdFrom = 0, lastSeekKey = 0, lastTick = 0;
+    let holdFrom = 0, lastSeekKey = 0, lastTick = 0, spdHide = 0;
+    const spdEl = document.getElementById('spd');
 
     function seekKeyDir(e) {
       const k = (e.key || '').toLowerCase();
@@ -272,13 +278,48 @@
       if (k === 'mediarewind' || k === 'arrowleft' || e.keyCode === 412 || e.keyCode === 37) return -1;
       return 0;
     }
-    // The player shows its controls for any key it handles; ours are swallowed before they get there,
-    // so hand it one that only wakes the controls up.
+    // The player shows its controls for any key it handles; the seek keys are taken before they get
+    // there, so hand it one it does nothing with, which still counts as activity and brings them up.
     function wakeControls() {
       try {
         const el = document.querySelector('cast-media-player') || window;
         el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', keyCode: 38, bubbles: true }));
       } catch (x) {}
+    }
+    // The progress bar lives in the player's shadow root, so find it by shape rather than by a class
+    // name that is not ours to rely on: the widest short box in the lower part of the screen.
+    let barBox = null, barAt = 0;
+    function scrubberRect() {
+      const now = Date.now();
+      if (barBox && now - barAt < 1000) return barBox;
+      const host = document.querySelector('cast-media-player');
+      const root = host && host.shadowRoot;
+      if (!root) return null;
+      const W = innerWidth || 0, H = innerHeight || 0;
+      if (!W || !H) return null;
+      let best = null;
+      for (const el of root.querySelectorAll('*')) {
+        const b = el.getBoundingClientRect();
+        if (b.width > W * 0.4 && b.height > 0 && b.height < 30 && b.top > H * 0.5) {
+          if (!best || b.width > best.width || (b.width === best.width && b.top > best.top)) best = b;
+        }
+      }
+      barBox = best; barAt = now;
+      return best;
+    }
+    function showSpeed(tier, frac) {
+      // Ride the player's scrubber when it can be located. Its markup is not ours, so when the shape
+      // search comes up empty the marks still appear, over the strip the bar occupies.
+      const b = scrubberRect();
+      const W = innerWidth || 1280, H = innerHeight || 720;
+      const box = b && b.width > 0 ? b : { left: W * 0.06, width: W * 0.88, top: H - 86 };
+      frac = Math.min(1, Math.max(0, frac || 0));
+      spdEl.textContent = '\u25b8'.repeat(tier);
+      spdEl.style.left = Math.round(box.left + box.width * frac) + 'px';
+      spdEl.style.top = Math.round(box.top - 6) + 'px';
+      spdEl.classList.add('on');
+      clearTimeout(spdHide);
+      spdHide = setTimeout(() => spdEl.classList.remove('on'), 1200);
     }
     function tryAcceleratedSeek(e) {
       const dir = seekKeyDir(e);
@@ -292,9 +333,16 @@
       if (now - lastTick >= SEEK_TICK) {
         lastTick = now;
         const held = now - holdFrom;
-        const step = held < SEEK_TIERS[0] ? SEEK_STEPS[0] : held < SEEK_TIERS[1] ? SEEK_STEPS[1] : SEEK_STEPS[2];
-        try { v.currentTime = Math.min(Math.max(0, v.currentTime + dir * step), Math.max(0, dur - 5)); } catch (x) {}
+        const tier = held < SEEK_TIERS[0] ? 1 : held < SEEK_TIERS[1] ? 2 : 3;
+        const target = Math.min(Math.max(0, v.currentTime + dir * SEEK_STEPS[tier - 1]),
+                                Math.max(0, dur - 5));
+        // Seek through the player, not the media element: its own clock, scrubber and time readout
+        // follow what it was told to do, and a raw element write leaves all three behind.
+        try { playerManager.seek(target); } catch (x) {
+          try { v.currentTime = target; } catch (y) {}
+        }
         wakeControls();
+        showSpeed(tier, target / dur);
       }
       e.preventDefault(); e.stopPropagation();
       return true;
