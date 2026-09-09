@@ -41,7 +41,7 @@
   <div id="jump"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.15';
+    const RX_VERSION = '1.16';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -292,9 +292,9 @@
       const step = SEEK_STEPS[seekRun < 4 ? 0 : seekRun < 10 ? 1 : 2];
       const target = Math.min(Math.max(0, v.currentTime + dir * step), Math.max(0, dur - 5));
       try { v.currentTime = target; } catch (x) { return false; }
-      const m = Math.floor(target / 60);
-      showJump((dir > 0 ? '\u00bb ' : '\u00ab ') + stepLabel(step)
-               + '   ' + Math.floor(m / 60) + ':' + String(m % 60).padStart(2, '0'));
+      const p2 = (n) => String(n).padStart(2, '0');
+      const at = Math.floor(target / 3600) + ':' + p2(Math.floor(target % 3600 / 60)) + ':' + p2(Math.floor(target % 60));
+      showJump((dir > 0 ? '\u00bb ' : '\u00ab ') + stepLabel(step) + '   ' + at);
       e.preventDefault(); e.stopPropagation();
       return true;
     }
