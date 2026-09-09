@@ -27,14 +27,21 @@
   #splash img { width: 168px; height: 168px; }
   #splash .nm { color: #e6e6e6; font: 600 30px/1 system-ui, sans-serif; }
   #splash.gone { display: none; }
+  /* transient readout for the accelerating seek, so the step in use is visible while holding a key */
+  #jump { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+          padding: 18px 34px; border-radius: 14px; background: rgba(0,0,0,.72);
+          color: #fff; font: 600 40px/1 system-ui, sans-serif; letter-spacing: .02em;
+          opacity: 0; transition: opacity .12s; pointer-events: none; }
+  #jump.on { opacity: 1; }
 </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="splash"><img src="icon-256.png" alt=""><div class="nm">Streaming LAN Cast</div></div>
+  <div id="jump"></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.14';
+    const RX_VERSION = '1.15';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -253,6 +260,45 @@
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
+    // Skipping through a long recording. A fixed step makes hours of stream unreachable, so a held or
+    // repeated seek key climbs three steps: a nudge, then minutes, then a quarter hour, dropping back
+    // to the nudge once the key is released. Only for a finite, seekable stream long enough to need it;
+    // a short piece and a live edge keep the player's own behaviour.
+    const SEEK_STEPS = [30, 300, 900];
+    const jumpEl = document.getElementById('jump');
+    let seekRun = 0, seekAt = 0, jumpHide = 0;
+    function seekKeyDir(e) {
+      const k = (e.key || '').toLowerCase();
+      if (k === 'mediafastforward' || k === 'arrowright' || e.keyCode === 417 || e.keyCode === 39) return 1;
+      if (k === 'mediarewind' || k === 'arrowleft' || e.keyCode === 412 || e.keyCode === 37) return -1;
+      return 0;
+    }
+    function showJump(txt) {
+      jumpEl.textContent = txt;
+      jumpEl.classList.add('on');
+      clearTimeout(jumpHide);
+      jumpHide = setTimeout(() => jumpEl.classList.remove('on'), 900);
+    }
+    function stepLabel(sec) { return sec >= 60 ? (sec / 60) + ' min' : sec + ' s'; }
+    function tryAcceleratedSeek(e) {
+      const dir = seekKeyDir(e);
+      if (!dir) return false;
+      const v = mediaEl();
+      const dur = v && v.duration;
+      if (!v || !isFinite(dur) || dur < 600) return false;   // short or live: leave the player alone
+      const now = Date.now();
+      seekRun = (now - seekAt < 900) ? seekRun + 1 : 0;       // a released key falls back to the nudge
+      seekAt = now;
+      const step = SEEK_STEPS[seekRun < 4 ? 0 : seekRun < 10 ? 1 : 2];
+      const target = Math.min(Math.max(0, v.currentTime + dir * step), Math.max(0, dur - 5));
+      try { v.currentTime = target; } catch (x) { return false; }
+      const m = Math.floor(target / 60);
+      showJump((dir > 0 ? '\u00bb ' : '\u00ab ') + stepLabel(step)
+               + '   ' + Math.floor(m / 60) + ':' + String(m % 60).padStart(2, '0'));
+      e.preventDefault(); e.stopPropagation();
+      return true;
+    }
+
     // BACK button. The numeric keyCode for "back" isn't consistent across Cast platforms, so match the
     // portable event.key name first (Chromecast / Google TV report 'BrowserBack') and fall back to the
     // known TV back codes: 166 (legacy BrowserBack), 461 (HbbTV / most TV browsers), 10009 (Tizen).
@@ -270,6 +316,7 @@
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
+      if (tryAcceleratedSeek(e)) { lastKeyAt = Date.now(); return; }
       if (isBackKey(e)) {
         if (controlsVisible) {
           lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
