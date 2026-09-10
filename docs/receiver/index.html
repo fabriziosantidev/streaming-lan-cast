@@ -45,11 +45,16 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.30';
+    const RX_VERSION = '1.31';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
     const nudge = { left: 3, prevT: -1, at: 0 };
+    // Whether the viewer stopped this. The element's paused flag cannot say: playback pauses on its
+    // own while a source is swapped, while a seek settles and while the player waits, and every one
+    // of those reads the same as a press of the pause key. A press arrives as a command, so that is
+    // what gets recorded, and a load starts the cast off meaning to play.
+    const intent = { paused: false };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
@@ -138,7 +143,17 @@
         playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
         nudge.left = 3; nudge.prevT = -1; nudge.at = 0;
+        intent.paused = false;
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
+      return req;
+    });
+
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
+      intent.paused = true;
+      return req;
+    });
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, (req) => {
+      intent.paused = false;
       return req;
     });
 
@@ -224,11 +239,7 @@
         // A hold in flight is itself what paused the element, so its captured flag is the only record
         // of whether the viewer had this playing; carry that forward rather than reading back the
         // pause we made. Whatever ends a hold owes playback its state back, early returns included.
-        // An element that has not started yet also reads as paused, which is how the opening seek to
-        // a live edge arrives, so a played range is what marks a pause as the viewer's.
-        let everPlayed = false;
-        try { everPlayed = v.played.length > 0; } catch (e) {}
-        const wasPaused = fix ? fix.wasPaused : (v.paused && everPlayed);
+        const wasPaused = fix ? fix.wasPaused : intent.paused;
         const resume = fix && !wasPaused ? () => { try { v.play(); } catch (e) {} } : () => {};
         cancelFix();
         // Any source fed through MSE, not only a locally transcoded one, can land with its two tracks
@@ -305,7 +316,7 @@
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
-        pa, rs, nl: nudge.left,
+        pa, rs, nl: nudge.left, ip: intent.paused,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
@@ -319,9 +330,7 @@
     setInterval(() => {
       const v = mediaEl();
       if (!v || nudge.left <= 0) return;
-      let played = 0;
-      try { played = v.played.length; } catch (e) {}
-      if (v.paused && played) return;
+      if (intent.paused) return;
       let ahead = 0;
       try {
         const b = v.buffered;

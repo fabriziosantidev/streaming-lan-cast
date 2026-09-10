@@ -4708,7 +4708,7 @@ def run_cast(args):
                 tele = 0
                 log(f"cast: telemetry rx={slc.last.get('ver')} state={st} buf={slc.last.get('buf')}s "
                     f"t={slc.last.get('t')} cov={slc.last.get('cov')} b0={slc.last.get('b0')} "
-                    f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} "
+                    f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} ip={slc.last.get('ip')} "
                     f"stalls={stalls} err={slc.last.get('err')}")
 
     _quit()
