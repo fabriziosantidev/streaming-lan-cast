@@ -1967,7 +1967,7 @@ def serve_control(port):
 
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
                         src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
-                        dvr_start=-1.0):
+                        dvr_start=-1.0, start_at=-1.0):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -1984,6 +1984,8 @@ def serve_control(port):
             extra += ["--dvr-media", json.dumps(dvr[:4])]
             if dvr_start is not None and dvr_start >= 0:
                 extra += ["--dvr-start", str(dvr_start)]
+        elif start_at is not None and start_at >= 0:
+            extra += ["--start-at", str(start_at)]
         if src_kind:                          # classifier's verdict -> proxy skips its own source probe
             extra += ["--src-kind", src_kind]
             if src_vod:
@@ -2297,9 +2299,16 @@ def serve_control(port):
                 _dvr_start = float((q.get("dvrstart", [""])[0]) or -1)
             except ValueError:
                 _dvr_start = -1.0
+            # Where the page's own player sits, for a source with no separate recording: a VOD casts
+            # from there instead of from its beginning.
+            try:
+                _start_at = float((q.get("start", [""])[0]) or -1)
+            except ValueError:
+                _start_at = -1.0
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
-                                    dvr=dvr_state["urls"], dvr_start=_dvr_start)
+                                    dvr=dvr_state["urls"], dvr_start=_dvr_start,
+                                    start_at=_start_at)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -4417,12 +4426,20 @@ def run_cast(args):
     _start_in_dvr = getattr(args, "dvr_start", -1) >= 0 and bool(_dvr_base)
     _first = ((_dvr_base, "application/x-mpegurl", "BUFFERED") if _start_in_dvr
               else (hls_url, _ct_load, _stream_type))
+    # A source carrying its own full timeline opens where the viewer's page was sitting: the LOAD
+    # names the offset and the receiver starts there. Only on a BUFFERED load, since a live edge has
+    # no earlier point to open at.
+    _sa = getattr(args, "start_at", -1)
+    _open_at = (max(0.0, args.dvr_start) if _start_in_dvr
+                else (max(0.0, _sa) if _sa >= 0 and _first[2] == "BUFFERED" else None))
     if _start_in_dvr:
         log(f"cast: opening the recording at t={int(args.dvr_start)}s (not the live edge)")
+    elif _open_at is not None:
+        log(f"cast: opening at t={int(_open_at)}s")
     mc = cc.media_controller
     try:
         mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2],
-                      **({"current_time": max(0.0, args.dvr_start)} if _start_in_dvr else {}))
+                      **({"current_time": _open_at} if _open_at is not None else {}))
         try:
             mc.block_until_active(timeout=10)
         except Exception:
@@ -4816,6 +4833,7 @@ def main():
     ap.add_argument("--media-url", default="", help="direct media URL (HLS/DASH/file) to cast instead of resolving the page")
     ap.add_argument("--fallback-media", default="", help=argparse.SUPPRESS)  # sniffed sibling playlists (JSON) for the proxy's source recovery
     ap.add_argument("--dvr-start", type=float, default=-1.0, help=argparse.SUPPRESS)  # open the recording here instead of the live edge
+    ap.add_argument("--start-at", type=float, default=-1.0, help=argparse.SUPPRESS)   # open a seekable VOD at this offset
     ap.add_argument("--dvr-media", default="", help=argparse.SUPPRESS)       # recording of the ongoing broadcast (JSON), served at /dvr.m3u8 for rewinding
     ap.add_argument("--src-kind", default="", help=argparse.SUPPRESS)       # control's source classification (hls) -> skip the proxy re-probe
     ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)

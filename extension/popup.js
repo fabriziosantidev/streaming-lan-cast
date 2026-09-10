@@ -19,6 +19,8 @@ let activeUrl = "";
 let themeMode = "auto";
 let suppressUntil = 0;   // ignore casting:false during a quality re-cast (brief proxy gap)
 let pagePos = 0;         // where the page's own player sits, offered as a starting point
+let pageDur = 0;         // its runtime, as the page's own player reports it
+let pageLive = false;    // the page says it is showing a broadcast that is still running
 let posTick = 0;         // throttles re-reading that position while the popup stays open
 let castFrom = -1;       // a point inside the recording to open the cast at, -1 = the live edge
 // quality menu state per trigger: current value ("best" or "itag:NNN") + the /qualities format matrix
@@ -395,6 +397,8 @@ async function refreshStartRow() {
   if (tb.id == null || !isSupported(tb.url || "")) { row.hidden = true; $("castRow").hidden = false; return; }
   const shown = readPageMedia(tb.id).then((pm) => {
     pagePos = pm.t || 0;
+    pageDur = pm.d || 0;
+    pageLive = !!pm.live;
     $("startAtHere").querySelector(".lbl").textContent =
       pagePos > 30 ? hms(pagePos) : tOr("rewindHere", "Position");
     $("startAtHere").disabled = !(pagePos > 30);
@@ -402,9 +406,14 @@ async function refreshStartRow() {
   const rec = await tabRecording(tb.id);
   await shown;
   // With a recording in hand these replace the plain cast: on a page whose broadcast has ended there
-  // is no live to cast, and where there is one the casting view still offers a way back to it.
-  row.hidden = !rec;
-  $("castRow").hidden = !!rec;
+  // is no live to cast, and where there is one the casting view still offers a way back to it. A page
+  // with no separate recording still gets them once its own player is known to sit inside a finite
+  // video, which is what a source that casts as a seekable VOD looks like from here.
+  // A page still showing a running broadcast is left out: its cast opens on the live edge, which has
+  // no earlier point to start from, so the buttons would promise something they cannot deliver.
+  const atPos = !rec && !pageLive && Number.isFinite(pageDur) && pageDur > 0 && pagePos > 30;
+  row.hidden = !(rec || atPos);
+  $("castRow").hidden = !!(rec || atPos);
 }
 
 async function showPicker() {
@@ -667,18 +676,24 @@ function manualMedia() {
 async function readPageMedia(tabId) {
   if (!(browser.scripting && browser.scripting.executeScript)) return { url: "", blobOnly: false };
   const probe = () => {
-    let best = "", bestArea = -1, blobOnly = false, bestT = 0;
+    // A live edge and a recording look alike from the media element: on a stream that has run for
+    // hours with its whole window seekable, the runtime and the seekable end both sit still while
+    // playback advances. The page's own description of the broadcast is what separates them.
+    const lb = document.querySelector('meta[itemprop="isLiveBroadcast"]');
+    const live = !!lb && String(lb.content || "").toLowerCase() !== "false"
+                 && !document.querySelector('meta[itemprop="endDate"]');
+    let best = "", bestArea = -1, blobOnly = false, bestT = 0, bestD = 0;
     for (const v of document.querySelectorAll("video")) {
       const s = v.currentSrc || v.src || "";
       const a = (v.videoWidth || v.clientWidth || 0) * (v.videoHeight || v.clientHeight || 0);
       if (/^https?:\/\//i.test(s)) {
-        if (a > bestArea) { bestArea = a; best = s; bestT = v.currentTime || 0; }
+        if (a > bestArea) { bestArea = a; best = s; bestT = v.currentTime || 0; bestD = v.duration || 0; }
       } else if (s) {
         blobOnly = true;                       // a MediaSource src still reports a usable position
-        if (a > bestArea) { bestArea = a; bestT = v.currentTime || 0; }
+        if (a > bestArea) { bestArea = a; bestT = v.currentTime || 0; bestD = v.duration || 0; }
       }
     }
-    return { url: best, area: bestArea, blobOnly, t: bestT };
+    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live };
   };
   let res;
   try {
@@ -687,15 +702,16 @@ async function readPageMedia(tabId) {
     try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
     catch { return { url: "", blobOnly: false }; }
   }
-  let url = "", area = -1, blobOnly = false, t = 0;
+  let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false;
   for (const f of res || []) {
     const r = f && f.result;
     if (!r) continue;
     if (r.url && r.area > area) { area = r.area; url = r.url; }
-    if (r.t > t) t = r.t;
+    if (r.t > t) { t = r.t; d = r.d || 0; }   // the runtime of the frame the position came from
     blobOnly = blobOnly || !!r.blobOnly;
+    live = live || !!r.live;              // the frame carrying the page's own markup is the one that knows
   }
-  return { url, blobOnly, t };
+  return { url, blobOnly, t, d, live };
 }
 
 // Read off the path, so a signed query string does not hide the extension.
@@ -777,7 +793,8 @@ async function castCurrentTab() {
       (medias ? `&medias=${encodeURIComponent(medias)}` : ``) +
       (ladder ? `&ladder=${encodeURIComponent(ladder)}` : ``) +
       (dvrRec ? `&dvrrec=${encodeURIComponent(dvrRec)}` : ``) +
-      (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``);
+      (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``) +
+      (!dvrRec && castFrom > 0 ? `&start=${Math.floor(castFrom)}` : ``);
     castFrom = -1;                      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
