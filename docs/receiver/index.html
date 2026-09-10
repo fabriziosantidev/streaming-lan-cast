@@ -45,8 +45,11 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.28';
+    const RX_VERSION = '1.29';
     const stats = { stalls: 0, lastError: null };
+    // Budget for the startup nudge below, held here so the load interceptor can refill it without
+    // reaching forward to a declaration that has not run yet.
+    const nudge = { left: 3, prevT: -1, at: 0 };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
@@ -134,6 +137,7 @@
         playbackConfig.shakaConfig.streaming.retryParameters.timeout = isTc ? 50000 : 9000;
         playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
+        nudge.left = 3; nudge.prevT = -1; nudge.at = 0;
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
     });
@@ -302,15 +306,17 @@
 
     // A cast can settle with the playhead on the first buffered sample and never start: the element
     // sits at a position the decoder has nothing to render at, so it waits while the buffer behind it
-    // keeps filling. A small step into the buffer starts it. This runs only before playback has ever
-    // begun, so it can never argue with a viewer's own pause, and it gives up after a few tries.
-    let nudges = 0, prevT = -1, stuckAt = 0;
+    // keeps filling. A small step into the buffer starts it. Every load can land that way, a swap to
+    // another source and a recovery reload included, so the budget refills whenever one begins.
+    // A viewer's own pause is the one state left alone: pausing takes a playback to pause, so a
+    // paused element that has played is theirs, while one that is not paused and still will not move
+    // is waiting on nothing.
     setInterval(() => {
       const v = mediaEl();
-      if (!v || nudges >= 3) return;
-      let started = 0;
-      try { started = v.played.length; } catch (e) {}
-      if (started) return;
+      if (!v || nudge.left <= 0) return;
+      let played = 0;
+      try { played = v.played.length; } catch (e) {}
+      if (v.paused && played) return;
       let ahead = 0;
       try {
         const b = v.buffered;
@@ -319,10 +325,10 @@
         }
       } catch (e) {}
       const t = v.currentTime;
-      if (ahead < 1 || t !== prevT) { prevT = t; stuckAt = Date.now(); return; }
-      if (Date.now() - stuckAt < 4000) return;
-      nudges++;
-      stuckAt = Date.now();
+      if (ahead < 1 || t !== nudge.prevT) { nudge.prevT = t; nudge.at = Date.now(); return; }
+      if (Date.now() - nudge.at < 4000) return;
+      nudge.left--;
+      nudge.at = Date.now();
       try { v.currentTime = t + 0.3; } catch (e) {}
       try { v.play(); } catch (e) {}
     }, 1000);
