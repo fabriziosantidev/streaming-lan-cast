@@ -4429,9 +4429,9 @@ def run_cast(args):
     elif _open_at is not None:
         log(f"cast: opening at t={int(_open_at)}s")
     mc = cc.media_controller
+    _open_kw = {"current_time": _open_at} if _open_at is not None else {}
     try:
-        mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2],
-                      **({"current_time": _open_at} if _open_at is not None else {}))
+        mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
         try:
             mc.block_until_active(timeout=10)
         except Exception:
@@ -4606,7 +4606,11 @@ def run_cast(args):
                 load_attempts += 1
                 log(f"cast: load failed ({err}); auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
                 try:
-                    mc.play_media(hls_url, _ct_load, title=_title, stream_type=_stream_type)
+                    # Re-send what this cast opened with. A cast that opened inside a recording, or at
+                    # a position, is not the live edge, and a retry aimed there lands somewhere the
+                    # viewer never asked for. Nothing has played yet here, so the opening load is
+                    # still what the cast is meant to be showing.
+                    mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
                     last_load_at = last_progress_at = time.monotonic()
                     deepest_buf = -1.0      # the new LOAD buffers from zero
                 except Exception as e:
