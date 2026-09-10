@@ -4141,7 +4141,9 @@ def run_cast(args):
         if resolved:
             log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
             source_url = resolved
-            _low_latency = True   # these sources are stable enough to ride closer to the live edge
+            # How close to the edge this can sit is settled below, from the playlist. Riding near it
+            # needs the sub-segment parts of a real LL-HLS; a source published as whole segments has
+            # nothing between them to play, so it keeps the standard distance back.
         else:
             # A broadcast that has ended leaves nothing to resolve. Record that this cast has no live
             # edge behind it, whatever it ends up playing, so nothing offers a way back to one.
@@ -4305,8 +4307,14 @@ def run_cast(args):
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _stream_type = "BUFFERED" if _is_vod else "LIVE"
         _marks = []
+        # Two separate things ride here. ll=1 is how close to the live edge to sit, which any stable
+        # source can do. llp=1 is the receiver's low-latency playback, which reads partial segments and
+        # so belongs only to a playlist that carries them; on one that does not, it leaves the playhead
+        # waiting on parts that never arrive.
         if _low_latency and _kind != "file":
             _marks.append("ll=1")
+        if _ll and not _is_vod and _kind != "file":
+            _marks.append("llp=1")
         if _is_vod:
             _marks.append("vod=1")
         _path = f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"
@@ -4686,7 +4694,8 @@ def run_cast(args):
             if tele >= 7:          # ~ every 10s
                 tele = 0
                 log(f"cast: telemetry rx={slc.last.get('ver')} state={st} buf={slc.last.get('buf')}s "
-                    f"t={slc.last.get('t')} stalls={stalls} err={slc.last.get('err')}")
+                    f"t={slc.last.get('t')} cov={slc.last.get('cov')} b0={slc.last.get('b0')} "
+                    f"stalls={stalls} err={slc.last.get('err')}")
 
     _quit()
     if httpd:
