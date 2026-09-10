@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.29';
+    const RX_VERSION = '1.30';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -280,10 +280,14 @@
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
-      let st = 'idle', t = 0, buf = 0, cov = null, b0 = null;
+      let st = 'idle', t = 0, buf = 0, cov = null, b0 = null, pa = null, rs = null;
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) {
         t = Math.round(v.currentTime * 10) / 10;
+        // What the element itself thinks, so a playhead that will not move can be told apart from one
+        // held by a pause, one starved of decodable data, and one a nudge has already tried to start.
+        pa = !!v.paused;
+        rs = v.readyState | 0;
         // buf reaches to the end of the last range, which holds whether or not the playhead is inside
         // one: a playhead parked in a gap ahead of the media reads as a deep buffer that never plays.
         // cov says whether the playhead sits in buffered content, b0 where the content starts.
@@ -301,6 +305,7 @@
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
+        pa, rs, nl: nudge.left,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
