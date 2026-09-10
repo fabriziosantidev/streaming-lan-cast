@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.26';
+    const RX_VERSION = '1.27';
     const stats = { stalls: 0, lastError: null };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
 
@@ -303,6 +303,33 @@
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
+
+    // A cast can settle with the playhead on the first buffered sample and never start: the element
+    // sits at a position the decoder has nothing to render at, so it waits while the buffer behind it
+    // keeps filling. A small step into the buffer starts it. This runs only before playback has ever
+    // begun, so it can never argue with a viewer's own pause, and it gives up after a few tries.
+    let nudges = 0, prevT = -1, stuckAt = 0;
+    setInterval(() => {
+      const v = mediaEl();
+      if (!v || nudges >= 3) return;
+      let started = 0;
+      try { started = v.played.length; } catch (e) {}
+      if (started) return;
+      let ahead = 0;
+      try {
+        const b = v.buffered;
+        for (let i = 0; i < b.length; i++) {
+          if (v.currentTime >= b.start(i) - 0.1 && v.currentTime < b.end(i)) ahead = b.end(i) - v.currentTime;
+        }
+      } catch (e) {}
+      const t = v.currentTime;
+      if (ahead < 1 || t !== prevT) { prevT = t; stuckAt = Date.now(); return; }
+      if (Date.now() - stuckAt < 4000) return;
+      nudges++;
+      stuckAt = Date.now();
+      try { v.currentTime = t + 0.3; } catch (e) {}
+      try { v.play(); } catch (e) {}
+    }, 1000);
 
     // Skipping through a long recording. The remote's key auto-repeat fires far faster than a person
     // can judge, so the jump runs on a clock of its own instead of once per repeat, and the step grows
