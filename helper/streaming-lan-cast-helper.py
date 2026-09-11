@@ -1643,6 +1643,8 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                             break
                         self.wfile.write(chunk)
                         _sent += len(chunk)
+                        if time.monotonic() - _SEG_SERVED["at"] > 0.5:
+                            _SEG_SERVED["at"] = time.monotonic()   # bytes still moving = still progressing
                     # What one segment costs, for the first few of a cast. Playback cannot begin until
                     # the receiver has identified the media, and it identifies it by reading a whole
                     # segment, so this is the size and the wait the first frame is behind.
@@ -4681,23 +4683,33 @@ def run_cast(args):
                 and err_changed_at and (time.monotonic() - err_changed_at) < 30
                 and mid_reloads < MAX_MID_RELOADS):
             mid_reloads += 1
+            # Recover the source the cast is ON. A cast watching the recording is not helped by being
+            # dropped at the live edge: that is hours from where the viewer was, and on a broadcast
+            # that has ended there is no edge there at all. Whether the position can be read is a
+            # question about the load in the player, not about the source the cast was built from.
+            _on_dvr = cur_src == "dvr" and dvr_url_sw
+            _re_url = dvr_url_sw if _on_dvr else hls_url_sw
+            _re_ct = "application/x-mpegurl" if _on_dvr else _ct_load
+            _re_type = "BUFFERED" if _on_dvr else _stream_type
             pos = 0.0
-            if _stream_type == "BUFFERED":
+            if _re_type == "BUFFERED":
                 try:
                     mc.update_status()
                     time.sleep(0.3)
                     pos = float(mc.status.current_time or 0)
                 except Exception:
                     pos = 0.0
-            cur_src = "live"           # a failed recording falls back to the edge too
-            log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading "
-                f"({mid_reloads}/{MAX_MID_RELOADS})" + (f" at t={int(pos)}s" if pos else ""))
+            if not _on_dvr:
+                cur_src = "live"       # a failed recording with no edge to keep falls back to one
+            log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading the "
+                f"{'recording' if _on_dvr else 'live edge'} ({mid_reloads}/{MAX_MID_RELOADS})"
+                + (f" at t={int(pos)}s" if pos else ""))
             try:
                 if pos:
-                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type,
+                    mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type,
                                   current_time=max(0.0, pos - 2))
                 else:
-                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
+                    mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type)
                 last_load_at = time.monotonic()
             except Exception as e:
                 log(f"cast: mid-play reload failed: {type(e).__name__}: {str(e)[:60]}")
@@ -4760,7 +4772,7 @@ def run_cast(args):
                 tele = 0
                 log(f"cast: telemetry rx={slc.last.get('ver')} state={st} buf={slc.last.get('buf')}s "
                     f"t={slc.last.get('t')} cov={slc.last.get('cov')} b0={slc.last.get('b0')} "
-                    f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} ip={slc.last.get('ip')} "
+                    f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} ip={slc.last.get('ip')} want={slc.last.get('want')} "
                     f"stalls={stalls} err={slc.last.get('err')}")
 
     _quit()
