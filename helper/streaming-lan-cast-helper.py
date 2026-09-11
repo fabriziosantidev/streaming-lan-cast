@@ -2861,6 +2861,12 @@ def _hls_is_vod(url, hdr_map):
         return False
 
 
+def _seq_in(url):
+    """The sequence number a segment url carries, or 0 when it is not numbered that way."""
+    m = re.search(r"/sq/(\d+)", url)
+    return int(m.group(1)) if m else 0
+
+
 def _seq_url(tpl, n):
     """The same segment url with its sequence number replaced."""
     return re.sub(r"/sq/\d+", "/sq/%d" % n, tpl, count=1)
