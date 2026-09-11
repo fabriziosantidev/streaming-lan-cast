@@ -4599,12 +4599,19 @@ def run_cast(args):
             if buf_now > deepest_buf:
                 deepest_buf = buf_now
                 last_progress_at = time.monotonic()
-        if not played and err and err.startswith("shaka/"):
+        # A load that never reaches playback is a failed start whether or not an error is still being
+        # reported: the receiver names the url it is loading in the same field, so the error that
+        # started this is gone the moment the next load begins. Waiting for one to still be there
+        # leaves the cast that quietly never starts with nothing to arm this at all, and nothing to
+        # end it either. The buffer guard above is what separates that from a source merely slow to
+        # begin, which keeps filling while it gets there.
+        if not played:
             now = time.monotonic()
             if (load_attempts < MAX_LOAD_ATTEMPTS and (now - last_load_at) > LOAD_RETRY_AFTER
                     and (now - last_progress_at) > LOAD_STUCK_AFTER):
                 load_attempts += 1
-                log(f"cast: load failed ({err}); auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
+                log(f"cast: load never started ({err or 'nothing reported'}); "
+                    f"auto-retry {load_attempts}/{MAX_LOAD_ATTEMPTS}")
                 try:
                     # Re-send what this cast opened with. A cast that opened inside a recording, or at
                     # a position, is not the live edge, and a retry aimed there lands somewhere the
@@ -4617,7 +4624,8 @@ def run_cast(args):
                     log(f"cast: auto-retry LOAD send failed: {type(e).__name__}: {str(e)[:60]}")
             elif load_attempts >= MAX_LOAD_ATTEMPTS and not gave_up:
                 gave_up = True
-                log(f"cast: still failing after {MAX_LOAD_ATTEMPTS} loads ({err}); source may be down "
+                log(f"cast: still failing after {MAX_LOAD_ATTEMPTS} loads ({err or 'nothing reported'}); "
+                    f"source may be down "
                     f"or too slow to start; re-cast to retry")
         # A stream that errors out MID-play parks the session idle even though the source usually
         # recovers: a live playlist can advertise a segment its CDN never serves, which kills playback
