@@ -2615,7 +2615,12 @@ def serve_control(port):
             except Exception:
                 pass
             _nolive = os.path.exists(PROXY_NOLIVE_FILE)
-            _seekable = os.path.exists(PROXY_SEEK_FILE)
+            _seekable = ""
+            try:
+                with open(PROXY_SEEK_FILE, encoding="utf-8") as _sf:
+                    _seekable = (_sf.read(16) or "vod").strip()
+            except OSError:
+                _seekable = ""
             _dvr_on = bool(alive and dvr_state["urls"])
             if _dvr_on and not dvr_state.get("told"):
                 dvr_state["told"] = True
@@ -2624,7 +2629,7 @@ def serve_control(port):
                         **({"perror": perror} if perror else {}),
                         **({"dvr": True} if _dvr_on else {}),
                         **({"nolive": True} if (alive and _nolive) else {}),
-                        **({"seekable": True} if (alive and _seekable) else {})})
+                        **({"seekable": _seekable} if (alive and _seekable) else {})})
 
         def _ping(self, q):
             resp = {"ok": True, "pong": True, "version": HELPER_VERSION}
@@ -4475,8 +4480,13 @@ def run_cast(args):
         # finished video or from a live stream being replayed from behind its edge. The popup offers
         # the points to move to; this is how it learns there are any.
         if _is_vod:
+            # Which timeline it is, not only that there is one. A recorded video shares its clock with
+            # the page's own player, so a point on one is a point on the other. A live stream being
+            # replayed starts its at the anchor, which is its own count: the page's position names a
+            # moment that does not exist there.
             try:
-                open(PROXY_SEEK_FILE, "w").close()
+                with open(PROXY_SEEK_FILE, "w", encoding="utf-8") as _sf:
+                    _sf.write("replay" if _replay_anchor else "vod")
             except OSError:
                 pass
         _marks = []

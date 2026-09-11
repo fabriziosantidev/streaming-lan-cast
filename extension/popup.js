@@ -215,17 +215,25 @@ function startStatusPoll() {
     // no edge to return to there, so that control stays out of it.
     const dv = !!(s.casting && s.dvr);
     const sk = !!(s.casting && s.seekable && !s.dvr);
+    const replay = sk && s.seekable === "replay";
     $("rewindRow").hidden = !(dv || sk);
     // A cast that opened inside a recording because the broadcast is over has no edge to return to.
     $("backLive").hidden = sk || !!s.nolive;
+    // A replay counts from its own anchor, so the page's position names a moment it does not have;
+    // its beginning is the one point on it that can be asked for.
+    $("rewindHere").hidden = replay;
     if ((dv || sk) && posTick-- <= 0) {   // the page keeps playing, so refresh the point on offer
       posTick = 5;
       const tb = await activeTab();
       const pm = tb.id != null ? await readPageMedia(tb.id) : { t: 0 };
       pagePos = pm.t || 0;
+      // On a page showing a running broadcast the point worth naming is how far back it is being
+      // watched, which its own player answers; its position counts from somewhere else entirely.
+      const shown = pm.live ? (pm.atEdge ? 0 : (pm.behind || 0)) : pagePos;
+      const enough = pm.live ? shown > 60 : shown > 30;
       $("rewindHere").querySelector(".lbl").textContent =
-        pagePos > 30 ? hms(pagePos) : tOr("rewindHere", "Position");
-      $("rewindHere").disabled = !(pagePos > 30);
+        enough ? hms(shown) : tOr("rewindHere", "Position");
+      $("rewindHere").disabled = !enough;
     }
     castSeekable = sk;
     if (s.casting && !inCasting) showCasting(s.name || s.device || "", whatOf(s), s.url, s.quality);
