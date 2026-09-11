@@ -1345,7 +1345,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
         qs = path.split("?", 1)[1] if "?" in path else ""
         return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
 
-    dbg = {"m3u8": False, "seg": False, "refused": False, "err": 0, "dewrap": False, "frange": 0, "paths": set()}   # log the first of each event only once
+    dbg = {"m3u8": False, "seg": False, "segn": 0, "refused": False, "err": 0, "dewrap": False, "frange": 0, "paths": set()}   # log the first of each event only once
     cur = {"src": source_url}      # the playlist being served; recovery below may move it to a fallback
     _spawned = time.monotonic()
     _fallbacks = [f for f in (fallbacks or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
@@ -1589,6 +1589,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self._serve_m3u8(text, cur["src"])
                     return
                 if p == "/p":
+                    _seg_t0 = time.monotonic()
                     if not dbg["seg"]:
                         dbg["seg"] = True
                         log("proxy: receiver fetched first segment/sub-playlist")
@@ -1628,13 +1629,23 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self.send_response(200)
                     self.send_header("Content-Type", ct)
                     self._cors([("Connection", "close")]); self.end_headers()
+                    _sent = 0
                     if first:
                         self.wfile.write(first)
+                        _sent = len(first)
                     while True:
                         chunk = r.read(65536)
                         if not chunk:
                             break
                         self.wfile.write(chunk)
+                        _sent += len(chunk)
+                    # What one segment costs, for the first few of a cast. Playback cannot begin until
+                    # the receiver has identified the media, and it identifies it by reading a whole
+                    # segment, so this is the size and the wait the first frame is behind.
+                    if dbg["segn"] < 3:
+                        dbg["segn"] += 1
+                        log(f"proxy: segment {dbg['segn']} served {_sent / 1048576:.1f}MB in "
+                            f"{time.monotonic() - _seg_t0:.1f}s")
                     return
                 self.send_error(404)
             except _UpstreamError as e:
