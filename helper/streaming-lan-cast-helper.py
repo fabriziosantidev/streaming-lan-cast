@@ -1564,7 +1564,12 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         dbg["m3u8"] = True
                         log(f"proxy: receiver fetched /live.m3u8 [replay from {_REPLAY['anchor']['seq']}] "
                             f"(client {self.client_address[0]})")
-                    self._serve_m3u8(_dvr_playlist(_REPLAY["anchor"], _REPLAY["t0"]), cur["src"])
+                    _body = _dvr_playlist(_REPLAY["anchor"]).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self._cors([("Content-Length", str(len(_body))), ("Connection", "close")])
+                    self.end_headers()
+                    self.wfile.write(_body)
                     return
                 if p == "/live.m3u8":
                     # Forward only the receiver's blocking-reload params, dropping the source's stale ones
@@ -1604,13 +1609,23 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         log(f"proxy: receiver fetched /live.m3u8 [{_proxy_playlist_note(text)}] (client {self.client_address[0]})")
                     self._serve_m3u8(text, cur["src"])
                     return
-                if p == "/p":
+                if p == "/p" or p.startswith("/s/"):
                     _seg_t0 = time.monotonic()
                     _SEG_SERVED["at"] = _seg_t0    # a segment in flight is progress too, not only a finished one
                     if not dbg["seg"]:
                         dbg["seg"] = True
                         log("proxy: receiver fetched first segment/sub-playlist")
-                    u = (_qparam(self.path, "u") or [""])[0]
+                    if p.startswith("/s/"):
+                        # A replay's playlist names its segments by number alone, so the url is built
+                        # back here from the one the anchor was taken from.
+                        if not _REPLAY["anchor"]:
+                            self.send_error(404); return
+                        try:
+                            u = _seq_url(_REPLAY["anchor"]["tpl"], int(p[3:]))
+                        except ValueError:
+                            self.send_error(400); return
+                    else:
+                        u = (_qparam(self.path, "u") or [""])[0]
                     if not u:
                         self.send_error(400); return
                     res_tail = _redact_url(u).rsplit("/", 1)[-1] or p
@@ -1621,15 +1636,22 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         # A replay playing forward crosses out of the generation it was anchored in,
                         # and the next one refuses the numbers that are not its own. Refusal is the
                         # only thing a wrong generation returns, so the next one up is safe to ask.
-                        _nu = ""
+                        r = None
                         if e.code == 404 and _REPLAY["anchor"] and _lmt_in(u):
-                            _nu = _lmt_url(u, _lmt_in(u) + 1)
-                        if not _nu:
+                            # A day of broadcast spans several of the source's generations, and each
+                            # refuses the numbers that are not its own. Refusal is all a wrong one
+                            # returns, so the ones after it can be asked in turn.
+                            for _g in range(1, 5):
+                                try:
+                                    r = _fetch(_lmt_url(u, _lmt_in(u) + _g))
+                                    break
+                                except _UpstreamError:
+                                    continue
+                        if r is None:
                             raise
-                        r = _fetch(_nu)
                         if not dbg.get("gen"):
                             dbg["gen"] = True
-                            log("proxy: the replay reached the source's next media generation")
+                            log("proxy: the replay crossed into a later media generation")
                     ctype = r.headers.get("Content-Type", "")
                     if is_pl or "mpegurl" in ctype:
                         self._serve_m3u8(r.read().decode("utf-8", "replace"), u)
@@ -2895,20 +2917,22 @@ def _seg_answers(url, hdr_map):
         return False
 
 
-def _dvr_playlist(anchor, started_at=0.0, keep=1440):
+def _dvr_playlist(anchor, started_at=0.0, keep=17280):
     """The stretch of the broadcast the replay covers, closed. A playlist left open is a live one
     however it is labelled: the player gives it no duration and no range to move through, and starts
     it at its newest moment rather than the one it was anchored to. Closing it makes the same
     segments a recording, which is what a viewer who rewound is asking to watch.
 
-    It runs from the anchor to the edge the source was at, capped: every entry is a signed url of its
-    own, and a broadcast two days deep would otherwise weigh tens of megabytes to hand over."""
+    It runs from the anchor to the edge the source was at when the anchor was taken, so the whole of
+    what was reached is there to move through. Each entry names only its number: the proxy holds the
+    url they are all built from, and writing it out in full on every line is what would make a day of
+    broadcast weigh tens of megabytes instead of a few hundred kilobytes."""
     dur = anchor["dur"]
     last = min(anchor["live"], anchor["seq"] + keep - 1)
     out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD",
            f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{anchor['seq']}"]
     for n in range(anchor["seq"], last + 1):
-        out += [f"#EXTINF:{dur:.3f},", _seq_url(anchor["tpl"], n)]
+        out += [f"#EXTINF:{dur:.3f},", f"/s/{n}"]
     out.append("#EXT-X-ENDLIST")
     return "\n".join(out) + "\n"
 
