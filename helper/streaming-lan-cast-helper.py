@@ -86,7 +86,8 @@ PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-noli
 PROXY_SEEK_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-seekable")         # proxy->control: this cast carries its own timeline, so it can be moved through
 # The live stream this cast is replaying and where from. Held here because the playlist is served on
 # one thread and re-anchored on another, and both have to agree on which moment the cast starts at.
-_REPLAY = {"anchor": None, "t0": 0.0, "gd": 0}
+_REPLAY = {"anchor": None, "t0": 0.0, "gd": 0, "window": 43200.0,
+           "live": 0, "at": 0.0, "text": ""}
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
@@ -1564,7 +1565,25 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         dbg["m3u8"] = True
                         log(f"proxy: receiver fetched /live.m3u8 [replay from {_REPLAY['anchor']['seq']}] "
                             f"(client {self.client_address[0]})")
-                    _body = _dvr_playlist(_REPLAY["anchor"]).encode("utf-8")
+                    # The edge moves while the cast runs, so it is read again, briefly cached: the
+                    # player refetches this every few seconds and the source's own window is 30s.
+                    if time.monotonic() - _REPLAY["at"] > 2.0 or not _REPLAY["text"]:
+                        _up = None
+                        try:
+                            _up = _fetch(cur["src"]).read().decode("utf-8", "replace")
+                        except Exception:
+                            _up = None
+                        if _up:
+                            _tail = [l.strip() for l in _up.splitlines()
+                                     if l.strip() and not l.startswith("#")]
+                            _n = _seq_in(_tail[-1]) if _tail else 0
+                            if _n:
+                                _REPLAY["live"] = _n
+                        if _REPLAY["live"]:
+                            _REPLAY["text"] = _dvr_playlist(_REPLAY["anchor"], _REPLAY["live"],
+                                                            _REPLAY["window"])
+                            _REPLAY["at"] = time.monotonic()
+                    _body = (_REPLAY["text"] or "").encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/vnd.apple.mpegurl")
                     self._cors([("Content-Length", str(len(_body))), ("Connection", "close")])
@@ -2043,7 +2062,7 @@ def serve_control(port):
 
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
                         src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
-                        dvr_start=-1.0, start_at=-1.0, dvr_back=0.0):
+                        dvr_start=-1.0, start_at=-1.0, dvr_back=0.0, dvr_window=0.0):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -2060,6 +2079,8 @@ def serve_control(port):
             # Only where there is no recording to rewind into: that path is proven, this one replays
             # a live stream by asking its own numbering for earlier segments.
             extra += ["--dvr-back", str(dvr_back)]
+            if dvr_window and dvr_window > 0:
+                extra += ["--dvr-window", str(dvr_window)]
         if dvr:
             extra += ["--dvr-media", json.dumps(dvr[:4])]
             if dvr_start is not None and dvr_start >= 0:
@@ -2389,10 +2410,14 @@ def serve_control(port):
                 _dvr_back = max(0.0, float((q.get("behind", [""])[0]) or 0))   # how far behind its edge the page sits
             except ValueError:
                 _dvr_back = 0.0
+            try:
+                _dvr_win = max(0.0, float((q.get("window", [""])[0]) or 0))    # and how much of it the source offers
+            except ValueError:
+                _dvr_win = 0.0
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
                                     dvr=dvr_state["urls"], dvr_start=_dvr_start,
-                                    start_at=_start_at, dvr_back=_dvr_back)
+                                    start_at=_start_at, dvr_back=_dvr_back, dvr_window=_dvr_win)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -2545,7 +2570,7 @@ def serve_control(port):
                     b = max(0.0, float((q.get("behind", ["0"])[0]) or 0))
                 except ValueError:
                     b = 0.0
-                req = {"go": "reanchor", "behind": b}
+                req = {"go": "behind", "behind": b}
             elif (q.get("seek", [""])[0]).strip() and os.path.exists(PROXY_SEEK_FILE):
                 # Move within what this cast is already playing. A recording is a source to switch to;
                 # this is the same source at another moment, which is all a cast carrying its own
@@ -2945,24 +2970,22 @@ def _seg_answers(url, hdr_map):
         return False
 
 
-def _dvr_playlist(anchor, started_at=0.0, keep=17280):
-    """The stretch of the broadcast the replay covers, closed. A playlist left open is a live one
-    however it is labelled: the player gives it no duration and no range to move through, and starts
-    it at its newest moment rather than the one it was anchored to. Closing it makes the same
-    segments a recording, which is what a viewer who rewound is asking to watch.
+def _dvr_playlist(anchor, live, window_s):
+    """The window of the broadcast on offer, ending at the edge it has reached now. Left open, which
+    is what lets it move: the player refetches it, so the far end follows the broadcast and the near
+    end travels with it, the same window the source publishes rather than a wider one held open past
+    what it means to offer. Open costs nothing in reach, which was worth checking: a listing of this
+    length is seekable end to end either way, and only where playback starts differs.
 
-    It runs from the anchor to the edge the source was at when the anchor was taken, so the whole of
-    what was reached is there to move through. Each entry names only its number: the proxy holds the
-    url they are all built from, and writing it out in full on every line is what would make a day of
-    broadcast weigh tens of megabytes instead of a few hundred kilobytes."""
+    Each entry names only its number. The url they are all built from is the proxy's, and writing it
+    out in full on every line is what would make half a day weigh tens of megabytes."""
     dur = anchor["dur"]
-    first = anchor.get("floor") or anchor["seq"]
-    last = min(anchor["live"], first + keep - 1)
-    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD",
+    span = max(1, int(round(max(60.0, window_s) / dur)))
+    first = max(1, live - span + 1)
+    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:EVENT",
            f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{first}"]
-    for n in range(first, last + 1):
+    for n in range(first, live + 1):
         out += [f"#EXTINF:{dur:.3f},", f"/s/{n}"]
-    out.append("#EXT-X-ENDLIST")
     return "\n".join(out) + "\n"
 
 
@@ -4567,11 +4590,17 @@ def run_cast(args):
                 _replay_anchor = _dvr_anchor(_pl, source_url, args.dvr_back,
                                              lambda u: _seg_answers(u, hdr_map))
             if _replay_anchor:
-                _is_vod = True     # it publishes everything from the anchor forward, so it seeks
-                # The listing starts at the oldest the source keeps; playback starts where the viewer
-                # asked, which is that far into it.
-                args.start_at = max(0.0, (_replay_anchor["seq"] - _replay_anchor["floor"])
-                                    * _replay_anchor["dur"])
+                _is_vod = True     # it offers a window to move through, not only an edge
+                # The window the source itself publishes, which is what the page can move through and
+                # therefore all this should offer. Given by the page when it knows; otherwise half a
+                # day, which is the order these broadcasts keep.
+                _win = getattr(args, "dvr_window", 0.0) or 43200.0
+                _REPLAY.update(window=_win, live=_replay_anchor["live"], at=0.0, text="")
+                _span = max(1, int(round(_win / _replay_anchor["dur"])))
+                _first = max(1, _replay_anchor["live"] - _span + 1)
+                # Where in that window the viewer asked to be.
+                args.start_at = max(0.0, (_replay_anchor["seq"] - _first) * _replay_anchor["dur"])
+                log(f"cast: window {_win / 3600:.1f}h, opening {args.dvr_back / 3600:.1f}h behind its edge")
                 _got = int((_replay_anchor["live"] - _replay_anchor["seq"]) * _replay_anchor["dur"])
                 log(f"cast: replaying this live stream from {_got}s behind its edge, segment "
                     f"{_replay_anchor['seq']}"
@@ -4996,31 +5025,24 @@ def run_cast(args):
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: rewind load failed: {type(e).__name__}: {str(e)[:60]}")
-            elif _creq.get("go") == "reanchor" and _REPLAY["anchor"]:
-                # The page moved to another moment of the broadcast, so the replay is rebuilt to start
-                # there. Its own clock restarts with it: what it was playing is not a part of it.
+            elif _creq.get("go") == "behind" and _REPLAY["anchor"]:
+                # A point in the window on offer, named by its distance from the edge. The window
+                # travels with the broadcast, so the same distance means a later moment each time it
+                # is asked for, which is what a viewer watching an hour back expects to stay at.
                 try:
                     _bk = max(0.0, float(_creq.get("behind") or 0))
                 except (TypeError, ValueError):
                     _bk = 0.0
-                _npl = _fetch_playlist(source_url, hdr_map)
-                _na = _dvr_anchor(_npl, source_url, _bk,
-                                  lambda u: _seg_answers(u, hdr_map)) if _npl else None
-                if _na:
-                    _REPLAY.update(anchor=_na, t0=time.monotonic())
-                    _got = int((_na["live"] - _na["seq"]) * _na["dur"])
-                    log(f"cast: replay re-anchored {_got}s behind the edge, segment {_na['seq']}"
-                        + (f" ({int(_bk)}s was asked for; it keeps no more)"
-                           if _na["seq"] > _na["want"] else ""))
-                    _into = max(0.0, (_na["seq"] - _na["floor"]) * _na["dur"])
-                    try:
-                        mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type="BUFFERED",
-                                      current_time=_into)
-                        last_load_at = time.monotonic()
-                    except Exception as e:
-                        log(f"cast: re-anchor load failed: {type(e).__name__}: {str(e)[:60]}")
-                else:
-                    log("cast: the source no longer reaches that far back; leaving the replay where it is")
+                _dur = _REPLAY["anchor"]["dur"]
+                _span = max(1, int(round(_REPLAY["window"] / _dur)))
+                _t = max(0.0, min(_span * _dur, _span * _dur - _bk))
+                log(f"cast: moving to {_bk / 3600:.1f}h behind the edge")
+                try:
+                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type="BUFFERED",
+                                  current_time=_t)
+                    last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
             elif _creq.get("go") == "seek":
                 try:
                     _t = max(0.0, float(_creq.get("t") or 0))
@@ -5191,6 +5213,7 @@ def main():
     ap.add_argument("--dvr-start", type=float, default=-1.0, help=argparse.SUPPRESS)  # open the recording here instead of the live edge
     ap.add_argument("--start-at", type=float, default=-1.0, help=argparse.SUPPRESS)   # open a seekable VOD at this offset
     ap.add_argument("--dvr-back", type=float, default=0.0, help=argparse.SUPPRESS)    # replay a live stream from this many seconds behind its edge
+    ap.add_argument("--dvr-window", type=float, default=0.0, help=argparse.SUPPRESS)  # how much of it the source itself offers
     ap.add_argument("--dvr-media", default="", help=argparse.SUPPRESS)       # recording of the ongoing broadcast (JSON), served at /dvr.m3u8 for rewinding
     ap.add_argument("--src-kind", default="", help=argparse.SUPPRESS)       # control's source classification (hls) -> skip the proxy re-probe
     ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)

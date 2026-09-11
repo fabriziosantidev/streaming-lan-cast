@@ -24,6 +24,7 @@ let pageLive = false;    // the page says it is showing a broadcast that is stil
 let pageBehind = 0;      // how far behind its edge that broadcast is being watched
 let castBehind = 0;      // the distance the next cast should open at, for a replayable live source
 let castSeekable = false;  // the running cast carries its own timeline, so it can be asked for a moment
+let pageWindow = 0;        // how much of its broadcast the page itself offers to move through
 let castReplay = false;    // ...and that timeline is one we built, so moving means anchoring it again
 let castBehindNow = 0;     // how far behind its edge the page is, for a replay that follows it
 let posTick = 0;         // throttles re-reading that position while the popup stays open
@@ -220,11 +221,12 @@ function startStatusPoll() {
     const replay = sk && s.seekable === "replay";
     $("rewindRow").hidden = !(dv || sk);
     // A cast that opened inside a recording because the broadcast is over has no edge to return to.
-    $("backLive").hidden = sk || !!s.nolive;
-    // A replay counts from its own anchor, so a moment of it cannot be named by the page's clock.
-    // What can be asked for is another anchor: the replay is rebuilt to start where the page now is.
+    $("backLive").hidden = (sk && s.seekable !== "replay") || !!s.nolive;
+    // A replay offers the window the broadcast itself keeps, and the window travels with it, so all
+    // three controls are points of one thing: its oldest moment, where the page is, and its edge.
     $("rewindHere").hidden = false;
     castReplay = replay;
+    if (replay) $("backLive").hidden = false;
     if ((dv || sk) && posTick-- <= 0) {   // the page keeps playing, so refresh the point on offer
       posTick = 5;
       const tb = await activeTab();
@@ -432,6 +434,7 @@ async function refreshStartRow() {
     // On a running broadcast the point on offer is how far back it is being watched, which the page's
     // player answers directly. Sitting at the edge is nothing to offer at all.
     pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
+    pageWindow = pageLive ? (pm.dvrWindow || 0) : 0;
     const off = pageLive ? pageBehind : pagePos;
     const enough = pageLive ? pageBehind > 60 : pagePos > 30;
     $("startAtHere").querySelector(".lbl").textContent =
@@ -863,7 +866,8 @@ async function castCurrentTab() {
       (dvrRec ? `&dvrrec=${encodeURIComponent(dvrRec)}` : ``) +
       (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``) +
       (!dvrRec && castFrom > 0 ? `&start=${Math.floor(castFrom)}` : ``) +
-      (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``);
+      (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``) +
+      (!dvrRec && castBehind > 0 && pageWindow > 0 ? `&window=${Math.floor(pageWindow)}` : ``);
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
@@ -927,7 +931,7 @@ function rewindTo(sec) {
 function rewindFollow(sec) {
   return `/rewind?behind=${Math.max(0, Math.floor(sec))}`;
 }
-const FROM_THE_TOP = 864000;   // further back than a broadcast runs, so it lands on the oldest kept
+const FROM_THE_TOP = 864000;   // further back than any window reaches, so it lands on its oldest
 $("rewindStart").addEventListener("click", async () => {
   try { await call(castReplay ? rewindFollow(FROM_THE_TOP) : rewindTo(0)); }
   catch { notify(t("errNoHelper"), "err"); }
@@ -937,7 +941,10 @@ $("rewindHere").addEventListener("click", async () => {
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("backLive").addEventListener("click", async () => {
-  try { await call("/rewind?live=1"); } catch { notify(t("errNoHelper"), "err"); }
+  // On a replay the edge is a point of the window like any other, reached by asking for no distance
+  // behind it; on a cast with a recording it is the other source, and switching back to it.
+  try { await call(castReplay ? rewindFollow(0) : "/rewind?live=1"); }
+  catch { notify(t("errNoHelper"), "err"); }
 });
 $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTimeout(noticeTimer); });
 $("helperOld").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL + "#update" }); });
