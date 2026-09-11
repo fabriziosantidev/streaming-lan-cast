@@ -23,6 +23,7 @@ let pageDur = 0;         // its runtime, as the page's own player reports it
 let pageLive = false;    // the page says it is showing a broadcast that is still running
 let pageBehind = 0;      // how far behind its edge that broadcast is being watched
 let castBehind = 0;      // the distance the next cast should open at, for a replayable live source
+let castSeekable = false;  // the running cast carries its own timeline, so it can be asked for a moment
 let posTick = 0;         // throttles re-reading that position while the popup stays open
 let castFrom = -1;       // a point inside the recording to open the cast at, -1 = the live edge
 // quality menu state per trigger: current value ("best" or "itag:NNN") + the /qualities format matrix
@@ -208,11 +209,16 @@ function startStatusPoll() {
       notify(t("errStreamExpired"), "err");
       return showPicker();
     }
+    // Two ways a cast can be moved through. One has a recording of the broadcast to switch onto and
+    // an edge to come back to. The other carries its own timeline and is simply asked for another
+    // moment of itself, which is every finished video and every live stream being replayed: there is
+    // no edge to return to there, so that control stays out of it.
     const dv = !!(s.casting && s.dvr);
-    $("rewindRow").hidden = !dv;
+    const sk = !!(s.casting && s.seekable && !s.dvr);
+    $("rewindRow").hidden = !(dv || sk);
     // A cast that opened inside a recording because the broadcast is over has no edge to return to.
-    $("backLive").hidden = !!s.nolive;
-    if (dv && posTick-- <= 0) {          // the page keeps playing, so refresh the point on offer
+    $("backLive").hidden = sk || !!s.nolive;
+    if ((dv || sk) && posTick-- <= 0) {   // the page keeps playing, so refresh the point on offer
       posTick = 5;
       const tb = await activeTab();
       const pm = tb.id != null ? await readPageMedia(tb.id) : { t: 0 };
@@ -221,6 +227,7 @@ function startStatusPoll() {
         pagePos > 30 ? hms(pagePos) : tOr("rewindHere", "Position");
       $("rewindHere").disabled = !(pagePos > 30);
     }
+    castSeekable = sk;
     if (s.casting && !inCasting) showCasting(s.name || s.device || "", whatOf(s), s.url, s.quality);
     else if (!s.casting && inCasting) { if (Date.now() < suppressUntil) return; showPicker(); }
     else if (s.casting && inCasting) {
@@ -895,11 +902,17 @@ $("startAtHere").addEventListener("click", () => {
   if (pageLive) { castBehind = pageBehind; castFrom = -1; } else { castFrom = pagePos; }
   castCurrentTab();
 });
+// A cast with a recording behind it is switched onto that recording at a moment; one carrying its
+// own timeline is asked for a moment of what it is already playing. Same two points, different verb.
+function rewindTo(sec) {
+  const at = Math.max(0, Math.floor(sec));
+  return castSeekable ? `/rewind?seek=1&t=${at}` : `/rewind?t=${at}`;
+}
 $("rewindStart").addEventListener("click", async () => {
-  try { await call("/rewind?t=0"); } catch { notify(t("errNoHelper"), "err"); }
+  try { await call(rewindTo(0)); } catch { notify(t("errNoHelper"), "err"); }
 });
 $("rewindHere").addEventListener("click", async () => {
-  try { await call("/rewind?t=" + Math.max(0, Math.floor(pagePos))); }
+  try { await call(rewindTo(pagePos)); }
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("backLive").addEventListener("click", async () => {

@@ -83,6 +83,7 @@ PROXY_LOG = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-cast.log")  
 PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-error.json")  # proxy->control: source expired (410/403)
 PROXY_CTL_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-ctl.json")    # control->proxy: switch the cast between live and the recording
 PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-nolive")         # proxy->control: this cast has no live edge to return to
+PROXY_SEEK_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-seekable")         # proxy->control: this cast carries its own timeline, so it can be moved through
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
@@ -2351,6 +2352,7 @@ def serve_control(port):
                     stopping["until"] = 0  # a fresh cast cancels any pending stop-suppression
                     _safe_unlink(PROXY_ERR_FILE)         # clear a stale expired-source flag from a prior cast
                     _safe_unlink(PROXY_NOLIVE_FILE)      # and a stale "no live edge" marker
+                    _safe_unlink(PROXY_SEEK_FILE)        # and a stale "this one can be moved through"
                     _spawn_proxy(extra, headers)        # kill old (if any) + launch + record pid
                     epoch["n"] += 1
                     this_epoch = epoch["n"]
@@ -2489,6 +2491,15 @@ def serve_control(port):
                 return
             if (q.get("live", [""])[0]).strip():
                 req = {"go": "live"}
+            elif (q.get("seek", [""])[0]).strip() and os.path.exists(PROXY_SEEK_FILE):
+                # Move within what this cast is already playing. A recording is a source to switch to;
+                # this is the same source at another moment, which is all a cast carrying its own
+                # timeline needs to be asked for.
+                try:
+                    t = max(0.0, float((q.get("t", ["0"])[0]) or 0))
+                except ValueError:
+                    t = 0.0
+                req = {"go": "seek", "t": t}
             elif has_dvr:
                 try:
                     t = max(0.0, float((q.get("t", ["0"])[0]) or 0))
@@ -2604,6 +2615,7 @@ def serve_control(port):
             except Exception:
                 pass
             _nolive = os.path.exists(PROXY_NOLIVE_FILE)
+            _seekable = os.path.exists(PROXY_SEEK_FILE)
             _dvr_on = bool(alive and dvr_state["urls"])
             if _dvr_on and not dvr_state.get("told"):
                 dvr_state["told"] = True
@@ -2611,7 +2623,8 @@ def serve_control(port):
             self._json({"ok": True, "casting": alive, **snap,
                         **({"perror": perror} if perror else {}),
                         **({"dvr": True} if _dvr_on else {}),
-                        **({"nolive": True} if (alive and _nolive) else {})})
+                        **({"nolive": True} if (alive and _nolive) else {}),
+                        **({"seekable": True} if (alive and _seekable) else {})})
 
         def _ping(self, q):
             resp = {"ok": True, "pong": True, "version": HELPER_VERSION}
@@ -4458,6 +4471,14 @@ def run_cast(args):
                                                    fallbacks=_fbs, dvr_urls=_dvrs))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _stream_type = "BUFFERED" if _is_vod else "LIVE"
+        # A cast with its own timeline can be moved through, whether that timeline comes from a
+        # finished video or from a live stream being replayed from behind its edge. The popup offers
+        # the points to move to; this is how it learns there are any.
+        if _is_vod:
+            try:
+                open(PROXY_SEEK_FILE, "w").close()
+            except OSError:
+                pass
         _marks = []
         if _low_latency and _kind != "file":
             _marks.append("ll=1")
@@ -4847,6 +4868,20 @@ def run_cast(args):
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: rewind load failed: {type(e).__name__}: {str(e)[:60]}")
+            elif _creq.get("go") == "seek":
+                try:
+                    _t = max(0.0, float(_creq.get("t") or 0))
+                except (TypeError, ValueError):
+                    _t = 0.0
+                _sk_url = dvr_url_sw if (cur_src == "dvr" and dvr_url_sw) else hls_url_sw
+                _sk_ct = "application/x-mpegurl" if (cur_src == "dvr" and dvr_url_sw) else _ct_load
+                log(f"cast: moving to t={int(_t)}s within this cast")
+                try:
+                    mc.play_media(_sk_url, _sk_ct, title=_title, stream_type="BUFFERED",
+                                  current_time=_t)
+                    last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
             elif _creq.get("go") == "live":
                 cur_src = "live"
                 log("cast: back to the live edge")
