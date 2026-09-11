@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.31';
+    const RX_VERSION = '1.32';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -331,19 +331,26 @@
       const v = mediaEl();
       if (!v || nudge.left <= 0) return;
       if (intent.paused) return;
-      let ahead = 0;
+      let ahead = 0, first = -1;
       try {
         const b = v.buffered;
+        if (b.length) first = b.start(0);
         for (let i = 0; i < b.length; i++) {
           if (v.currentTime >= b.start(i) - 0.1 && v.currentTime < b.end(i)) ahead = b.end(i) - v.currentTime;
         }
       } catch (e) {}
       const t = v.currentTime;
-      if (ahead < 1 || t !== nudge.prevT) { nudge.prevT = t; nudge.at = Date.now(); return; }
+      if (first < 0 || t !== nudge.prevT) { nudge.prevT = t; nudge.at = Date.now(); return; }
+      // Where the playhead sits against the media matters as much as whether it moves. A load that
+      // names a position inside a recording can leave the element at zero while the content arrives
+      // a couple of hours along, and a third of a second reaches nothing from there: the playhead
+      // has to be carried to the media. A playhead merely near its buffer is mid-seek, and settles.
+      const adrift = ahead < 1 && Math.abs(first - t) > 5;
+      if (ahead < 1 && !adrift) { nudge.prevT = t; nudge.at = Date.now(); return; }
       if (Date.now() - nudge.at < 4000) return;
       nudge.left--;
       nudge.at = Date.now();
-      try { v.currentTime = t + 0.3; } catch (e) {}
+      try { v.currentTime = (adrift ? first : t) + 0.3; } catch (e) {}
       try { v.play(); } catch (e) {}
     }, 1000);
 
