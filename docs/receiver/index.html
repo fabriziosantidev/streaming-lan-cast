@@ -45,11 +45,11 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.32';
+    const RX_VERSION = '1.33';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
-    const nudge = { left: 3, prevT: -1, at: 0 };
+    const nudge = { left: 3, prevT: -1, at: 0, want: 0, starting: false };
     // Whether the viewer stopped this. The element's paused flag cannot say: playback pauses on its
     // own while a source is swapped, while a seek settles and while the player waits, and every one
     // of those reads the same as a press of the pause key. A press arrives as a command, so that is
@@ -143,6 +143,8 @@
         playbackConfig.shakaConfig.streaming.retryParameters.stallTimeout = isTc ? 0 : 5000;
         stats.lastError = 'loading:' + url.slice(0, 40);
         nudge.left = 3; nudge.prevT = -1; nudge.at = 0;
+        nudge.want = Number(req.currentTime) || 0;
+        nudge.starting = true;
         intent.paused = false;
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
@@ -186,7 +188,10 @@
       stats.lastError = d.slice(0, 200);
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
-    playerManager.addEventListener(EV.PLAYING, () => splash.classList.add('gone'));   // hide the loading logo once playback starts
+    playerManager.addEventListener(EV.PLAYING, () => {
+      splash.classList.add('gone');   // hide the loading logo once playback starts
+      nudge.starting = false;         // the load's own seek has landed; the playhead is the element's again
+    });
 
     // The media element lives inside <cast-media-player>'s shadow root, so a plain tag lookup finds
     // nothing. Pierce the shadow root to hook it and to read its position/buffer for the status telemetry.
@@ -236,6 +241,7 @@
       hooked = v;
       v.addEventListener('seeking', () => {
         if (fix && fix.own && Math.abs(v.currentTime - fix.own) < 0.5) return;   // our corrective hop
+        if (nudge.starting) return;   // the load reaching its own start position, which it settles itself
         // A hold in flight is itself what paused the element, so its captured flag is the only record
         // of whether the viewer had this playing; carry that forward rather than reading back the
         // pause we made. Whatever ends a hold owes playback its state back, early returns included.
@@ -316,7 +322,7 @@
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
-        pa, rs, nl: nudge.left, ip: intent.paused,
+        pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want),
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
@@ -331,26 +337,39 @@
       const v = mediaEl();
       if (!v || nudge.left <= 0) return;
       if (intent.paused) return;
-      let ahead = 0, first = -1;
+      // Until the element has metadata its currentTime is a placeholder, not the playhead: a load
+      // that named a position keeps that position of its own and writes it once metadata lands, and
+      // it adopts whatever the element reads if that is not zero by then. So a reading of nothing
+      // moving is not a fact yet, and writing one here would take the position the viewer asked for.
+      if (v.readyState < 1) { nudge.prevT = -1; nudge.at = Date.now(); return; }
+      let ahead = 0, first = -1, last = -1, covered = false;
       try {
         const b = v.buffered;
-        if (b.length) first = b.start(0);
+        if (b.length) { first = b.start(0); last = b.end(b.length - 1); }
         for (let i = 0; i < b.length; i++) {
-          if (v.currentTime >= b.start(i) - 0.1 && v.currentTime < b.end(i)) ahead = b.end(i) - v.currentTime;
+          if (v.currentTime >= b.start(i) - 0.1 && v.currentTime < b.end(i)) {
+            covered = true;
+            ahead = b.end(i) - v.currentTime;
+          }
         }
       } catch (e) {}
       const t = v.currentTime;
       if (first < 0 || t !== nudge.prevT) { nudge.prevT = t; nudge.at = Date.now(); return; }
-      // Where the playhead sits against the media matters as much as whether it moves. A load that
-      // names a position inside a recording can leave the element at zero while the content arrives
-      // a couple of hours along, and a third of a second reaches nothing from there: the playhead
-      // has to be carried to the media. A playhead merely near its buffer is mid-seek, and settles.
-      const adrift = ahead < 1 && Math.abs(first - t) > 5;
-      if (ahead < 1 && !adrift) { nudge.prevT = t; nudge.at = Date.now(); return; }
+      // A playhead outside every buffered range has nothing under it to play, and a step of a third
+      // of a second reaches none of it: it has to be carried to the media. Sitting inside a range is
+      // the opposite case, however little is left ahead, since a start still filling looks exactly
+      // like that. Where a load named a position, that is where the media is meant to be.
+      // Parked means sitting on content with plenty of it left ahead and still not moving. A playhead
+      // inside a range with barely any ahead of it is starving, not parked, and a step forward from
+      // there lands past the end of what has arrived.
+      const adrift = !covered && (t < first - 5 || t > last + 5);
+      const parked = covered && ahead >= 1;
+      if (!parked && !adrift) { nudge.prevT = t; nudge.at = Date.now(); return; }
       if (Date.now() - nudge.at < 4000) return;
       nudge.left--;
       nudge.at = Date.now();
-      try { v.currentTime = (adrift ? first : t) + 0.3; } catch (e) {}
+      const to = adrift ? Math.max(nudge.want, first) : t;
+      try { v.currentTime = to + 0.3; } catch (e) {}
       try { v.play(); } catch (e) {}
     }, 1000);
 
