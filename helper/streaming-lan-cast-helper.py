@@ -1517,7 +1517,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                             except Exception:
                                 return None
                         if _dvr["src"] is None:
-                            _dvr["src"] = _recording_among(_dvrs, _txt) or None
+                            _dvr["src"] = _recording_among(_dvrs, _txt, quality) or None
                         if _dvr["src"]:
                             t = _txt(_dvr["src"])
                             if t:
@@ -2430,12 +2430,13 @@ def serve_control(port):
                 hmap = {}
             if not isinstance(hmap, dict):
                 hmap = {}
-            key = "\n".join(sorted(urls))
+            key = _safe_quality(q.get("quality", [""])[0]) + "\n" + "\n".join(sorted(urls))
             hit = _rec_cache.get(key)
             if hit and time.time() - hit[1] < 300:
                 self._json({"ok": True, "rec": hit[0]})
                 return
-            rec = _recording_among(urls, lambda u: _fetch_playlist(u, hmap))
+            rec = _recording_among(urls, lambda u: _fetch_playlist(u, hmap),
+                                   _safe_quality(q.get("quality", [""])[0]))
             _rec_cache[key] = (rec, time.time())
             while len(_rec_cache) > 24:
                 _rec_cache.pop(next(iter(_rec_cache)))
@@ -2728,14 +2729,22 @@ def _hls_is_vod(url, hdr_map):
         return False
 
 
-def _recording_among(candidates, fetch_text):
+def _recording_among(candidates, fetch_text, quality=""):
     """The recording of a broadcast among sniffed playlists, told apart by content: a media playlist
     that ends in #EXT-X-ENDLIST (the window of a live stream never carries one), or a master whose
-    first variant does. A media playlist wins: it names its segments directly, while a master adds a
-    level of indirection whose own url can be session-scoped and outlive its usefulness. The cast
-    already carries a chosen quality, so adapting across the recording's renditions buys little.
+    first variant does. What gets cast is a media playlist either way: it names its segments directly,
+    while a master adds a level of indirection whose own url can be session-scoped and outlive its
+    usefulness.
+
+    Which media playlist, though, is a question the sniffed ones cannot answer. They are whichever
+    renditions the page's own player reached for, and a player that adapts reaches for several, so
+    taking the first that ends leaves the cast on whatever the page happened to be watching. A master
+    names the ladder, so when one is among the candidates the rendition is picked from there: the
+    requested height, or the highest offered. Only with no master to read does a sniffed media
+    playlist stand on its own.
+
     fetch_text(url) returns the playlist text or None. Returns the chosen url, or ''."""
-    master = ""
+    media, master, master_text = "", "", ""
     for u in candidates:
         t = fetch_text(u)
         if not t or not t.lstrip().startswith("#EXTM3U"):
@@ -2746,10 +2755,21 @@ def _recording_among(candidates, fetch_text):
             v = next((ln.strip() for ln in t.splitlines() if ln.strip() and not ln.startswith("#")), "")
             vt = fetch_text(urllib.parse.urljoin(u, v)) if v else None
             if vt and "#EXT-X-ENDLIST" in vt:
-                master = u
-        elif "#EXT-X-ENDLIST" in t:
-            return u
-    return master
+                master, master_text = u, t
+        elif "#EXT-X-ENDLIST" in t and not media:
+            media = u
+    if master:
+        variants = _parse_master_variants(master, master_text)
+        if variants:
+            want = re.match(r"(\d+)", quality or "")
+            pick = None
+            if want:
+                pick = next((v for v in variants if int(v.get("height") or 0) == int(want.group(1))), None)
+            pick = pick or variants[0]          # highest, which is what "best" and no pick both mean
+            log(f"recording: {pick['quality']} of {len(variants)} offered"
+                + (f" (asked for {quality})" if quality else ""))
+            return pick["url"]
+    return media or master
 
 
 def _fetch_playlist(url, hdr_map, timeout=8):
