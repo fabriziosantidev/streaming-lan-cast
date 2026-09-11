@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.34';
+    const RX_VERSION = '1.35';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -302,7 +302,13 @@
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
-      let st = 'idle', t = 0, buf = 0, cov = null, b0 = null, pa = null, rs = null;
+      let st = 'idle', t = 0, buf = 0, cov = null, b0 = null, pa = null, rs = null, lsr = null;
+      // What the cast framework itself holds as the live range: the span its own live controls would
+      // be drawn from, if it is drawing any. Named beside the element's view of the same stream.
+      try {
+        const r = playerManager.getLiveSeekableRange && playerManager.getLiveSeekableRange();
+        if (r) lsr = [Math.round(r.start || 0), Math.round(r.end || 0), r.isMovingWindow ? 1 : 0];
+      } catch (e) {}
       try { st = (playerManager.getPlayerState() || 'IDLE').toLowerCase(); } catch (e) {}
       if (v) {
         t = Math.round(v.currentTime * 10) / 10;
@@ -327,7 +333,7 @@
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
-        pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want),
+        pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want), lsr,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
