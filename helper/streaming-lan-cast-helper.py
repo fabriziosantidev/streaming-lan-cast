@@ -1223,7 +1223,7 @@ def _mpd_filter_height(text, height):
 
 
 def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fallbacks=None,
-                   dvr_urls=None):
+                   dvr_urls=None, dvr_anchor=None):
     """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
     requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
     endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
@@ -1354,6 +1354,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
     _fallbacks = [f for f in (fallbacks or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
     _dvrs = [f for f in (dvr_urls or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
     _dvr = {"src": None, "text": None, "at": 0.0}   # resolved recording playlist, briefly cached
+    _replay = {"anchor": dvr_anchor, "t0": time.monotonic()}   # a live stream being replayed from behind its edge
 
     # In-flight direct-file responses. Seeking makes the receiver stop reading the response it has and
     # open a new range request, so the old one is left blocked writing to a socket nobody drains while
@@ -1552,6 +1553,13 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self._cors([("Content-Length", str(len(body))), ("Connection", "close")])
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+                if p == "/live.m3u8" and _replay["anchor"]:
+                    if not dbg["m3u8"]:
+                        dbg["m3u8"] = True
+                        log(f"proxy: receiver fetched /live.m3u8 [replay from {_replay['anchor']['seq']}] "
+                            f"(client {self.client_address[0]})")
+                    self._serve_m3u8(_dvr_playlist(_replay["anchor"], _replay["t0"]), cur["src"])
                     return
                 if p == "/live.m3u8":
                     # Forward only the receiver's blocking-reload params, dropping the source's stale ones
@@ -1985,7 +1993,7 @@ def serve_control(port):
 
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
                         src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
-                        dvr_start=-1.0, start_at=-1.0):
+                        dvr_start=-1.0, start_at=-1.0, dvr_back=0.0):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -1998,6 +2006,10 @@ def serve_control(port):
             extra += ["--media-url", media]
         if fallbacks:
             extra += ["--fallback-media", json.dumps(fallbacks[:4])]
+        if dvr_back and dvr_back > 0 and not dvr:
+            # Only where there is no recording to rewind into: that path is proven, this one replays
+            # a live stream by asking its own numbering for earlier segments.
+            extra += ["--dvr-back", str(dvr_back)]
         if dvr:
             extra += ["--dvr-media", json.dumps(dvr[:4])]
             if dvr_start is not None and dvr_start >= 0:
@@ -2323,10 +2335,14 @@ def serve_control(port):
                 _start_at = float((q.get("start", [""])[0]) or -1)
             except ValueError:
                 _start_at = -1.0
+            try:
+                _dvr_back = max(0.0, float((q.get("behind", [""])[0]) or 0))   # how far behind its edge the page sits
+            except ValueError:
+                _dvr_back = 0.0
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
                                     dvr=dvr_state["urls"], dvr_start=_dvr_start,
-                                    start_at=_start_at)
+                                    start_at=_start_at, dvr_back=_dvr_back)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -2745,6 +2761,70 @@ def _hls_is_vod(url, hdr_map):
         return False
     except Exception:
         return False
+
+
+def _seq_url(tpl, n):
+    """The same segment url with its sequence number replaced."""
+    return re.sub(r"/sq/\d+", "/sq/%d" % n, tpl, count=1)
+
+
+def _dvr_anchor(text, base_url, back_s, answers, probes=9):
+    """Where a replay of a live stream should start, this many seconds behind its edge, for a source
+    that numbers its segments. Such a url can be asked for an earlier number, but the number only
+    counts inside the media generation the url belongs to: read into another one it returns a
+    different moment rather than an earlier one, which plays as content from the wrong time. So the
+    deepest point that still answers is closed in on, and the replay starts there instead.
+
+    text/base_url are the live playlist and where it came from; answers(url) reports whether a
+    segment url returns media. Returns the anchor, or None when this source is not numbered that way,
+    which is every source that is not a YouTube live stream.
+    """
+    segs = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    if not segs:
+        return None
+    tpl = urllib.parse.urljoin(base_url, segs[-1])
+    m = re.search(r"/sq/(\d+)", tpl)
+    if not m:
+        return None
+    live = int(m.group(1))
+    durs = [float(x) for x in re.findall(r"#EXTINF:([\d.]+)", text)]
+    dur = durs[-1] if durs else 0.0
+    if dur <= 0:
+        md = re.search(r"#EXT-X-TARGETDURATION:(\d+)", text)
+        dur = float(md.group(1)) if md else 0.0
+    if dur <= 0:
+        return None
+    want = max(1, live - int(round(max(0.0, back_s) / dur)))
+    seq = want
+    if not answers(_seq_url(tpl, want)):
+        lo, hi = want, live          # lo does not answer, hi does; close in on the boundary
+        for _ in range(probes):
+            if hi - lo <= 1:
+                break
+            mid = (lo + hi) // 2
+            if answers(_seq_url(tpl, mid)):
+                hi = mid
+            else:
+                lo = mid
+        seq = hi
+    if seq >= live:
+        return None
+    return {"tpl": tpl, "seq": seq, "dur": dur, "live": live, "want": want}
+
+
+def _dvr_playlist(anchor, started_at, window=12, keep=1440):
+    """The replay as of now: everything due since the anchor, at the pace the source recorded it.
+    What has gone by stays listed instead of sliding out behind the playhead, so the receiver can
+    move across it, and EVENT declares that it grows, which is what lets it be read as a recording
+    rather than a live edge."""
+    dur = anchor["dur"]
+    newest = anchor["seq"] + window - 1 + int((time.monotonic() - started_at) / dur)
+    first = max(anchor["seq"], newest - keep + 1)
+    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:EVENT",
+           f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{first}"]
+    for n in range(first, newest + 1):
+        out += [f"#EXTINF:{dur:.3f},", _seq_url(anchor["tpl"], n)]
+    return "\n".join(out) + "\n"
 
 
 def _recording_among(candidates, fetch_text, quality=""):
@@ -4337,6 +4417,32 @@ def run_cast(args):
             _kind, _is_vod, _container, _ll = _classify_source(source_url, hdr_map)
         if _ll and not _is_vod:
             _low_latency = True   # LL-HLS live: ride near the edge with a shallow buffer so it can start
+        # A live stream asked to open behind its edge is replayed from there, when its own segments are
+        # numbered and the numbers still answer. Settled here, before the cast url is built and before
+        # anything is loaded, so a source that cannot do it simply casts its live edge as it always has
+        # and nothing downstream is left describing a replay that is not happening.
+        _replay_anchor = None
+        if getattr(args, "dvr_back", 0) > 0 and _kind == "hls" and not _is_vod:
+            _pl = _fetch_playlist(source_url, hdr_map)
+            if _pl:
+                def _answers(u):
+                    try:
+                        _r = urllib.request.Request(u, headers=dict(hdr_map or {}))
+                        with urllib.request.urlopen(_r, timeout=10) as _x:
+                            _x.read(1)
+                        return True
+                    except Exception:
+                        return False
+                _replay_anchor = _dvr_anchor(_pl, source_url, args.dvr_back, _answers)
+            if _replay_anchor:
+                _is_vod = True     # it publishes everything from the anchor forward, so it seeks
+                _got = int((_replay_anchor["live"] - _replay_anchor["seq"]) * _replay_anchor["dur"])
+                log(f"cast: replaying this live stream from {_got}s behind its edge, segment "
+                    f"{_replay_anchor['seq']}"
+                    + (f" ({int(args.dvr_back)}s was asked for; it keeps no more)"
+                       if _replay_anchor["seq"] > _replay_anchor["want"] else ""))
+            else:
+                log("cast: this live source cannot be replayed from behind its edge; casting the edge")
         try:
             _fbs = json.loads(args.fallback_media) if args.fallback_media else []
         except Exception:
@@ -4347,6 +4453,7 @@ def run_cast(args):
             _dvrs = []
         httpd = ThreadingHTTPServer((ip, args.port),
                                     make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
+                                                   dvr_anchor=_replay_anchor,
                                                    quality="" if args.quality == "best" else args.quality,
                                                    fallbacks=_fbs, dvr_urls=_dvrs))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -4895,6 +5002,7 @@ def main():
     ap.add_argument("--fallback-media", default="", help=argparse.SUPPRESS)  # sniffed sibling playlists (JSON) for the proxy's source recovery
     ap.add_argument("--dvr-start", type=float, default=-1.0, help=argparse.SUPPRESS)  # open the recording here instead of the live edge
     ap.add_argument("--start-at", type=float, default=-1.0, help=argparse.SUPPRESS)   # open a seekable VOD at this offset
+    ap.add_argument("--dvr-back", type=float, default=0.0, help=argparse.SUPPRESS)    # replay a live stream from this many seconds behind its edge
     ap.add_argument("--dvr-media", default="", help=argparse.SUPPRESS)       # recording of the ongoing broadcast (JSON), served at /dvr.m3u8 for rewinding
     ap.add_argument("--src-kind", default="", help=argparse.SUPPRESS)       # control's source classification (hls) -> skip the proxy re-probe
     ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)

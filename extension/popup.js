@@ -21,6 +21,8 @@ let suppressUntil = 0;   // ignore casting:false during a quality re-cast (brief
 let pagePos = 0;         // where the page's own player sits, offered as a starting point
 let pageDur = 0;         // its runtime, as the page's own player reports it
 let pageLive = false;    // the page says it is showing a broadcast that is still running
+let pageBehind = 0;      // how far behind its edge that broadcast is being watched
+let castBehind = 0;      // the distance the next cast should open at, for a replayable live source
 let posTick = 0;         // throttles re-reading that position while the popup stays open
 let castFrom = -1;       // a point inside the recording to open the cast at, -1 = the live edge
 // quality menu state per trigger: current value ("best" or "itag:NNN") + the /qualities format matrix
@@ -391,6 +393,15 @@ async function changeCastQuality(val) {
 }
 
 // Offer to start a cast inside the recording, when this tab has one.
+// A live stream can be cast from behind its edge only where the helper can ask its source for
+// earlier segments, which today means YouTube; every other site keeps the plain cast it has always
+// had. Offering the choice more widely would promise a rewind that arrives at the live edge anyway.
+function replayableLive(url) {
+  let h;
+  try { h = new URL(url).hostname; } catch { return false; }
+  return /(^|\.)youtube\.com$/.test(h) || /(^|\.)youtu\.be$/.test(h);
+}
+
 async function refreshStartRow() {
   const row = $("startRow");
   const tb = await activeTab();
@@ -399,9 +410,14 @@ async function refreshStartRow() {
     pagePos = pm.t || 0;
     pageDur = pm.d || 0;
     pageLive = !!pm.live;
+    // On a running broadcast the point on offer is how far back it is being watched: its position
+    // counts from a beginning that may be hours away, and is not what the source is asked for.
+    pageBehind = pageLive && Number.isFinite(pageDur) && pageDur > 0 ? Math.max(0, pageDur - pagePos) : 0;
+    const off = pageLive ? pageBehind : pagePos;
+    const enough = pageLive ? pageBehind > 60 : pagePos > 30;
     $("startAtHere").querySelector(".lbl").textContent =
-      pagePos > 30 ? hms(pagePos) : tOr("rewindHere", "Position");
-    $("startAtHere").disabled = !(pagePos > 30);
+      enough ? hms(off) : tOr("rewindHere", "Position");
+    $("startAtHere").disabled = !enough;
   }).catch(() => {});
   const rec = await tabRecording(tb.id);
   await shown;
@@ -411,7 +427,12 @@ async function refreshStartRow() {
   // video, which is what a source that casts as a seekable VOD looks like from here.
   // A page still showing a running broadcast is left out: its cast opens on the live edge, which has
   // no earlier point to start from, so the buttons would promise something they cannot deliver.
-  const atPos = !rec && !pageLive && Number.isFinite(pageDur) && pageDur > 0 && pagePos > 30;
+  const atPos = !rec && (pageLive
+    ? replayableLive(tb.url || "") && pageBehind > 60
+    : Number.isFinite(pageDur) && pageDur > 0 && pagePos > 30);
+  // A running broadcast has no beginning to offer: what it keeps reaches back only so far, and how
+  // far is the source's answer, not the page's.
+  $("startAtZero").hidden = !!pageLive;
   row.hidden = !(rec || atPos);
   $("castRow").hidden = !!(rec || atPos);
 }
@@ -794,8 +815,9 @@ async function castCurrentTab() {
       (ladder ? `&ladder=${encodeURIComponent(ladder)}` : ``) +
       (dvrRec ? `&dvrrec=${encodeURIComponent(dvrRec)}` : ``) +
       (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``) +
-      (!dvrRec && castFrom > 0 ? `&start=${Math.floor(castFrom)}` : ``);
-    castFrom = -1;                      // consumed: a later plain cast opens on the live edge
+      (!dvrRec && castFrom > 0 ? `&start=${Math.floor(castFrom)}` : ``) +
+      (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``);
+    castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
       // remember this cast's quality list extension-wide so the cast view shows it in any window/tab
@@ -841,7 +863,10 @@ $("manualPaste").addEventListener("click", async () => {
   syncCastLabel();
 });
 $("startAtZero").addEventListener("click", () => { castFrom = 0; castCurrentTab(); });
-$("startAtHere").addEventListener("click", () => { castFrom = pagePos; castCurrentTab(); });
+$("startAtHere").addEventListener("click", () => {
+  if (pageLive) { castBehind = pageBehind; castFrom = -1; } else { castFrom = pagePos; }
+  castCurrentTab();
+});
 $("rewindStart").addEventListener("click", async () => {
   try { await call("/rewind?t=0"); } catch { notify(t("errNoHelper"), "err"); }
 });
