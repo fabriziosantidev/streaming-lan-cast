@@ -2856,7 +2856,7 @@ def _lmt_in(url):
     return int(m.group(1)) if m else 0
 
 
-def _dvr_anchor(text, base_url, back_s, answers, probes=9):
+def _dvr_anchor(text, base_url, back_s, answers, probes=9, keep=17280):
     """Where a replay of a live stream should start, this many seconds behind its edge, for a source
     that numbers its segments. Such a url can be asked for an earlier number, but the number only
     counts inside the media generation the url belongs to: read into another one it returns a
@@ -2901,9 +2901,28 @@ def _dvr_anchor(text, base_url, back_s, answers, probes=9):
         at = _reach(tpl, seq, answers)
     if not at or seq >= live:
         return None
+    # Where the listing starts, which is not where playback does. A viewer who rewound an hour wants
+    # to move around from there in both directions, so the replay carries everything the source still
+    # holds and simply opens at the hour they asked for. The oldest kept is tried outright, since a
+    # broadcast usually reaches past the span worth listing; closing in on it is for when it does not.
+    floor = max(1, live - keep)
+    if floor < seq:
+        if not _reach(tpl, floor, answers):
+            lo, hi = floor, seq      # lo is out of reach, hi is within it
+            for _ in range(probes):
+                if hi - lo <= 1:
+                    break
+                mid = (lo + hi) // 2
+                if _reach(tpl, mid, answers):
+                    hi = mid
+                else:
+                    lo = mid
+            floor = hi
+    else:
+        floor = seq
     # The anchor carries the generation that holds it, so the playlist built from it asks the right
     # one for every segment it lists.
-    return {"tpl": at, "seq": seq, "dur": dur, "live": live, "want": want}
+    return {"tpl": at, "seq": seq, "floor": floor, "dur": dur, "live": live, "want": want}
 
 
 def _seg_answers(url, hdr_map):
@@ -2928,10 +2947,11 @@ def _dvr_playlist(anchor, started_at=0.0, keep=17280):
     url they are all built from, and writing it out in full on every line is what would make a day of
     broadcast weigh tens of megabytes instead of a few hundred kilobytes."""
     dur = anchor["dur"]
-    last = min(anchor["live"], anchor["seq"] + keep - 1)
+    first = anchor.get("floor") or anchor["seq"]
+    last = min(anchor["live"], first + keep - 1)
     out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD",
-           f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{anchor['seq']}"]
-    for n in range(anchor["seq"], last + 1):
+           f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{first}"]
+    for n in range(first, last + 1):
         out += [f"#EXTINF:{dur:.3f},", f"/s/{n}"]
     out.append("#EXT-X-ENDLIST")
     return "\n".join(out) + "\n"
@@ -4539,6 +4559,10 @@ def run_cast(args):
                                              lambda u: _seg_answers(u, hdr_map))
             if _replay_anchor:
                 _is_vod = True     # it publishes everything from the anchor forward, so it seeks
+                # The listing starts at the oldest the source keeps; playback starts where the viewer
+                # asked, which is that far into it.
+                args.start_at = max(0.0, (_replay_anchor["seq"] - _replay_anchor["floor"])
+                                    * _replay_anchor["dur"])
                 _got = int((_replay_anchor["live"] - _replay_anchor["seq"]) * _replay_anchor["dur"])
                 log(f"cast: replaying this live stream from {_got}s behind its edge, segment "
                     f"{_replay_anchor['seq']}"
@@ -4979,9 +5003,10 @@ def run_cast(args):
                     log(f"cast: replay re-anchored {_got}s behind the edge, segment {_na['seq']}"
                         + (f" ({int(_bk)}s was asked for; it keeps no more)"
                            if _na["seq"] > _na["want"] else ""))
+                    _into = max(0.0, (_na["seq"] - _na["floor"]) * _na["dur"])
                     try:
                         mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type="BUFFERED",
-                                      current_time=0)
+                                      current_time=_into)
                         last_load_at = time.monotonic()
                     except Exception as e:
                         log(f"cast: re-anchor load failed: {type(e).__name__}: {str(e)[:60]}")
