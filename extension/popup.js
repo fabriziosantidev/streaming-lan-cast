@@ -730,12 +730,23 @@ async function readPageMedia(tabId) {
     }
     return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, behind, atEdge, dvrWindow };
   };
+  // In the page's own world, where a player that answers for its live bounds is reachable: those are
+  // methods the page script hangs on its element, and an isolated world sees the element without
+  // them. The media element itself reads the same either way, so a world that cannot be had costs
+  // only the live bounds.
   let res;
   try {
-    res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: probe });
+    res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, world: "MAIN", func: probe });
   } catch {
-    try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
-    catch { return { url: "", blobOnly: false }; }
+    try {
+      res = await browser.scripting.executeScript({ target: { tabId }, world: "MAIN", func: probe });
+    } catch {
+      try { res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: probe }); }
+      catch {
+        try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
+        catch { return { url: "", blobOnly: false }; }
+      }
+    }
   }
   let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false;
   let behind = 0, atEdge = false, dvrWindow = 0;
