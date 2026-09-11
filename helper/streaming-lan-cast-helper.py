@@ -83,6 +83,9 @@ PROXY_LOG = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-cast.log")  
 PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-error.json")  # proxy->control: source expired (410/403)
 PROXY_CTL_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-ctl.json")    # control->proxy: switch the cast between live and the recording
 PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-nolive")         # proxy->control: this cast has no live edge to return to
+# When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
+# one account of a load making progress that does not depend on the receiver's own reading of it.
+_SEG_SERVED = {"at": 0.0}
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
 YTDLP_STAMP = os.path.join(TOKEN_DIR, "ytdlp-refreshed")   # touched each time _refresh_ytdlp runs
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
@@ -1590,6 +1593,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     return
                 if p == "/p":
                     _seg_t0 = time.monotonic()
+                    _SEG_SERVED["at"] = _seg_t0    # a segment in flight is progress too, not only a finished one
                     if not dbg["seg"]:
                         dbg["seg"] = True
                         log("proxy: receiver fetched first segment/sub-playlist")
@@ -1642,6 +1646,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     # What one segment costs, for the first few of a cast. Playback cannot begin until
                     # the receiver has identified the media, and it identifies it by reading a whole
                     # segment, so this is the size and the wait the first frame is behind.
+                    _SEG_SERVED["at"] = time.monotonic()
                     if dbg["segn"] < 3:
                         dbg["segn"] += 1
                         log(f"proxy: segment {dbg['segn']} served {_sent / 1048576:.1f}MB in "
@@ -4622,7 +4627,11 @@ def run_cast(args):
         # re-send a LOAD that has both aged out and stopped making progress.
         if not played:
             buf_now = 0.0
-            if slc.last:
+            # buf measures from the playhead to the end of the buffer, so it only reads as a depth
+            # while the playhead is inside the buffer. A playhead sitting outside the media reports
+            # the distance to it instead, thousands of seconds that never grow, which reads exactly
+            # like a load that has stopped.
+            if slc.last and slc.last.get("cov"):
                 try:
                     buf_now = float(slc.last.get("buf") or 0)
                 except (TypeError, ValueError):
@@ -4630,6 +4639,10 @@ def run_cast(args):
             if buf_now > deepest_buf:
                 deepest_buf = buf_now
                 last_progress_at = time.monotonic()
+            # Segments still leaving the proxy are progress whatever the receiver reports, and a
+            # recording's are large enough that a few seconds apart is normal.
+            if _SEG_SERVED["at"] > last_progress_at:
+                last_progress_at = _SEG_SERVED["at"]
         # A load that never reaches playback is a failed start whether or not an error is still being
         # reported: the receiver names the url it is loading in the same field, so the error that
         # started this is gone the moment the next load begins. Waiting for one to still be there
