@@ -921,15 +921,19 @@ function rewindTo(sec) {
   return castSeekable ? `/rewind?seek=1&t=${at}` : `/rewind?t=${at}`;
 }
 // Following the page on a replay is not a move within what is playing: the replay is anchored again,
-// this time where the page is, and starts over from there.
-function rewindFollow() {
-  return `/rewind?behind=${Math.max(0, Math.floor(castBehindNow))}`;
+// this time where the page is, and starts over from there. Its beginning is the same request with
+// more distance asked for than any broadcast has, which the helper answers with the oldest moment
+// the source still keeps.
+function rewindFollow(sec) {
+  return `/rewind?behind=${Math.max(0, Math.floor(sec))}`;
 }
+const FROM_THE_TOP = 864000;   // further back than a broadcast runs, so it lands on the oldest kept
 $("rewindStart").addEventListener("click", async () => {
-  try { await call(rewindTo(0)); } catch { notify(t("errNoHelper"), "err"); }
+  try { await call(castReplay ? rewindFollow(FROM_THE_TOP) : rewindTo(0)); }
+  catch { notify(t("errNoHelper"), "err"); }
 });
 $("rewindHere").addEventListener("click", async () => {
-  try { await call(castReplay ? rewindFollow() : rewindTo(pagePos)); }
+  try { await call(castReplay ? rewindFollow(castBehindNow) : rewindTo(pagePos)); }
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("backLive").addEventListener("click", async () => {

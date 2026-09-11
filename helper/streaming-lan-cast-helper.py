@@ -1615,7 +1615,21 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         self.send_error(400); return
                     res_tail = _redact_url(u).rsplit("/", 1)[-1] or p
                     is_pl = u.split("?")[0].endswith(".m3u8")
-                    r = _fetch(_ll_fetch_url(u, self.path) if is_pl else u)   # forward blocking-reload for a nested LL chunklist
+                    try:
+                        r = _fetch(_ll_fetch_url(u, self.path) if is_pl else u)   # forward blocking-reload for a nested LL chunklist
+                    except _UpstreamError as e:
+                        # A replay playing forward crosses out of the generation it was anchored in,
+                        # and the next one refuses the numbers that are not its own. Refusal is the
+                        # only thing a wrong generation returns, so the next one up is safe to ask.
+                        _nu = ""
+                        if e.code == 404 and _REPLAY["anchor"] and _lmt_in(u):
+                            _nu = _lmt_url(u, _lmt_in(u) + 1)
+                        if not _nu:
+                            raise
+                        r = _fetch(_nu)
+                        if not dbg.get("gen"):
+                            dbg["gen"] = True
+                            log("proxy: the replay reached the source's next media generation")
                     ctype = r.headers.get("Content-Type", "")
                     if is_pl or "mpegurl" in ctype:
                         self._serve_m3u8(r.read().decode("utf-8", "replace"), u)
@@ -2796,6 +2810,30 @@ def _seq_url(tpl, n):
     return re.sub(r"/sq/\d+", "/sq/%d" % n, tpl, count=1)
 
 
+def _lmt_url(tpl, n):
+    """The same segment url attributed to another of the source's media generations."""
+    return re.sub(r"lmt%3D\d+", "lmt%%3D%d" % n, tpl)
+
+
+def _reach(tpl, seq, answers, gens=6):
+    """The url for this segment number, attributed to whichever generation actually holds it, or ''.
+    A source's generations carry successive stretches of the numbering and do not overlap, so a
+    number offered to the wrong one is refused rather than answered with another moment: what comes
+    back for one that answers is the segment asked for."""
+    base = _seq_url(tpl, seq)
+    cur = _lmt_in(base)
+    for n in ([cur - i for i in range(gens)] if cur else [0]):
+        cand = _lmt_url(base, n) if cur else base
+        if answers(cand):
+            return cand
+    return ""
+
+
+def _lmt_in(url):
+    m = re.search(r"lmt%3D(\d+)", url)
+    return int(m.group(1)) if m else 0
+
+
 def _dvr_anchor(text, base_url, back_s, answers, probes=9):
     """Where a replay of a live stream should start, this many seconds behind its edge, for a source
     that numbers its segments. Such a url can be asked for an earlier number, but the number only
@@ -2823,21 +2861,27 @@ def _dvr_anchor(text, base_url, back_s, answers, probes=9):
     if dur <= 0:
         return None
     want = max(1, live - int(round(max(0.0, back_s) / dur)))
+    at = _reach(tpl, want, answers)
     seq = want
-    if not answers(_seq_url(tpl, want)):
-        lo, hi = want, live          # lo does not answer, hi does; close in on the boundary
+    if not at:
+        # Further back than the source keeps. Close in on the oldest number it still answers for,
+        # rather than refusing outright: the deepest it reaches is the most of the ask that exists.
+        lo, hi = want, live          # lo is out of reach, hi is within it
         for _ in range(probes):
             if hi - lo <= 1:
                 break
             mid = (lo + hi) // 2
-            if answers(_seq_url(tpl, mid)):
+            if _reach(tpl, mid, answers):
                 hi = mid
             else:
                 lo = mid
         seq = hi
-    if seq >= live:
+        at = _reach(tpl, seq, answers)
+    if not at or seq >= live:
         return None
-    return {"tpl": tpl, "seq": seq, "dur": dur, "live": live, "want": want}
+    # The anchor carries the generation that holds it, so the playlist built from it asks the right
+    # one for every segment it lists.
+    return {"tpl": at, "seq": seq, "dur": dur, "live": live, "want": want}
 
 
 def _seg_answers(url, hdr_map):
