@@ -2895,18 +2895,21 @@ def _seg_answers(url, hdr_map):
         return False
 
 
-def _dvr_playlist(anchor, started_at, window=12, keep=1440):
-    """The replay as of now: everything due since the anchor, at the pace the source recorded it.
-    What has gone by stays listed instead of sliding out behind the playhead, so the receiver can
-    move across it, and EVENT declares that it grows, which is what lets it be read as a recording
-    rather than a live edge."""
+def _dvr_playlist(anchor, started_at=0.0, keep=1440):
+    """The stretch of the broadcast the replay covers, closed. A playlist left open is a live one
+    however it is labelled: the player gives it no duration and no range to move through, and starts
+    it at its newest moment rather than the one it was anchored to. Closing it makes the same
+    segments a recording, which is what a viewer who rewound is asking to watch.
+
+    It runs from the anchor to the edge the source was at, capped: every entry is a signed url of its
+    own, and a broadcast two days deep would otherwise weigh tens of megabytes to hand over."""
     dur = anchor["dur"]
-    newest = anchor["seq"] + window - 1 + int((time.monotonic() - started_at) / dur)
-    first = max(anchor["seq"], newest - keep + 1)
-    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:EVENT",
-           f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{first}"]
-    for n in range(first, newest + 1):
+    last = min(anchor["live"], anchor["seq"] + keep - 1)
+    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD",
+           f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{anchor['seq']}"]
+    for n in range(anchor["seq"], last + 1):
         out += [f"#EXTINF:{dur:.3f},", _seq_url(anchor["tpl"], n)]
+    out.append("#EXT-X-ENDLIST")
     return "\n".join(out) + "\n"
 
 
