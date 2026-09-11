@@ -2977,21 +2977,23 @@ def _seg_answers(url, hdr_map):
 
 
 def _dvr_playlist(anchor, live, window_s):
-    """The window of the broadcast on offer, ending at the edge it has reached now. Left open, which
-    is what lets it move: the player refetches it, so the far end follows the broadcast and the near
-    end travels with it, the same window the source publishes rather than a wider one held open past
-    what it means to offer. Open costs nothing in reach, which was worth checking: a listing of this
-    length is seekable end to end either way, and only where playback starts differs.
+    """The window of the broadcast on offer, ending at the edge it had reached when this was built,
+    and closed. Closing is what gives it a length, and a length is what a television draws a position
+    bar from; left open it is a live stream to the player, seekable all the same but with nothing to
+    show for it. What closing costs is travel: the window no longer follows the broadcast on its own.
+    It is rebuilt against the edge of the moment on every load instead, which is every time a viewer
+    asks for one of its points, so it advances whenever it is used.
 
     Each entry names only its number. The url they are all built from is the proxy's, and writing it
     out in full on every line is what would make half a day weigh tens of megabytes."""
     dur = anchor["dur"]
     span = max(1, int(round(max(60.0, window_s) / dur)))
     first = max(1, live - span + 1)
-    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:EVENT",
+    out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD",
            f"#EXT-X-TARGETDURATION:{int(dur) + 1}", f"#EXT-X-MEDIA-SEQUENCE:{first}"]
     for n in range(first, live + 1):
         out += [f"#EXTINF:{dur:.3f},", f"/s/{n}"]
+    out.append("#EXT-X-ENDLIST")
     return "\n".join(out) + "\n"
 
 
