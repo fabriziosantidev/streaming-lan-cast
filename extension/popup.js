@@ -24,6 +24,8 @@ let pageLive = false;    // the page says it is showing a broadcast that is stil
 let pageBehind = 0;      // how far behind its edge that broadcast is being watched
 let castBehind = 0;      // the distance the next cast should open at, for a replayable live source
 let castSeekable = false;  // the running cast carries its own timeline, so it can be asked for a moment
+let castReplay = false;    // ...and that timeline is one we built, so moving means anchoring it again
+let castBehindNow = 0;     // how far behind its edge the page is, for a replay that follows it
 let posTick = 0;         // throttles re-reading that position while the popup stays open
 let castFrom = -1;       // a point inside the recording to open the cast at, -1 = the live edge
 // quality menu state per trigger: current value ("best" or "itag:NNN") + the /qualities format matrix
@@ -219,9 +221,10 @@ function startStatusPoll() {
     $("rewindRow").hidden = !(dv || sk);
     // A cast that opened inside a recording because the broadcast is over has no edge to return to.
     $("backLive").hidden = sk || !!s.nolive;
-    // A replay counts from its own anchor, so the page's position names a moment it does not have;
-    // its beginning is the one point on it that can be asked for.
-    $("rewindHere").hidden = replay;
+    // A replay counts from its own anchor, so a moment of it cannot be named by the page's clock.
+    // What can be asked for is another anchor: the replay is rebuilt to start where the page now is.
+    $("rewindHere").hidden = false;
+    castReplay = replay;
     if ((dv || sk) && posTick-- <= 0) {   // the page keeps playing, so refresh the point on offer
       posTick = 5;
       const tb = await activeTab();
@@ -230,6 +233,7 @@ function startStatusPoll() {
       // On a page showing a running broadcast the point worth naming is how far back it is being
       // watched, which its own player answers; its position counts from somewhere else entirely.
       const shown = pm.live ? (pm.atEdge ? 0 : (pm.behind || 0)) : pagePos;
+      castBehindNow = pm.live && !pm.atEdge ? (pm.behind || 0) : 0;
       const enough = pm.live ? shown > 60 : shown > 30;
       $("rewindHere").querySelector(".lbl").textContent =
         enough ? hms(shown) : tOr("rewindHere", "Position");
@@ -916,11 +920,16 @@ function rewindTo(sec) {
   const at = Math.max(0, Math.floor(sec));
   return castSeekable ? `/rewind?seek=1&t=${at}` : `/rewind?t=${at}`;
 }
+// Following the page on a replay is not a move within what is playing: the replay is anchored again,
+// this time where the page is, and starts over from there.
+function rewindFollow() {
+  return `/rewind?behind=${Math.max(0, Math.floor(castBehindNow))}`;
+}
 $("rewindStart").addEventListener("click", async () => {
   try { await call(rewindTo(0)); } catch { notify(t("errNoHelper"), "err"); }
 });
 $("rewindHere").addEventListener("click", async () => {
-  try { await call(rewindTo(pagePos)); }
+  try { await call(castReplay ? rewindFollow() : rewindTo(pagePos)); }
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("backLive").addEventListener("click", async () => {
