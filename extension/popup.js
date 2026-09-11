@@ -410,9 +410,9 @@ async function refreshStartRow() {
     pagePos = pm.t || 0;
     pageDur = pm.d || 0;
     pageLive = !!pm.live;
-    // On a running broadcast the point on offer is how far back it is being watched: its position
-    // counts from a beginning that may be hours away, and is not what the source is asked for.
-    pageBehind = pageLive && Number.isFinite(pageDur) && pageDur > 0 ? Math.max(0, pageDur - pagePos) : 0;
+    // On a running broadcast the point on offer is how far back it is being watched, which the page's
+    // player answers directly. Sitting at the edge is nothing to offer at all.
+    pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
     const off = pageLive ? pageBehind : pagePos;
     const enough = pageLive ? pageBehind > 60 : pagePos > 30;
     $("startAtHere").querySelector(".lbl").textContent =
@@ -703,6 +703,20 @@ async function readPageMedia(tabId) {
     const lb = document.querySelector('meta[itemprop="isLiveBroadcast"]');
     const live = !!lb && String(lb.content || "").toLowerCase() !== "false"
                  && !document.querySelector('meta[itemprop="endDate"]');
+    // A running broadcast's media element reports a runtime that is a placeholder, so how far behind
+    // the edge it is being watched cannot be taken from it: on one stream it read as 188 days, on
+    // another as fourteen hours, and neither moved with playback. The page's own player keeps the
+    // seekable bounds that do mean something, and says whether it is sitting at the edge at all.
+    let behind = 0, atEdge = false, dvrWindow = 0;
+    try {
+      const mp = document.querySelector('#movie_player');
+      const ps = mp && mp.getProgressState ? mp.getProgressState() : null;
+      if (ps && isFinite(ps.seekableEnd) && isFinite(ps.current)) {
+        behind = Math.max(0, ps.seekableEnd - ps.current);
+        dvrWindow = Math.max(0, ps.seekableEnd - (ps.seekableStart || 0));
+        atEdge = !!ps.isAtLiveHead;
+      }
+    } catch (e) {}
     let best = "", bestArea = -1, blobOnly = false, bestT = 0, bestD = 0;
     for (const v of document.querySelectorAll("video")) {
       const s = v.currentSrc || v.src || "";
@@ -714,7 +728,7 @@ async function readPageMedia(tabId) {
         if (a > bestArea) { bestArea = a; bestT = v.currentTime || 0; bestD = v.duration || 0; }
       }
     }
-    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live };
+    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, behind, atEdge, dvrWindow };
   };
   let res;
   try {
@@ -724,6 +738,7 @@ async function readPageMedia(tabId) {
     catch { return { url: "", blobOnly: false }; }
   }
   let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false;
+  let behind = 0, atEdge = false, dvrWindow = 0;
   for (const f of res || []) {
     const r = f && f.result;
     if (!r) continue;
@@ -731,8 +746,10 @@ async function readPageMedia(tabId) {
     if (r.t > t) { t = r.t; d = r.d || 0; }   // the runtime of the frame the position came from
     blobOnly = blobOnly || !!r.blobOnly;
     live = live || !!r.live;              // the frame carrying the page's own markup is the one that knows
+    if (r.behind > behind) { behind = r.behind; dvrWindow = r.dvrWindow || 0; atEdge = !!r.atEdge; }
+    else if (r.atEdge) atEdge = true;
   }
-  return { url, blobOnly, t, d, live };
+  return { url, blobOnly, t, d, live, behind, atEdge, dvrWindow };
 }
 
 // Read off the path, so a signed query string does not hide the extension.
