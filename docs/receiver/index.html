@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.33';
+    const RX_VERSION = '1.34';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -124,7 +124,12 @@
         // A live HLS tagged ll=1 (Twitch/Kick/YouTube) rides closer to the edge with a shallower buffer;
         // a VOD seeks freely and has no live edge, so it drops the presentation delay.
         const lowLat = url.indexOf('ll=1') !== -1;
-        playbackConfig.shakaConfig.manifest.defaultPresentationDelay = isVod ? 0 : (lowLat ? 3 : 14);
+        // A window that travels is a live presentation underneath, whatever it is presented as, so it
+        // is tuned like one. Left to the manifest's own suggestion the player holds three segments
+        // back, which is most of a minute away from the edge it was asked to sit at.
+        const replay = url.indexOf('rp=1') !== -1;
+        playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
+          replay ? 6 : (isVod ? 0 : (lowLat ? 3 : 14));
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall

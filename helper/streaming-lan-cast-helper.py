@@ -4645,6 +4645,8 @@ def run_cast(args):
         _marks = []
         if _low_latency and _kind != "file":
             _marks.append("ll=1")
+        if _REPLAY["anchor"]:
+            _marks.append("rp=1")    # a window that travels: live underneath, however it is presented
         if _is_vod:
             _marks.append("vod=1")
         _path = f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"
@@ -4759,6 +4761,10 @@ def run_cast(args):
         log(f"cast: opening at t={int(_open_at)}s")
     mc = cc.media_controller
     _open_kw = {"current_time": _open_at} if _open_at is not None else {}
+    # A playlist left open carries no duration, and without one the television has nothing to draw a
+    # position bar from however seekable the stream is. The window's own length is that duration.
+    if _REPLAY["anchor"] and _REPLAY["window"]:
+        _open_kw["media_info"] = {"duration": float(_REPLAY["window"])}
     try:
         mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
         try:
@@ -5045,7 +5051,8 @@ def run_cast(args):
                 log(f"cast: moving to {_bk / 3600:.1f}h behind the edge")
                 try:
                     mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type="BUFFERED",
-                                  current_time=_t)
+                                  current_time=_t,
+                                  media_info={"duration": float(_REPLAY["window"])})
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
