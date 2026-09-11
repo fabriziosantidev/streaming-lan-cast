@@ -86,7 +86,7 @@ PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-noli
 PROXY_SEEK_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-seekable")         # proxy->control: this cast carries its own timeline, so it can be moved through
 # The live stream this cast is replaying and where from. Held here because the playlist is served on
 # one thread and re-anchored on another, and both have to agree on which moment the cast starts at.
-_REPLAY = {"anchor": None, "t0": 0.0}
+_REPLAY = {"anchor": None, "t0": 0.0, "gd": 0}
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
@@ -1617,13 +1617,17 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         log("proxy: receiver fetched first segment/sub-playlist")
                     if p.startswith("/s/"):
                         # A replay's playlist names its segments by number alone, so the url is built
-                        # back here from the one the anchor was taken from.
+                        # back here from the one the anchor was taken from, under whichever of the
+                        # source's generations last answered: a listing spanning a day crosses several,
+                        # in both directions from where it was anchored.
                         if not _REPLAY["anchor"]:
                             self.send_error(404); return
                         try:
                             u = _seq_url(_REPLAY["anchor"]["tpl"], int(p[3:]))
                         except ValueError:
                             self.send_error(400); return
+                        if _REPLAY["gd"]:
+                            u = _lmt_url(u, _lmt_in(u) + _REPLAY["gd"])
                     else:
                         u = (_qparam(self.path, "u") or [""])[0]
                     if not u:
@@ -1640,10 +1644,15 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         if e.code == 404 and _REPLAY["anchor"] and _lmt_in(u):
                             # A day of broadcast spans several of the source's generations, and each
                             # refuses the numbers that are not its own. Refusal is all a wrong one
-                            # returns, so the ones after it can be asked in turn.
-                            for _g in range(1, 5):
+                            # returns, so its neighbours can be asked in turn: earlier for the stretch
+                            # before the anchor, later for the stretch after it. The one that answers
+                            # is remembered, since the next segment asked for is usually beside it.
+                            _base = _lmt_in(u) - _REPLAY["gd"]
+                            for _d in (d for i in range(1, 7) for d in (-i, i)):
+                                _try = _REPLAY["gd"] + _d
                                 try:
-                                    r = _fetch(_lmt_url(u, _lmt_in(u) + _g))
+                                    r = _fetch(_lmt_url(u, _base + _try))
+                                    _REPLAY["gd"] = _try
                                     break
                                 except _UpstreamError:
                                     continue
