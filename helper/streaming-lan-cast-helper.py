@@ -87,7 +87,10 @@ PROXY_SEEK_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-seekab
 # The live stream this cast is replaying and where from. Held here because the playlist is served on
 # one thread and re-anchored on another, and both have to agree on which moment the cast starts at.
 _REPLAY = {"anchor": None, "t0": 0.0, "gd": 0, "window": 43200.0,
-           "live": 0, "at": 0.0, "text": ""}
+           "live": 0, "at": 0.0, "text": "",
+           # a growing recording served as one open window: its media playlist url, the open
+           # listing last built from it, when, and the span it covered then
+           "rec": "", "rec_text": "", "rec_at": 0.0, "rec_dur": 0.0}
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
@@ -1583,6 +1586,32 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if p == "/win.m3u8" and _REPLAY["rec"]:
+                    # A growing recording served as one open window. The source regenerates it
+                    # every half minute or so; it is read again at most every 5s and served open.
+                    if not dbg.get("win"):
+                        dbg["win"] = True
+                        log(f"proxy: receiver fetched /win.m3u8 (client {self.client_address[0]})")
+                    if time.monotonic() - _REPLAY["rec_at"] > 5.0 or not _REPLAY["rec_text"]:
+                        try:
+                            _rt = _fetch(_REPLAY["rec"]).read().decode("utf-8", "replace")
+                        except Exception:
+                            _rt = ""
+                        if _rt.lstrip().startswith("#EXTM3U"):
+                            _REPLAY["rec_text"], _REPLAY["rec_dur"] = _window_playlist(_rt, _REPLAY["rec"])
+                            _REPLAY["rec_at"] = time.monotonic()
+                            if not dbg.get("winspan") or time.monotonic() - dbg["winspan"] > 600:
+                                dbg["winspan"] = time.monotonic()
+                                log(f"proxy: window spans {_REPLAY['rec_dur'] / 3600:.2f}h of the recording")
+                    if not _REPLAY["rec_text"]:
+                        self.send_error(503); return
+                    _body = _REPLAY["rec_text"].encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self._cors([("Content-Length", str(len(_body))), ("Connection", "close")])
+                    self.end_headers()
+                    self.wfile.write(_body)
+                    return
                 if p == "/live.m3u8" and _REPLAY["anchor"]:
                     if not dbg["m3u8"]:
                         dbg["m3u8"] = True
@@ -1660,7 +1689,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         log(f"proxy: receiver fetched /live.m3u8 [{_proxy_playlist_note(text)}] (client {self.client_address[0]})")
                     self._serve_m3u8(text, cur["src"])
                     return
-                if p == "/p" or p.startswith("/s/"):
+                if p == "/p" or p.startswith("/s/") or p.startswith("/r/"):
                     _seg_t0 = time.monotonic()
                     _SEG_SERVED["at"] = _seg_t0    # a segment in flight is progress too, not only a finished one
                     if not dbg["seg"]:
@@ -1679,6 +1708,11 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                             self.send_error(400); return
                         if _REPLAY["gd"]:
                             u = _lmt_url(u, _lmt_in(u) + _REPLAY["gd"])
+                    elif p.startswith("/r/"):
+                        # A segment of the window, named by its file under the recording's playlist.
+                        if not _REPLAY["rec"] or "/" in p[3:] or ".." in p:
+                            self.send_error(404); return
+                        u = urllib.parse.urljoin(_REPLAY["rec"], p[3:])
                     else:
                         u = (_qparam(self.path, "u") or [""])[0]
                     if not u:
@@ -2425,6 +2459,8 @@ def serve_control(port):
             _dvr_done = (q.get("dvrrec", [""])[0]).strip()
             if not _dvr_done.startswith(("http://", "https://")):
                 _dvr_done = _rec_by_page.get(url, "")     # resolved on an earlier cast of this page
+            if not _dvr_done.startswith(("http://", "https://")) and "kick.com" in url and kind == "cast":
+                _dvr_done = _kick_recording(url, quality)  # the site names it, sniffed or not
             if _dvr_done.startswith(("http://", "https://")):
                 dvr_state["urls"] = [_dvr_done]
                 _rec_by_page[url] = _dvr_done
@@ -2570,8 +2606,11 @@ def serve_control(port):
             except Exception:
                 urls = []
             urls = [u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://"))][:6]
+            page = (q.get("page", [""])[0]).strip()
             if not urls:
-                self._json({"ok": True, "rec": ""})
+                # Nothing sniffed yet; a Kick page still names its recording through the site's api.
+                rec = _kick_recording(page, _safe_quality(q.get("quality", [""])[0])) if "kick.com" in page else ""
+                self._json({"ok": True, "rec": rec})
                 return
             try:
                 hmap = json.loads((q.get("h", [""])[0]).strip() or "{}")
@@ -2586,6 +2625,8 @@ def serve_control(port):
                 return
             rec = _recording_among(urls, lambda u: _fetch_playlist(u, hmap),
                                    _safe_quality(q.get("quality", [""])[0]))
+            if not rec and "kick.com" in page:
+                rec = _kick_recording(page, _safe_quality(q.get("quality", [""])[0]))
             _rec_cache[key] = (rec, time.time())
             while len(_rec_cache) > 24:
                 _rec_cache.pop(next(iter(_rec_cache)))
@@ -3037,6 +3078,100 @@ def _dvr_playlist(anchor, live, window_s):
     for n in range(first, live + 1):
         out += [f"#EXTINF:{dur:.3f},", f"/s/{n}"]
     return "\n".join(out) + "\n"
+
+
+def _cf_get(url, headers=None, timeout=12):
+    """GET url and return (status, text). Uses curl_cffi with a browser TLS fingerprint when it is
+    installed, since some hosts answer a plain client with a bot check; falls back to urllib."""
+    h = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+    h.update(headers or {})
+    try:
+        from curl_cffi import requests as _cr
+        r = _cr.get(url, headers=h, timeout=timeout, impersonate="chrome")
+        return r.status_code, r.text
+    except ImportError:
+        pass
+    except Exception as e:
+        log(f"recording: fetch {_redact_url(url)} -> {type(e).__name__}")
+        return 0, ""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+            return r.getcode() or 200, r.read(2_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception as e:
+        log(f"recording: fetch {_redact_url(url)} -> {type(e).__name__}")
+        return 0, ""
+
+
+_KICK_REC = {}      # channel slug -> (media playlist url, resolved at)
+
+
+def _kick_recording(page_url, quality=""):
+    """The media playlist of the recording Kick keeps of a channel's running broadcast, or ''. The
+    channel's current livestream names a video, and that video's source is the master playlist of
+    a recording that grows for as long as the broadcast runs. The rendition is picked as the cast
+    asked (a height, else the highest). Answers are kept for a minute per channel."""
+    m = re.match(r"https?://(?:www\.)?kick\.com/([A-Za-z0-9_.-]+)", page_url or "")
+    if not m:
+        return ""
+    slug = m.group(1)
+    hit = _KICK_REC.get(slug)
+    if hit and time.time() - hit[1] < 60:
+        return hit[0]
+    rec = ""
+    try:
+        st, body = _cf_get(f"https://kick.com/api/v2/channels/{slug}")
+        live_id = (json.loads(body).get("livestream") or {}).get("id") if st == 200 else None
+        uuid = ""
+        if live_id:
+            st, body = _cf_get(f"https://kick.com/api/v1/channels/{slug}")
+            for ls in (json.loads(body).get("previous_livestreams") or []) if st == 200 else []:
+                if ls.get("id") == live_id:
+                    uuid = (ls.get("video") or {}).get("uuid") or ""
+                    break
+        if uuid:
+            st, body = _cf_get(f"https://kick.com/api/v1/video/{uuid}")
+            master = json.loads(body).get("source") if st == 200 else ""
+            if master:
+                st, text = _cf_get(master)
+                variants = _parse_master_variants(master, text) if st == 200 else []
+                if variants:
+                    want = re.match(r"(\d+)", quality or "")
+                    pick = next((v for v in variants if want and int(v.get("height") or 0) == int(want.group(1))), None)
+                    pick = pick or variants[0]
+                    rec = pick["url"]
+                    log(f"recording: kick keeps one of this broadcast ({pick['quality']} of {len(variants)} offered)")
+        if not rec:
+            log("recording: kick keeps none of this broadcast" + ("" if live_id else " (not live)"))
+    except Exception as e:
+        log(f"recording: kick lookup failed: {type(e).__name__}: {str(e)[:60]}")
+    _KICK_REC[slug] = (rec, time.time())
+    return rec
+
+
+def _window_playlist(text, base):
+    """A growing recording's media playlist as an open live listing: the end marker and the playlist
+    type go, so the player keeps refetching it and the edge keeps moving, and each segment is named
+    by its own file under /r/ so the listing stays small over hours. Returns (listing, span in s)."""
+    out, dur = [], 0.0
+    for ln in text.splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if t.startswith("#"):
+            if t.startswith(("#EXT-X-ENDLIST", "#EXT-X-PLAYLIST-TYPE")):
+                continue
+            m = re.match(r"#EXTINF:([\d.]+)", t)
+            if m:
+                dur += float(m.group(1))
+            out.append(t)
+            continue
+        if re.match(r"https?://", t):
+            out.append("/p?u=" + urllib.parse.quote(urllib.parse.urljoin(base, t), safe=""))
+        else:
+            out.append("/r/" + t)
+    return "\n".join(out) + "\n", dur
 
 
 def _recording_among(candidates, fetch_text, quality=""):
@@ -4753,6 +4888,28 @@ def run_cast(args):
             _dvrs = json.loads(args.dvr_media) if args.dvr_media else []
         except Exception:
             _dvrs = []
+        # A Kick broadcast keeps a recording that grows while it runs. Served open, it is one window
+        # from the start of the broadcast to the recording's edge, which trails the live edge by up to
+        # half a minute, and the points asked for are seeks within it rather than loads. A cast asked
+        # to open at a point starts in the window; a cast of the edge keeps the low-latency live and
+        # moves into the window the first time a point is asked for.
+        _win_url, _win_open = "", False
+        if "kick.com" in _page and _kind == "hls" and not _is_vod and not _replay_anchor:
+            _qsel = "" if args.quality == "best" else (args.quality or "")
+            _rec = ""
+            if _dvrs:
+                _rec = _recording_among(_dvrs, lambda u: _fetch_playlist(u, hdr_map), _qsel) or ""
+            if not _rec:
+                _rec = _kick_recording(_page, _qsel)
+            if _rec:
+                _REPLAY.update(rec=_rec, rec_text="", rec_at=0.0, rec_dur=0.0)
+                _win_url = f"http://{ip}:{args.port}/win.m3u8?rp=1"
+                if getattr(args, "dvr_start", -1) >= 0:
+                    _win_open = True
+                    _is_vod = True
+                    args.start_at = max(0.0, float(args.dvr_start))
+                    args.dvr_start = -1.0
+                    log(f"cast: opening the window over the recording at t={int(args.start_at)}s")
         httpd = ThreadingHTTPServer((ip, args.port),
                                     make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
                                                    dvr_anchor=_replay_anchor,
@@ -4761,7 +4918,7 @@ def run_cast(args):
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         # A replayed window is loaded as live: the player keeps refetching it, and the cast framework
         # holds a moving seekable range for it and draws its live bar from that.
-        _stream_type = "LIVE" if (_replay_anchor or not _is_vod) else "BUFFERED"
+        _stream_type = "LIVE" if (_replay_anchor or _win_open or not _is_vod) else "BUFFERED"
         # A cast with its own timeline can be moved through, whether that timeline comes from a
         # finished video or from a live stream being replayed from behind its edge. The popup offers
         # the points to move to; this is how it learns there are any.
@@ -4772,17 +4929,18 @@ def run_cast(args):
             # moment that does not exist there.
             try:
                 with open(PROXY_SEEK_FILE, "w", encoding="utf-8") as _sf:
-                    _sf.write("replay" if _replay_anchor else "vod")
+                    _sf.write("replay" if (_replay_anchor or _win_open) else "vod")
             except OSError:
                 pass
         _marks = []
-        if _low_latency and _kind != "file" and not _replay_anchor:
+        if _low_latency and _kind != "file" and not _replay_anchor and not _win_open:
             _marks.append("ll=1")
-        if _replay_anchor:
+        if _replay_anchor or _win_open:
             _marks.append("rp=1")    # a replayed window: live and a whole window deep, moved by distance
         elif _is_vod:
             _marks.append("vod=1")
-        _path = f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"
+        _path = ("/win.m3u8" if _win_open
+                 else (f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"))
         hls_url = f"http://{ip}:{args.port}{_path}" + ("?" + "&".join(_marks) if _marks else "")
         log(f"{_kind} proxy at {hls_url} -> cast ({'VOD/seekable' if _is_vod else 'live'}) to {args.cast_name or args.tv}")
 
@@ -4887,7 +5045,7 @@ def run_cast(args):
     # segment, so it takes an offset too; a plain live edge has no earlier point to open at.
     _sa = getattr(args, "start_at", -1)
     _open_at = (max(0.0, args.dvr_start) if _start_in_dvr
-                else (max(0.0, _sa) if _sa >= 0 and (_first[2] == "BUFFERED" or _REPLAY["anchor"])
+                else (max(0.0, _sa) if _sa >= 0 and (_first[2] == "BUFFERED" or _REPLAY["anchor"] or _win_open)
                       else None))
     if _start_in_dvr:
         log(f"cast: opening the recording at t={int(args.dvr_start)}s (not the live edge)")
@@ -4938,7 +5096,22 @@ def run_cast(args):
     _sw_sep = "&" if "?" in hls_url else "?"
     hls_url_sw = hls_url + _sw_sep + "sw=1"
     dvr_url_sw = (_dvr_base + "&sw=1") if _dvr_base else ""
-    cur_src = "dvr" if _start_in_dvr else "live"   # which source the receiver is on
+    cur_src = "win" if _win_open else ("dvr" if _start_in_dvr else "live")   # which source the receiver is on
+    _win_sw = (_win_url + "&sw=1") if _win_url else ""
+
+    def _window_move(t=None, behind=None):
+        """Move the window already playing, to t seconds from the start of the broadcast or to a
+        distance behind its edge. A receiver from 1.36 on takes the distance and seeks against the
+        range it holds, so nothing reloads; an older one gets the window loaded again at the point.
+        The span last served converts one into the other; until a listing has been served, a point
+        is asked for as a load."""
+        _span = float(_REPLAY["rec_dur"] or 0)
+        _new = _ver_at_least((slc.last or {}).get("ver"), (1, 36))
+        if _new and (behind is not None or _span > 0):
+            slc.send_message({"type": "behind", "s": behind if behind is not None else max(0.0, _span - t)})
+        else:
+            _at = t if t is not None else max(0.0, _span - behind)
+            mc.play_media(_win_sw, _ct_load, title=_title, stream_type="LIVE", current_time=max(0.0, _at))
     _safe_unlink(PROXY_CTL_FILE)   # a stale switch request from an earlier cast must not fire here
     _ctl_seen = 0.0
     MAX_LOAD_ATTEMPTS = 5          # if the receiver reports a load error before playback starts, the
@@ -5130,9 +5303,10 @@ def run_cast(args):
             # that has ended there is no edge there at all. Whether the position can be read is a
             # question about the load in the player, not about the source the cast was built from.
             _on_dvr = cur_src == "dvr" and dvr_url_sw
-            _re_url = dvr_url_sw if _on_dvr else hls_url_sw
+            _on_win = cur_src == "win" and _win_sw
+            _re_url = dvr_url_sw if _on_dvr else (_win_sw if _on_win else hls_url_sw)
             _re_ct = "application/x-mpegurl" if _on_dvr else _ct_load
-            _re_type = "BUFFERED" if _on_dvr else _stream_type
+            _re_type = "BUFFERED" if _on_dvr else ("LIVE" if _on_win else _stream_type)
             pos = 0.0
             if _re_type == "BUFFERED":
                 try:
@@ -5145,15 +5319,17 @@ def run_cast(args):
                 # an errored load reports no position of its own; resume the video where the
                 # receiver last reported playing it
                 pos = seen_t[0]
+            if not pos and _on_win and seen_t[1] == "win":
+                pos = seen_t[0]       # the window counts from the start of the broadcast, as the position does
             if not pos and _REPLAY["anchor"] and not _on_dvr and seen_bk > 30:
                 # a replayed window reopens as far behind its edge as it was playing
                 _dur = _REPLAY["anchor"]["dur"]
                 _span = max(1, int(round(_REPLAY["window"] / _dur)))
                 pos = max(0.0, _span * _dur - seen_bk)
-            if not _on_dvr:
+            if not _on_dvr and not _on_win:
                 cur_src = "live"       # a failed recording with no edge to keep falls back to one
             log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading the "
-                f"{'recording' if _on_dvr else ('window' if _REPLAY['anchor'] else ('video' if _is_vod else 'live edge'))} "
+                f"{'recording' if _on_dvr else ('window' if (_REPLAY['anchor'] or _on_win) else ('video' if _is_vod else 'live edge'))} "
                 f"({mid_reloads}/{MAX_MID_RELOADS})"
                 + (f" at t={int(pos)}s" if pos else ""))
             try:
@@ -5179,7 +5355,30 @@ def run_cast(args):
                     _creq = json.load(_cf)
             except Exception:
                 _creq = {}
-            if _creq.get("go") == "dvr" and dvr_url_sw:
+            if _creq.get("go") in ("dvr", "seek") and _win_sw and (cur_src == "win" or _creq.get("go") == "dvr"):
+                # A point of the window over the recording: a seek of it once it is playing, and
+                # otherwise the load that moves the cast into it.
+                try:
+                    _t = max(0.0, float(_creq.get("t") or 0))
+                except (TypeError, ValueError):
+                    _t = 0.0
+                try:
+                    if cur_src == "win":
+                        log(f"cast: moving to t={int(_t)}s within the window")
+                        _window_move(t=_t)
+                    else:
+                        cur_src = "win"
+                        try:
+                            with open(PROXY_SEEK_FILE, "w", encoding="utf-8") as _sf:
+                                _sf.write("replay")
+                        except OSError:
+                            pass
+                        log(f"cast: moving into the window over the recording at t={int(_t)}s")
+                        mc.play_media(_win_sw, _ct_load, title=_title, stream_type="LIVE", current_time=_t)
+                        last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
+            elif _creq.get("go") == "dvr" and dvr_url_sw:
                 try:
                     _t = max(0.0, float(_creq.get("t") or 0))
                 except (TypeError, ValueError):
@@ -5192,6 +5391,17 @@ def run_cast(args):
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: rewind load failed: {type(e).__name__}: {str(e)[:60]}")
+            elif _creq.get("go") == "behind" and cur_src == "win" and _win_sw:
+                # A distance from the edge of the window over the recording; 0 is its edge.
+                try:
+                    _bk = max(0.0, float(_creq.get("behind") or 0))
+                except (TypeError, ValueError):
+                    _bk = 0.0
+                log(f"cast: moving to {_bk / 3600:.1f}h behind the window's edge")
+                try:
+                    _window_move(behind=_bk)
+                except Exception as e:
+                    log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
             elif _creq.get("go") == "behind" and _REPLAY["anchor"]:
                 # A point in the window on offer, named by its distance from the edge. The window
                 # travels with the broadcast, so the same distance means a later moment each time it
@@ -5234,6 +5444,8 @@ def run_cast(args):
                 except Exception as e:
                     log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
             elif _creq.get("go") == "live":
+                if cur_src == "win" and not _win_open:
+                    _safe_unlink(PROXY_SEEK_FILE)    # the low-latency live has no window to move through
                 cur_src = "live"
                 log("cast: back to the live edge")
                 try:

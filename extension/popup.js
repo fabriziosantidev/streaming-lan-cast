@@ -130,11 +130,17 @@ async function tabRecording(tabId) {
   const det = await browser.runtime.sendMessage({ cmd: "getDetected", tabId }).catch(() => null);
   if (det && det.rec) return (recUrl = det.rec);
   const srcs = ((det && det.sources) || []).filter(s => s.type === "hls");
-  if (!srcs.length) return "";
+  // The helper can name a Kick page's recording on its own, so that page is asked about even
+  // before anything crossed the wire.
+  let page = "";
+  try { page = ((await activeTab()).url || ""); } catch {}
+  const kick = /(^|\.)kick\.com$/.test((() => { try { return new URL(page).hostname; } catch { return ""; } })());
+  if (!srcs.length && !kick) return "";
   const hs = {};
-  for (const k of ["Referer", "Origin", "User-Agent"]) { const v = pickHeader(srcs[0].headers, k); if (v) hs[k] = v; }
+  if (srcs.length) for (const k of ["Referer", "Origin", "User-Agent"]) { const v = pickHeader(srcs[0].headers, k); if (v) hs[k] = v; }
   const body = "urls=" + encodeURIComponent(JSON.stringify(srcs.map(s => s.url).slice(0, 6)))
-             + "&h=" + encodeURIComponent(JSON.stringify(hs));
+             + "&h=" + encodeURIComponent(JSON.stringify(hs))
+             + (kick ? "&page=" + encodeURIComponent(page) : "");
   try {
     const r = await call("/recording", { method: "POST", body });
     return (recUrl = (r && r.rec) || "");
@@ -218,7 +224,9 @@ function startStatusPoll() {
     // no edge to return to there, so that control stays out of it.
     const dv = !!(s.casting && s.dvr);
     const sk = !!(s.casting && s.seekable && !s.dvr);
-    const replay = sk && s.seekable === "replay";
+    // A window built over a recording reports both: the recording it came from and the window it
+    // has become, and the window is what the controls move through.
+    const replay = !!(s.casting && s.seekable === "replay");
     $("rewindRow").hidden = !(dv || sk);
     // A cast that opened inside a recording because the broadcast is over has no edge to return to.
     $("backLive").hidden = (sk && s.seekable !== "replay") || !!s.nolive;
@@ -879,7 +887,7 @@ async function castCurrentTab() {
     pageLive = !!pm.live;
     pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
     pageWindow = pageLive ? (pm.dvrWindow || 0) : 0;
-    pgNote = `/f${pm.frames || 0}/${pm.liveSrc || "-"}/w${Math.floor(pm.dvrWindow || 0)}/b${Math.floor(pm.behind || 0)}`
+    pgNote = `/f${pm.frames || 0}/${pm.liveSrc || "-"}/w${Math.floor(pm.dvrWindow || 0)}/b${Math.floor(pm.behind || 0)}/t${Math.floor(pm.t || 0)}`
       + (pm.atEdge ? `/edge` : ``) + (pm.err ? `/${pm.err}` : ``);
   }
   // A YouTube broadcast that keeps a window behind its edge is cast as that window wherever the page
@@ -971,7 +979,9 @@ $("rewindStart").addEventListener("click", async () => {
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("rewindHere").addEventListener("click", async () => {
-  try { await call(castReplay ? rewindFollow(castBehindNow) : rewindTo(pagePos)); }
+  // A page that answers how far behind the edge it sits names the point by that distance; one that
+  // answers only its own time names it by that time, which a window over a recording counts the same way.
+  try { await call(castReplay && castBehindNow > 0 ? rewindFollow(castBehindNow) : rewindTo(pagePos)); }
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("backLive").addEventListener("click", async () => {
