@@ -1228,13 +1228,15 @@ def _mpd_filter_height(text, height):
 
 
 def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fallbacks=None,
-                   dvr_urls=None, dvr_anchor=None):
+                   dvr_urls=None, dvr_anchor=None, relink=None):
     """Authenticating reverse-proxy for the receiver. Injects the sniffed headers/token the CDN
     requires and adds Access-Control-Allow-Origin so the https receiver can fetch this http LAN
     endpoint. media_kind 'hls' rewrites every playlist URL to route back through here (so segments and
     nested playlists inherit those headers + CORS); 'file' streams a direct media file at /live.<ext>
     and forwards byte-range requests so the receiver can seek; 'dash' serves the manifest at /live.mpd
-    with its URLs resolved against the source, and the receiver fetches the media from the origin."""
+    with its URLs resolved against the source, and the receiver fetches the media from the origin.
+    relink() resolves the page again and returns the new source URL. The proxy calls it when the
+    source refuses the URL being served, since a signed URL can stop being accepted mid-cast."""
     HDRS = dict(hdr_map or {})
     HDRS.setdefault("User-Agent", "Mozilla/5.0")
     # Mimic a browser's in-player fetch. Some CDNs hotlink-protect their segments by requiring the
@@ -1357,6 +1359,27 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
     cur = {"src": source_url}      # the playlist being served; recovery below may move it to a fallback
     _spawned = time.monotonic()
     _fallbacks = [f for f in (fallbacks or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
+    _relink_lock = threading.Lock()
+    _relink_at = [0.0]
+
+    def _relink_src(stale):
+        """The source url to serve once `stale` is refused: newly resolved from the page, or '' when
+        there is none. Requests refused together share one resolve, and a new one runs at most
+        every 20s."""
+        with _relink_lock:
+            if cur["src"] != stale:
+                return cur["src"]          # a request refused at the same time already resolved it
+            if not relink or time.monotonic() - _relink_at[0] < 20:
+                return ""
+            _relink_at[0] = time.monotonic()
+            src = relink() or ""
+            if src and src != stale:
+                cur["src"] = src
+                log(f"proxy: source url refused; resolved the page again -> "
+                    f"{_redact_url(src).rsplit('/', 1)[-1][:40]}")
+                return src
+            log("proxy: source url refused; resolving the page again gave no new url")
+            return ""
     _dvrs = [f for f in (dvr_urls or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
     _dvr = {"src": None, "text": None, "at": 0.0}   # resolved recording playlist, briefly cached
     if dvr_anchor:
@@ -1593,33 +1616,42 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                 if p == "/live.m3u8":
                     # Forward only the receiver's blocking-reload params, dropping the source's stale ones
                     # (see _ll_fetch_url). The rewrite base stays the playlist being served.
+                    _src = cur["src"]
                     try:
-                        r = _fetch(_ll_fetch_url(cur["src"], self.path))
+                        r = _fetch(_ll_fetch_url(_src, self.path))
                     except _UpstreamError as e:
                         # A host that mints per-request signatures can kill the chosen url between the
                         # classify fetch and this one. Name the timing (it separates a spent/expired
-                        # signature from a dead source), give the same url one more chance for a flaky
-                        # edge, then move to a sniffed sibling: the stream the page itself is playing
-                        # provably serves.
+                        # signature from a dead source). A source resolved from its page gets a newly
+                        # signed url from the page right away. Otherwise, or when that yields none, give
+                        # the same url one more chance for a flaky edge, then move to a sniffed sibling:
+                        # the stream the page itself is playing provably serves.
                         log(f"proxy: source playlist {e.code} {time.monotonic() - _spawned:.0f}s after "
-                            f"spawn; retrying once")
-                        time.sleep(1.0)
+                            f"spawn; " + ("resolving the page again" if relink else "retrying once"))
                         r = None
-                        try:
-                            r = _fetch(_ll_fetch_url(cur["src"], self.path))
-                        except _UpstreamError as e2:
-                            log(f"proxy: retry -> {e2.code}")
-                            for fb in _fallbacks:
-                                if fb == cur["src"]:
-                                    continue
-                                try:
-                                    r = _fetch(fb)
-                                except _UpstreamError as e3:
-                                    log(f"proxy: fallback {_redact_url(fb).rsplit('/', 1)[-1][:40]} -> {e3.code}")
-                                    continue
-                                cur["src"] = fb
-                                log("proxy: source url stayed dead; casting the stream the page is playing instead")
-                                break
+                        _fresh = _relink_src(_src) if relink else ""
+                        if _fresh:
+                            try:
+                                r = _fetch(_ll_fetch_url(_fresh, self.path))
+                            except _UpstreamError as e4:
+                                log(f"proxy: re-resolved url -> {e4.code}")
+                        if r is None:
+                            time.sleep(1.0)
+                            try:
+                                r = _fetch(_ll_fetch_url(cur["src"], self.path))
+                            except _UpstreamError as e2:
+                                log(f"proxy: retry -> {e2.code}")
+                                for fb in _fallbacks:
+                                    if fb == cur["src"]:
+                                        continue
+                                    try:
+                                        r = _fetch(fb)
+                                    except _UpstreamError as e3:
+                                        log(f"proxy: fallback {_redact_url(fb).rsplit('/', 1)[-1][:40]} -> {e3.code}")
+                                        continue
+                                    cur["src"] = fb
+                                    log("proxy: source url stayed dead; casting the stream the page is playing instead")
+                                    break
                         if r is None:
                             raise e
                     text = r.read().decode("utf-8", "replace")
@@ -4412,6 +4444,7 @@ def run_cast(args):
     # resolved, fall back to proxying the given URL.
     _page = args.url or ""
     _low_latency = False
+    _relink = None      # resolves the page again when the source refuses the url being served
     _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
     _yt_ff = None
     _yt_dl = None       # parallel yt-dlp download of the complete file (full-seek hand-off)
@@ -4502,6 +4535,7 @@ def run_cast(args):
             log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
             source_url = resolved
             _low_latency = True   # these sources are stable enough to ride closer to the live edge
+            _relink = lambda: _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
         else:
             # A broadcast that has ended leaves nothing to resolve. Record that this cast has no live
             # edge behind it, whatever it ends up playing, so nothing offers a way back to one.
@@ -4692,7 +4726,7 @@ def run_cast(args):
                                     make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
                                                    dvr_anchor=_replay_anchor,
                                                    quality="" if args.quality == "best" else args.quality,
-                                                   fallbacks=_fbs, dvr_urls=_dvrs))
+                                                   fallbacks=_fbs, dvr_urls=_dvrs, relink=_relink))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _stream_type = "BUFFERED" if _is_vod else "LIVE"
         # A cast with its own timeline can be moved through, whether that timeline comes from a
