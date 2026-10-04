@@ -4541,6 +4541,11 @@ def run_cast(args):
     if _yt_dash is None and _yt_dir is None and any(
             site in _page for site in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
         resolved = _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
+        if not resolved:
+            # The site answers slowly or not at all now and then; one more ask a moment later
+            # usually gets the stream that is there.
+            time.sleep(2.0)
+            resolved = _resolve_hls_url(_page, getattr(args, "quality", None), hdr_map)
         if resolved:
             log(f"cast: streamlink resolved {_page.split('//')[-1][:34]} -> HLS (native player)")
             source_url = resolved
@@ -4559,7 +4564,15 @@ def run_cast(args):
                 args.dvr_start = 0.0
                 log(f"cast: no live stream at {_page[:44]}; opening its recording instead")
             else:
-                log(f"cast: could not resolve {_page[:48]} via streamlink; proxying {source_url[:36]} as-is")
+                # The page itself serves no media, so a cast of it can only fail on the television.
+                # Report the failure to the popup instead, where it reads as the source being down.
+                log(f"cast: could not resolve {_page[:48]} via streamlink; nothing to cast")
+                try:
+                    with open(PROXY_ERR_FILE, "w", encoding="utf-8") as _ef:
+                        json.dump({"code": 503, "ts": time.time()}, _ef)
+                except Exception:
+                    pass
+                _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
 
     # A sniffed HLS master + a resolution picked in the menu -> serve just that variant (no adaptive).
     # Skip this when the control server already resolved the exact media to cast (--src-kind): re-resolving
