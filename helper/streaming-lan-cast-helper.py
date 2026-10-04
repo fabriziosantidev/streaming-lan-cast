@@ -2448,6 +2448,11 @@ def serve_control(port):
                 _dvr_win = max(0.0, float((q.get("window", [""])[0]) or 0))    # and how much of it the source offers
             except ValueError:
                 _dvr_win = 0.0
+            _pg = (q.get("pg", [""])[0]).strip()
+            if _pg:
+                log(f"control: page reports live/behind/window {_pg[:40]}")
+            if _dvr_back > 0 or _dvr_win > 0:
+                log(f"control: page sits {int(_dvr_back)}s behind its edge, window {_dvr_win / 3600:.1f}h")
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
                                     dvr=dvr_state["urls"], dvr_start=_dvr_start,

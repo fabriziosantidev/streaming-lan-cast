@@ -721,17 +721,32 @@ async function readPageMedia(tabId) {
   const probe = () => {
     // A live edge and a recording look alike from the media element: on a stream that has run for
     // hours with its whole window seekable, the runtime and the seekable end both sit still while
-    // playback advances. The page's own description of the broadcast is what separates them.
-    const lb = document.querySelector('meta[itemprop="isLiveBroadcast"]');
-    const live = !!lb && String(lb.content || "").toLowerCase() !== "false"
-                 && !document.querySelector('meta[itemprop="endDate"]');
+    // playback advances. The page's player answers for what it is showing now. The page's own
+    // markup (isLiveBroadcast without an endDate) describes what the page first loaded, which on a
+    // site that moves between videos without reloading can be another video altogether, so it is
+    // read only when the player answers nothing. The player's live styling is the last word.
+    const mp = document.querySelector('#movie_player');
+    let live = false, liveSrc = "";
+    try {
+      const pr = mp && mp.getPlayerResponse ? mp.getPlayerResponse() : null;
+      const vd = pr && pr.videoDetails;
+      if (vd) { live = !!vd.isLive; liveSrc = "p"; }
+    } catch (e) {}
+    if (!liveSrc) {
+      const lb = document.querySelector('meta[itemprop="isLiveBroadcast"]');
+      if (lb) {
+        live = String(lb.content || "").toLowerCase() !== "false"
+               && !document.querySelector('meta[itemprop="endDate"]');
+        liveSrc = "m";
+      }
+    }
+    if (!live && mp && mp.classList && mp.classList.contains("ytp-live")) { live = true; liveSrc += "c"; }
     // A running broadcast's media element reports a runtime that is a placeholder, so how far behind
     // the edge it is being watched cannot be taken from it: on one stream it read as 188 days, on
     // another as fourteen hours, and neither moved with playback. The page's own player keeps the
     // seekable bounds that do mean something, and says whether it is sitting at the edge at all.
     let behind = 0, atEdge = false, dvrWindow = 0;
     try {
-      const mp = document.querySelector('#movie_player');
       const ps = mp && mp.getProgressState ? mp.getProgressState() : null;
       if (ps && isFinite(ps.seekableEnd) && isFinite(ps.current)) {
         behind = Math.max(0, ps.seekableEnd - ps.current);
@@ -750,27 +765,29 @@ async function readPageMedia(tabId) {
         if (a > bestArea) { bestArea = a; bestT = v.currentTime || 0; bestD = v.duration || 0; }
       }
     }
-    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, behind, atEdge, dvrWindow };
+    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, liveSrc, behind, atEdge, dvrWindow };
   };
   // In the page's own world, where a player that answers for its live bounds is reachable: those are
   // methods the page script hangs on its element, and an isolated world sees the element without
   // them. The media element itself reads the same either way, so a world that cannot be had costs
   // only the live bounds.
-  let res;
+  let res, err = "";
+  const why = (e) => String((e && e.message) || e).slice(0, 60);
   try {
     res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, world: "MAIN", func: probe });
-  } catch {
+  } catch (e1) {
+    err = why(e1);
     try {
       res = await browser.scripting.executeScript({ target: { tabId }, world: "MAIN", func: probe });
     } catch {
       try { res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: probe }); }
       catch {
         try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
-        catch { return { url: "", blobOnly: false }; }
+        catch (e4) { return { url: "", blobOnly: false, err: err + "|" + why(e4) }; }
       }
     }
   }
-  let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false;
+  let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false, liveSrc = "";
   let behind = 0, atEdge = false, dvrWindow = 0;
   for (const f of res || []) {
     const r = f && f.result;
@@ -778,14 +795,14 @@ async function readPageMedia(tabId) {
     if (r.url && r.area > area) { area = r.area; url = r.url; }
     if (r.t > t) { t = r.t; d = r.d || 0; }   // the runtime of the frame the position came from
     blobOnly = blobOnly || !!r.blobOnly;
-    live = live || !!r.live;              // the frame carrying the page's own markup is the one that knows
+    if (r.live && !live) { live = true; liveSrc = r.liveSrc || ""; }   // the frame carrying the page's own player is the one that knows
     if (r.behind > behind) { behind = r.behind; atEdge = !!r.atEdge; }
     else if (r.atEdge) atEdge = true;
     // The page reports the window wherever its player sits, the edge included, where how far behind
     // it is reads as zero.
     if ((r.dvrWindow || 0) > dvrWindow) dvrWindow = r.dvrWindow;
   }
-  return { url, blobOnly, t, d, live, behind, atEdge, dvrWindow };
+  return { url, blobOnly, t, d, live, liveSrc, behind, atEdge, dvrWindow, err, frames: (res || []).length };
 }
 
 // Read off the path, so a signed query string does not hide the extension.
@@ -809,7 +826,7 @@ async function castCurrentTab() {
   const tb = await activeTab();
   const url = tb.url || "";
   const quality = qCtx.quality.value || "best";
-  let media = "", headers = "", medias = "", ladder = "", dvrRec = "";
+  let media = "", headers = "", medias = "", ladder = "", dvrRec = "", pgNote = "";
   const supplied = manualMedia();
   // A supplied address is unrelated to the open page, so the tab's title names the wrong thing; sent
   // empty, the helper reads a title off the page url, which is the tab again. So send a fixed label.
@@ -856,6 +873,14 @@ async function castCurrentTab() {
     // the helper tells the recording apart from the live window by content, and only then offers a
     // rewind. Watching live stays on the low-latency edge either way.
     dvrRec = await tabRecording(tb.id);
+    // Read the page again now: what it shows may have moved since the picker was drawn, and a
+    // popup opened onto a running cast never drew it at all.
+    const pm = await readPageMedia(tb.id);
+    pageLive = !!pm.live;
+    pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
+    pageWindow = pageLive ? (pm.dvrWindow || 0) : 0;
+    pgNote = `/f${pm.frames || 0}/${pm.liveSrc || "-"}/w${Math.floor(pm.dvrWindow || 0)}/b${Math.floor(pm.behind || 0)}`
+      + (pm.atEdge ? `/edge` : ``) + (pm.err ? `/${pm.err}` : ``);
   }
   // A YouTube broadcast that keeps a window behind its edge is cast as that window wherever the page
   // sits, so the television can move back through it even when the cast opens at the edge.
@@ -874,7 +899,9 @@ async function castCurrentTab() {
       (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``) +
       (!dvrRec && castFrom > 0 ? `&start=${Math.floor(castFrom)}` : ``) +
       (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``) +
-      (castWindow ? `&window=${Math.floor(pageWindow)}` : ``);
+      (castWindow ? `&window=${Math.floor(pageWindow)}` : ``) +
+      // what the page reported, for the helper's log
+      `&pg=${encodeURIComponent(`${pageLive ? 1 : 0}/${Math.floor(pageBehind)}/${Math.floor(pageWindow)}${pgNote}`)}`;
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
