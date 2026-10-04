@@ -988,9 +988,58 @@ def transport_state(control_url):
         return f"err:{e}"
 
 
+class _TsPace:
+    """Media seconds an MPEG-TS stream has delivered, read off the presentation timestamps of its
+    elementary streams, so delivery can be held against the wall clock: a source that delivers
+    less media than the time that passes is starving the player. Each PID is clocked by the
+    highest timestamp seen on it, which rides out the reordering of video frames; a timestamp that
+    jumps back or leaps ahead is a discontinuity and restarts that count without adding to it. The
+    stream's media is the most any one PID has delivered."""
+    def __init__(self):
+        self.buf = b""
+        self.clocks = {}        # pid -> [highest timestamp seen, media counted]
+
+    @property
+    def media(self):
+        return max((c[1] for c in self.clocks.values()), default=0.0)
+
+    def feed(self, chunk):
+        b = self.buf + chunk
+        i = 0
+        n = len(b)
+        while i + 188 <= n:
+            if b[i] != 0x47 or (i + 188 < n and b[i + 188] != 0x47):
+                i += 1
+                continue
+            if b[i + 1] & 0x40:                              # a payload unit starts here
+                afc = (b[i + 3] >> 4) & 0x3
+                p = i + 4 + (1 + b[i + 4] if afc & 0x2 else 0)
+                if afc & 0x1 and p + 14 <= i + 188 and b[p] == 0 and b[p + 1] == 0 and b[p + 2] == 1 \
+                        and (b[p + 7] & 0x80) and b[p + 8] >= 5:
+                    pts = (((b[p + 9] & 0x0E) << 29) | (b[p + 10] << 22) | ((b[p + 11] & 0xFE) << 14)
+                           | (b[p + 12] << 7) | (b[p + 13] >> 1)) / 90000.0
+                    pid = ((b[i + 1] & 0x1F) << 8) | b[i + 2]
+                    c = self.clocks.get(pid)
+                    if c is None:
+                        self.clocks[pid] = [pts, 0.0]
+                    elif pts > c[0]:
+                        if pts - c[0] < 30:
+                            c[1] += pts - c[0]
+                        c[0] = pts
+                    elif c[0] - pts > 2:
+                        c[0] = pts                           # jumped back: a new timeline
+            i += 188
+        self.buf = b[i:]
+
+
+_PUSH = {"sent": 0, "media": 0.0, "queued": 0, "since": 0.0}   # the live push's last state, for the stop log
+
+
 # --- Live MPEG-TS HTTP server (DLNA push) ------------------------------------
 # Live HTTP server: serves the stream as non-seekable live, fresh per connect.
-def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_ref=None):
+def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_ref=None, remux=""):
+    # remux: path to ffmpeg, when the source's transport stream is to be rewritten on the way
+    # through (a stream carrying no PCR clock, which a television's demuxer may not play for long).
     # hold_ref, if given, is a 1-element list whose value the adaptive monitor mutates at runtime;
     # the writer reads it each iteration so the hold-delay depth can grow/shrink live. Falls back
     # to the fixed `hold` when absent (e.g. the DLNA path).
@@ -1033,7 +1082,6 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_r
             log(f"TV connected ({self.client_address[0]}) -> streamlink target: {_redact_url(target)} "
                 f"(continuous live, hold={_hold():.0f}s)")
             self._send_live_headers()
-            cmd = _streamlink_cmd(*sl_flags, *extra_sl, "--stdout", "--", target, quality)
             # DLNA-faithful robustness, in two parts:
             #  (1) ONE HTTP response kept open indefinitely; a READER thread RESPAWNS streamlink
             #      across its restarts instead of ending the response when the source hiccups.
@@ -1049,51 +1097,95 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_r
             done = threading.Event()          # set when the source is dead OR the client left
             MAXQ = 64 * 1024 * 1024
             state = {"grand": 0, "gen": 0, "reader_bytes": 0}
+            cmd = _streamlink_cmd(*sl_flags, *extra_sl, "--stdout", "--", target, quality)
 
             def reader():
                 duds = 0
                 while not done.is_set():
                     state["gen"] += 1
                     errf = tempfile.TemporaryFile()
+                    ff = None
                     try:
                         sl = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
                                               creationflags=NO_WINDOW)
+                        if remux:
+                            # The stream is rewritten on the way through: same codecs, a fresh
+                            # transport layer with a PCR clock and regular tables.
+                            ff = subprocess.Popen([remux, "-v", "error", "-nostdin",
+                                                   "-probesize", "1000000", "-analyzeduration", "1000000",
+                                                   "-i", "pipe:0", "-c", "copy", "-f", "mpegts",
+                                                   "-muxdelay", "0", "-muxpreload", "0",
+                                                   "-flush_packets", "1", "pipe:1"],
+                                                  stdin=sl.stdout, stdout=subprocess.PIPE, stderr=errf,
+                                                  creationflags=NO_WINDOW)
+                            sl.stdout.close()         # leaves ffmpeg as the only reader of streamlink
                     except Exception as e:
                         log(f"proxy: streamlink spawn failed: {type(e).__name__}: {str(e)[:80]}")
                         break
+                    out = ff.stdout if ff else sl.stdout
                     seg = 0
+                    _run_t0 = time.monotonic()
+                    pace, _checked, _warned = _TsPace(), 0.0, 0.0
                     try:
                         while not done.is_set():
-                            chunk = sl.stdout.read(188 * 350)
+                            chunk = out.read(188 * 350)
                             if not chunk:
                                 break                     # streamlink ended -> respawn at live edge
                             with qlock:
                                 Q.append((time.monotonic(), chunk))
                                 state["reader_bytes"] += len(chunk)
-                                over = state["reader_bytes"]  # trim if the queue balloons
-                                while Q and over > MAXQ:
-                                    over -= len(Q.popleft()[1])
-                                state["reader_bytes"] = over
+                                # The queue holds what the client has not taken yet; past the cap
+                                # the oldest of it goes, so a client that stopped reading cannot
+                                # grow it without bound.
+                                while Q and state["reader_bytes"] > MAXQ:
+                                    state["reader_bytes"] -= len(Q.popleft()[1])
                             seg += len(chunk)
+                            pace.feed(chunk)
+                            _PUSH["media"] = pace.media
+                            _PUSH["queued"] = state["reader_bytes"]
+                            # Media delivered against time passed. Once a minute the run's pace
+                            # is logged, and a source more than 6s behind the clock is named as
+                            # starving the player: nothing here can make it deliver faster, and a
+                            # restart would only leave the player without data for longer.
+                            _now = time.monotonic()
+                            _ran = _now - _run_t0
+                            if _ran >= 15 and _now - _checked >= 5:
+                                _checked = _now
+                                _lag = _ran - pace.media
+                                if _now - state.get("paced", 0.0) >= 60:
+                                    state["paced"] = _now
+                                    log(f"proxy: run {state['gen']} delivered {pace.media:.0f}s of media in "
+                                        f"{_ran:.0f}s ({seg * 8 / _ran / 1e6:.1f} Mbit/s)")
+                                if _lag > 6 and pace.media > 0 and _now - _warned >= 30:
+                                    _warned = _now
+                                    log(f"proxy: the source is starving the player: {pace.media:.0f}s of "
+                                        f"media in {_ran:.0f}s ({seg * 8 / _ran / 1e6:.1f} Mbit/s)")
                     finally:
-                        try:
-                            sl.terminate()
+                        for proc in (sl, ff):
+                            if proc is None:
+                                continue
                             try:
-                                sl.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                sl.kill(); sl.wait()
-                        except Exception:
-                            pass
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=2)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill(); proc.wait()
+                            except Exception:
+                                pass
                         try:
-                            if sl.stdout:
-                                sl.stdout.close()
+                            out.close()
                         except Exception:
                             pass
-                        if seg < 100000:
+                        if seg < 100000 or not done.is_set():
+                            # A run that ends on its own, however much it delivered, says why on its
+                            # stderr: that and its pace tell a starved source from a dropped one.
                             try:
                                 errf.seek(0)
-                                err = errf.read().decode("utf-8", "replace").strip()[-400:]
-                                log(f"proxy: streamlink run {state['gen']} produced {seg}B (source hiccup) {err[-160:]}")
+                                err = errf.read().decode("utf-8", "replace").strip()
+                                _tail = " | ".join(ln.strip() for ln in err.splitlines()[-3:])[-240:]
+                                _secs = max(0.1, time.monotonic() - _run_t0)
+                                log(f"proxy: streamlink run {state['gen']} ended on its own after {_secs:.0f}s, "
+                                    f"{seg // 1024}KB ({seg * 8 / _secs / 1e6:.1f} Mbit/s) {_tail}")
                             except Exception:
                                 pass
                         try:
@@ -1118,19 +1210,32 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_r
             # "arrived >= hold ago" cutoff keeps advancing through the reserve already in Q, so the
             # server KEEPS FEEDING the receiver and it never underruns for stalls shorter than hold.
             # No receiver-side seeking needed (that fought mpegts and caused reload storms).
+            _PUSH.update(sent=0, media=0.0, queued=0, since=time.monotonic())
+            _told = time.monotonic()
             try:
                 while True:
                     cutoff = time.monotonic() - _hold()
                     out = []
                     with qlock:
                         while Q and (Q[0][0] <= cutoff or done.is_set()):
-                            out.append(Q.popleft()[1])
+                            c = Q.popleft()[1]
+                            state["reader_bytes"] -= len(c)
+                            out.append(c)
                             if len(out) >= 64:
                                 break
                     if out:
                         for c in out:
                             self.wfile.write(c)
                             state["grand"] += len(c)
+                        _PUSH["sent"] = state["grand"]
+                    if time.monotonic() - _told >= 60:
+                        # What the television has taken against what the source delivered: a
+                        # queue that grows is a television that is not keeping up.
+                        _told = time.monotonic()
+                        _el = _told - _PUSH["since"]
+                        log(f"proxy: television took {state['grand'] // 1024}KB in {_el:.0f}s "
+                            f"({state['grand'] * 8 / max(1.0, _el) / 1e6:.1f} Mbit/s); source delivered "
+                            f"{_PUSH['media']:.0f}s of media; {state['reader_bytes'] // 1024}KB waiting")
                     elif done.is_set():
                         break                 # source dead and reserve drained
                     else:
@@ -5534,9 +5639,15 @@ def run_proxy(args):
         atexit.register(lambda p=cfg: _safe_unlink(p))
     if args.insecure:
         extra_sl += ["--http-no-ssl-verify"]
-    httpd = ThreadingHTTPServer((ip, args.port), make_handler(target, args.quality, sl_flags, extra_sl, tv=args.tv))
+    # YouTube's live segments carry no PCR clock, and a television's demuxer may not play such a
+    # stream for long; rewritten through ffmpeg on the way, the stream gets a clock and regular
+    # tables with the same codecs.
+    _remux = _ffmpeg_bin() if any(h in (args.url or "") for h in ("youtube.com", "youtu.be")) else None
+    httpd = ThreadingHTTPServer((ip, args.port), make_handler(target, args.quality, sl_flags, extra_sl, tv=args.tv,
+                                                              remux=_remux or ""))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    log(f"live HTTP server at {local_url} (live-edge={args.live_edge}, quality={args.quality})")
+    log(f"live HTTP server at {local_url} (live-edge={args.live_edge}, quality={args.quality}"
+        + (", remuxed with a clock" if _remux else "") + ")")
     set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}")
     log("pushed (live). Ctrl+C stops the server and playback.")
     played, gone, retries = False, 0, 0
@@ -5551,7 +5662,11 @@ def run_proxy(args):
                 gone += 1                        # not playing after it started
                 if gone >= 3:  # ~6s
                     if st in ("STOPPED", "NO_MEDIA"):
-                        log("TV stopped externally; shutting down proxy")  # clean stop -> user stopped
+                        _el = time.monotonic() - _PUSH["since"] if _PUSH["since"] else 0.0
+                        log("TV stopped externally; shutting down proxy"    # clean stop -> user stopped
+                            + (f" (it took {_PUSH['sent'] // 1024}KB in {_el:.0f}s; the source had delivered "
+                               f"{_PUSH['media']:.0f}s of media; {_PUSH['queued'] // 1024}KB were waiting)"
+                               if _PUSH["since"] else ""))
                         break
                     # st unreadable/error -> renderer briefly unreachable (a connection blip, not a
                     # deliberate stop) -> re-push a few times before giving up, so it recovers.

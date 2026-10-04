@@ -463,8 +463,12 @@ async function refreshStartRow() {
   // A running broadcast has no beginning to offer: what it keeps reaches back only so far, and how
   // far is the source's answer, not the page's.
   $("startAtZero").hidden = !!pageLive;
-  row.hidden = !(rec || atPos);
-  $("castRow").hidden = !!(rec || atPos);
+  // A device reached over DLNA takes a continuous stream of the live edge and nothing else, so
+  // the points to start from are offered only to a device that plays through the receiver.
+  const dev = deviceMap.get(selectedId) && deviceMap.get(selectedId).device;
+  const offers = !!(dev && dev.kind === "cast") && (rec || atPos);
+  row.hidden = !offers;
+  $("castRow").hidden = !!offers;
 }
 
 async function showPicker() {
