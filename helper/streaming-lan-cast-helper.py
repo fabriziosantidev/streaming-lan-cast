@@ -3609,6 +3609,55 @@ def _resolve_youtube(page_url, max_h=2160, itag=None, codecs="avc"):
                     if v.get("format_id") and a.get("format_id") else "")}
 
 
+def _youtube_format_urls(page_url, format_ids):
+    """Newly issued source URLs for the given yt-dlp format ids of a YouTube video ({id: url}; ids
+    it no longer lists are left out). Empty when yt-dlp is unavailable or the extraction fails."""
+    cmd = _ytdlp_cmd()
+    if not cmd:
+        return {}
+    try:
+        out = subprocess.run(cmd + ["-J", "--no-warnings", "--no-playlist", "--", page_url],
+                             capture_output=True, text=True, timeout=45, creationflags=NO_WINDOW)
+        fmts = json.loads(out.stdout or "").get("formats") or []
+    except Exception as e:
+        log(f"cast: yt-dlp re-resolve failed: {type(e).__name__}: {str(e)[:80]}")
+        return {}
+    want = {str(i) for i in format_ids}
+    return {str(f["format_id"]): f["url"] for f in fmts
+            if str(f.get("format_id")) in want and f.get("url") and f.get("protocol") == "https"}
+
+
+def _dash_url_refresher(page_url, format_ids, upstreams, min_gap=10.0):
+    """refresh(path, stale_url) for _make_dash_server over a YouTube video: re-resolves the formats
+    behind upstreams (path -> source URL; format_ids: path -> yt-dlp format id) and swaps in the new
+    URL of each file whose byte length is unchanged (the manifest's byte ranges hold only for the
+    same file). Fetches refused together share one re-resolve, and a new one runs at most every
+    min_gap seconds. Returns the URL to retry on, or None when there is none."""
+    lock = threading.Lock()
+    last = [0.0]
+    def _clen(u):
+        return urllib.parse.parse_qs(urllib.parse.urlparse(u).query).get("clen", [""])[0]
+    def refresh(path, stale):
+        with lock:
+            cur = upstreams.get(path)
+            if cur and cur != stale:
+                return cur                     # another refused fetch already brought a new one
+            if time.monotonic() - last[0] < min_gap:
+                return None
+            last[0] = time.monotonic()
+            got = _youtube_format_urls(page_url, format_ids.values())
+            renewed = 0
+            for p, fid in format_ids.items():
+                new = got.get(str(fid))
+                if new and _clen(new) == _clen(upstreams.get(p, "")):
+                    upstreams[p] = new
+                    renewed += 1
+            log(f"cast: re-resolved the youtube urls ({renewed}/{len(format_ids)} renewed)")
+            new = upstreams.get(path)
+            return new if new != stale else None
+    return refresh
+
+
 def _probe_dash_ranges(url, ua):
     """Locate the header and index of a DASH mp4 by fetching its first bytes and walking the box
     tree. Returns (init_end, index_start, index_end) byte offsets (init = ftyp+moov, index = sidx),
@@ -3676,12 +3725,14 @@ def _build_mpd(duration, vlist, a):
     return "\n".join(out)
 
 
-def _make_dash_server(mpd_text, upstreams, ua, tv=""):
+def _make_dash_server(mpd_text, upstreams, ua, tv="", refresh=None):
     """DASH endpoint for the receiver: serves manifest.mpd and forwards ranged fetches of the DASH
     files (upstreams: local path -> source URL) to the source CDN, so fragments stream on demand (a
     seek anywhere lands with one range request; nothing is fetched ahead). Reachable only by the
     cast target + loopback. Range is not a CORS-safelisted request header, so OPTIONS preflights
-    are answered too."""
+    are answered too. When the source refuses a URL (403/410), refresh(path, url) gets a new URL for
+    the same file and the fetch is retried once on it. The receiver then sees one slow fragment
+    instead of an error that stops playback."""
     class _DashHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         def log_message(self, *a):
@@ -3730,7 +3781,14 @@ def _make_dash_server(mpd_text, upstreams, ua, tv=""):
                 except Exception:
                     pass
             try:
-                r = urllib.request.urlopen(urllib.request.Request(up, headers=hdrs), timeout=20)
+                try:
+                    r = urllib.request.urlopen(urllib.request.Request(up, headers=hdrs), timeout=20)
+                except urllib.error.HTTPError as e:
+                    fresh = refresh(path, up) if refresh and e.code in (403, 410) else None
+                    if not fresh:
+                        raise
+                    log(f"cast: DASH {path} refused by the source: {e.code}; retrying on a new url")
+                    r = urllib.request.urlopen(urllib.request.Request(fresh, headers=hdrs), timeout=20)
             except urllib.error.HTTPError as e:
                 log(f"cast: DASH {path} refused by the source: {e.code}")
                 _refuse(e.code)
@@ -4360,7 +4418,8 @@ def run_cast(args):
     _tc_dur = None      # source duration (s) when transcoding: declare the full timeline for instant seek
     _tc_state = None    # transcode server state (current encoder proc + seek-restart epochs)
     _yt_fname = "full.mp4"   # the downloaded file's name in the serve dir (extension per container)
-    _yt_dash = None     # (mpd, video_url, audio_url, ua) when YouTube is served as on-demand DASH
+    _yt_dash = None     # (mpd, upstreams, ua) when YouTube is served as on-demand DASH
+    _yt_refresh = None  # gets new DASH source URLs when the source refuses the current ones
     if ("youtube.com" in _page) or ("youtu.be" in _page):
         # A YouTube VOD is served as on-demand DASH: the receiver gets the complete timeline at once
         # (total duration + free seek from the first second) and every fragment is range-fetched from
@@ -4380,6 +4439,7 @@ def run_cast(args):
             if yt and yt.get("kind") == "vod" and float(yt.get("duration") or 0) > 0:
                 _ar = _probe_dash_ranges(yt["audio"], yt["ua"])
                 _vlist, _ups = [], {"/audio.mp4": yt["audio"]}
+                _fids = {"/audio.mp4": yt["a"].get("format_id")}
                 for _vf in (yt["v"], yt.get("v_avc")):
                     if not _vf:
                         continue
@@ -4387,10 +4447,13 @@ def run_cast(args):
                     if _vr:
                         _vf["_ranges"] = _vr
                         _ups[f"/video{len(_vlist)}.mp4"] = _vf["url"]
+                        _fids[f"/video{len(_vlist)}.mp4"] = _vf.get("format_id")
                         _vlist.append(_vf)
                 if _vlist and _ar:
                     yt["a"]["_ranges"] = _ar
                     _yt_dash = (_build_mpd(yt["duration"], _vlist, yt["a"]), _ups, yt["ua"])
+                    _yt_refresh = _dash_url_refresher(
+                        _page, {k: v for k, v in _fids.items() if v}, _ups)
                     _hs = "+".join(f"{int(_vf.get('height') or 0)}p" for _vf in _vlist)
                     log(f"cast: youtube VOD -> on-demand DASH ({_hs}, full timeline)")
                 else:
@@ -4536,7 +4599,8 @@ def run_cast(args):
             httpd.shutdown(); _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
         log(f"transcode DASH at {hls_url} -> cast (VOD, instant seek) to {args.cast_name or args.tv}")
     elif _yt_dash is not None:
-        httpd = ThreadingHTTPServer((ip, args.port), _make_dash_server(*_yt_dash, tv=args.tv))
+        httpd = ThreadingHTTPServer((ip, args.port), _make_dash_server(*_yt_dash, tv=args.tv,
+                                                                       refresh=_yt_refresh))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         _is_vod, _stream_type = True, "BUFFERED"
         _ct_load = "application/dash+xml"
@@ -4802,6 +4866,7 @@ def run_cast(args):
     MAX_MID_RELOADS = 3
     playing_since = 0.0            # start of the current uninterrupted playing stretch
     err_changed_at = 0.0           # when the receiver's error report last changed
+    seen_t = (0.0, "")             # last playhead the receiver reported under a playing load, and its source
     # Rewind support: the switch between the live edge and the recording is one player LOAD inside
     # this running cast. sw=1 tells the receiver to keep the screen as is instead of showing the
     # loading logo, so the swap reads as a brief gap, not a restart.
@@ -4852,6 +4917,13 @@ def run_cast(args):
                 mid_reloads = 0        # a long stable stretch earns the recoveries back
         else:
             playing_since = 0.0
+        if played and st in ("playing", "buffering", "paused"):
+            try:
+                _t = float(slc.last.get("t") or 0)
+            except (TypeError, ValueError):
+                _t = 0.0
+            if _t > 0:
+                seen_t = (_t, cur_src)
         # Full-seek hand-off: the parallel download landing a complete local .mp4 (served with byte
         # ranges), or the remux finishing (#EXT-X-ENDLIST -> finite HLS), turns the cast into a real
         # VOD. Re-send the LOAD resuming at the current position so the receiver shows the total
@@ -4998,10 +5070,15 @@ def run_cast(args):
                     pos = float(mc.status.current_time or 0)
                 except Exception:
                     pos = 0.0
+            if not pos and _yt_dash is not None and seen_t[1] == cur_src:
+                # an errored load reports no position of its own; resume the video where the
+                # receiver last reported playing it
+                pos = seen_t[0]
             if not _on_dvr:
                 cur_src = "live"       # a failed recording with no edge to keep falls back to one
             log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading the "
-                f"{'recording' if _on_dvr else 'live edge'} ({mid_reloads}/{MAX_MID_RELOADS})"
+                f"{'recording' if _on_dvr else ('video' if _is_vod else 'live edge')} "
+                f"({mid_reloads}/{MAX_MID_RELOADS})"
                 + (f" at t={int(pos)}s" if pos else ""))
             try:
                 if pos:
