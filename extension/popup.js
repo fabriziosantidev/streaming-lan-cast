@@ -33,7 +33,7 @@ let castFrom = -1;       // a point inside the recording to open the cast at, -1
 const qCtx = { quality: { value: "best", matrix: [], qualities: [] }, castQuality: { value: "best", matrix: [], qualities: [], url: "" } };
 let authToken = "";           // per-install secret shared with the helper (set in options)
 const deviceMap = new Map();
-const elMap = new Map();
+
 const RECAST_SUPPRESS_MS = 11000;   // ignore casting:false this long after a re-cast (helper relaunch grace)
 const RECAST_REENABLE_MS = 4000;    // re-enable the dropdown after this (proxy is up by then)
 
@@ -475,7 +475,7 @@ async function showPicker() {
   setLive(false);
   view("picker");
   qCtx.castQuality.url = ""; qCtx.castQuality.value = "best";   // reset casting-view menu tracking
-  deviceMap.clear(); elMap.clear(); $("devices").replaceChildren();
+  deviceMap.clear(); rowMap.clear(); $("devices").replaceChildren();
   selectedId = (await browser.storage.local.get("lastDevice")).lastDevice || null;
   const tb = await activeTab();
   if ((tb.url || "") !== activeUrl) { recUrl = ""; recTried = 0; }   // another page, another recording
@@ -503,56 +503,107 @@ async function scanLoop() {
   scanTimer = setTimeout(scanLoop, 1200);
 }
 
+// A device reachable more than one way (Cast and DLNA) comes as one entry per way, sharing a
+// group. The list shows one row per group; a row with two ways carries a chooser, and the
+// selection is always one entry, so the cast goes out the chosen way.
+const rowMap = new Map();      // group -> row element
+const wayPick = new Map();     // group -> kind last chosen for it
+function groupOf(d) { return d.group || d.id; }
+function entriesOf(group) {
+  return [...deviceMap.values()].map(r => r.device).filter(d => groupOf(d) === group);
+}
+function pickedEntry(group) {
+  const es = entriesOf(group);
+  if (!es.length) return null;
+  const want = wayPick.get(group);
+  return es.find(d => want && d.kind === want) || es.find(d => d.preferred) || es[0];
+}
 function mergeDevices(found) {
   const ids = new Set(found.map(d => d.id));
   for (const [id, rec] of [...deviceMap]) {
     if (ids.has(id)) rec.misses = 0;
-    else { rec.misses++; if (rec.misses >= 2) { removeDeviceEl(id); deviceMap.delete(id); if (selectedId === id) selectedId = null; } }
+    else { rec.misses++; if (rec.misses >= 2) { deviceMap.delete(id); if (selectedId === id) selectedId = null; } }
   }
   for (const d of found) {
-    if (deviceMap.has(d.id)) { deviceMap.get(d.id).device = d; updateDeviceEl(d); }
-    else { deviceMap.set(d.id, { device: d, misses: 0 }); addDeviceEl(d); }
+    if (deviceMap.has(d.id)) deviceMap.get(d.id).device = d;
+    else deviceMap.set(d.id, { device: d, misses: 0 });
   }
-  if (!selectedId && deviceMap.size) selectedId = [...deviceMap.keys()][0];
+  const groups = new Set([...deviceMap.values()].map(r => groupOf(r.device)));
+  for (const [g, el] of [...rowMap]) if (!groups.has(g)) { el.remove(); rowMap.delete(g); }
+  for (const g of groups) { if (!rowMap.has(g)) addDeviceEl(g); else updateDeviceEl(g); }
+  if (!selectedId && deviceMap.size) {
+    const first = pickedEntry(groupOf([...deviceMap.values()][0].device));
+    selectedId = first ? first.id : null;
+  }
   refreshSelectionUI(); updatePlaceholder(); castEnabled();
 }
 
-function addDeviceEl(d) {
+function addDeviceEl(group) {
   const lab = document.createElement("label");
-  lab.className = "dev"; lab.dataset.id = d.id;
+  lab.className = "dev"; lab.dataset.group = group;
   const radio = document.createElement("input"); radio.type = "radio"; radio.name = "dev";
-  const name = document.createElement("span"); name.className = "name"; name.textContent = d.name;
-  const model = document.createElement("span"); model.className = "model"; model.textContent = d.model || "";
-  lab.append(radio, name, model);
-  lab.addEventListener("click", () => selectDevice(d.id));
+  const name = document.createElement("span"); name.className = "name";
+  const ways = document.createElement("span"); ways.className = "ways";
+  const model = document.createElement("span"); model.className = "model";
+  lab.append(radio, name, ways, model);
+  lab.addEventListener("click", (e) => {
+    if (e.target.closest(".way")) return;
+    const d = pickedEntry(group); if (d) selectDevice(d.id);
+  });
   $("devices").appendChild(lab);
-  elMap.set(d.id, lab);
+  rowMap.set(group, lab);
+  updateDeviceEl(group);
 }
-function updateDeviceEl(d) {
-  const el = elMap.get(d.id); if (!el) return;
-  el.querySelector(".name").textContent = d.name;
-  el.querySelector(".model").textContent = d.model || "";
+function updateDeviceEl(group) {
+  const el = rowMap.get(group); if (!el) return;
+  const es = entriesOf(group);
+  const shown = (selectedId && es.find(d => d.id === selectedId)) || pickedEntry(group);
+  if (!shown) return;
+  el.querySelector(".name").textContent = shown.name;
+  el.querySelector(".model").textContent = shown.model || "";
+  const ways = el.querySelector(".ways");
+  ways.replaceChildren();
+  if (es.length > 1) {
+    for (const d of es.slice().sort((a, b) => (a.kind === "cast" ? 0 : 1) - (b.kind === "cast" ? 0 : 1))) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "way"; b.dataset.id = d.id;
+      b.textContent = d.kind === "cast" ? "Cast" : "DLNA";
+      b.addEventListener("click", (e) => { e.preventDefault(); wayPick.set(group, d.kind); selectDevice(d.id); });
+      ways.appendChild(b);
+    }
+  }
 }
-function removeDeviceEl(id) { const el = elMap.get(id); if (el) el.remove(); elMap.delete(id); }
+function removeDeviceEl(id) {
+  const rec = deviceMap.get(id); if (!rec) return;
+  deviceMap.delete(id);
+  const g = groupOf(rec.device);
+  if (!entriesOf(g).length) { const el = rowMap.get(g); if (el) el.remove(); rowMap.delete(g); }
+  else updateDeviceEl(g);
+}
 
 function selectDevice(id) {
   selectedId = id;
+  const rec = deviceMap.get(id);
+  if (rec) wayPick.set(groupOf(rec.device), rec.device.kind);
   browser.storage.local.set({ lastDevice: id });
   refreshSelectionUI(); castEnabled();
 }
 function refreshSelectionUI() {
-  for (const [id, el] of elMap) {
-    const sel = id === selectedId;
+  const cur = selectedId && deviceMap.get(selectedId) && deviceMap.get(selectedId).device;
+  for (const [g, el] of rowMap) {
+    const sel = !!cur && groupOf(cur) === g;
     el.classList.toggle("sel", sel);
     const r = el.querySelector("input"); if (r) r.checked = sel;
+    for (const b of el.querySelectorAll(".way")) b.classList.toggle("on", sel && b.dataset.id === selectedId);
+    if (sel) { el.querySelector(".name").textContent = cur.name; el.querySelector(".model").textContent = cur.model || ""; }
   }
 }
 function updatePlaceholder() {
   let ph = $("devices").querySelector(".ph");
-  if (elMap.size === 0 && !ph) {
+  if (rowMap.size === 0 && !ph) {
     ph = document.createElement("div"); ph.className = "ph muted center";
     ph.textContent = t("searching"); $("devices").appendChild(ph);
-  } else if (elMap.size > 0 && ph) ph.remove();
+  } else if (rowMap.size > 0 && ph) ph.remove();
 }
 
 function pickHeader(headers, name) {   // sniffed headers keep original casing; match case-insensitively

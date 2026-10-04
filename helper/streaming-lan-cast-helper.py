@@ -582,14 +582,20 @@ def cached_devices():
         return list(_dev_cache)
 
 
-def peek_device_by_host(host):
+def peek_device_by_host(host, kind=""):
     """A discovered device by host WITHOUT triggering a scan (None if unknown). Lets /cast learn
-    a target's kind (dlna vs cast) + cast details from the warm cache without blocking."""
+    a target's kind (dlna vs cast) + cast details from the warm cache without blocking. A host
+    reachable both ways has an entry per way; `kind` names the one wanted, else the preferred."""
     if not host:
         return None
     with _dev_lock:
         cache = list(_dev_cache) if _dev_scanned else []
-    return next((d for d in cache if d.get("host") == host), None)
+    ways = [d for d in cache if d.get("host") == host]
+    if kind:
+        for d in ways:
+            if d.get("kind") == kind:
+                return d
+    return next((d for d in ways if d.get("preferred")), ways[0] if ways else None)
 
 
 _meta_cache = OrderedDict()
@@ -2040,10 +2046,11 @@ def _remember_cast_host(host):
 
 
 def discover_all_devices():
-    """DLNA (SSDP) + Cast (mDNS) renderers, discovered in parallel and merged. If one physical
-    device exposes BOTH protocols (e.g. an Android TV or a modern TV with Chromecast built-in), keep
-    the Cast entry: it drives the branded receiver (own title, tolerant playback, remote exit) over a
-    plain HLS proxy. Set SLC_PREFER_DLNA=1 to keep the DLNA (MPEG-TS/SOAP) entry instead."""
+    """DLNA (SSDP) + Cast (mDNS) renderers, discovered in parallel and merged. One physical device
+    can answer on both (an Android TV, a modern TV with Chromecast built-in): each way of reaching
+    it is listed as its own entry, the entries of one host share a group, and one of them is marked
+    preferred. Cast is preferred: it drives the branded receiver (own title, tolerant playback,
+    remote exit) over a plain HLS proxy; SLC_PREFER_DLNA=1 prefers the DLNA (MPEG-TS/SOAP) entry."""
     from concurrent.futures import ThreadPoolExecutor
     devs = []
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -2053,41 +2060,35 @@ def discover_all_devices():
                 devs += f.result()
             except Exception:
                 pass
-    prefer_dlna = os.environ.get("SLC_PREFER_DLNA") == "1"   # opt back into the plain DLNA player
-    by_host, extras = {}, []
+    prefer_dlna = os.environ.get("SLC_PREFER_DLNA") == "1"
+    by_host = {}
     for d in devs:
-        h = d.get("host")
-        if not h:
-            extras.append(d)
-            continue
-        cur = by_host.get(h)
-        # When a host exposes both protocols, prefer Cast: it drives the branded receiver instead of
-        # the plain DLNA player. SLC_PREFER_DLNA=1 keeps DLNA (e.g. a source Cast plays back poorly).
-        if prefer_dlna:
-            take = cur is None or (cur.get("kind") == "cast" and d.get("kind") == "dlna")
-        else:
-            take = cur is None or (cur.get("kind") == "dlna" and d.get("kind") == "cast")
-        if take:
-            by_host[h] = d
-    devs = list(by_host.values()) + extras
-    # A TV with Chromecast built-in advertises Cast (mDNS) unreliably and its Cast port sleeps in standby,
-    # so a Cast device can surface over DLNA only. Drive any host known to be a Cast device over Cast (the
-    # branded receiver) regardless - a port that answers now confirms and remembers it; DLNA can't run the
-    # branded receiver, and when the port is asleep the cast reports "turn the TV on" instead of failing
-    # silently on DLNA. pychromecast connects by host:port and fetches the uuid/model itself.
-    if not prefer_dlna:
-        for d in devs:
-            if d.get("kind") == "cast" and d.get("host"):
-                _remember_cast_host(d["host"])
-        known = _cast_hosts()
-        for d in devs:
-            if d.get("kind") == "dlna" and d.get("host") and \
-               (d["host"] in known or _tcp_open(d["host"], 8009, timeout=1.5)):
-                log(f"discover: {d.get('name', d['host'])} is a Cast device -> using Cast over DLNA")
-                d["kind"] = "cast"; d["port"] = 8009
-                _remember_cast_host(d["host"])
-    devs.sort(key=lambda d: d["name"].lower())
-    return devs
+        if d.get("host"):
+            by_host.setdefault(d["host"], {})
+            by_host[d["host"]].setdefault(d.get("kind") or "dlna", d)   # one entry per way of reaching it
+    # A TV with Chromecast built-in advertises Cast (mDNS) unreliably and its Cast port sleeps in
+    # standby, so a Cast device can show up over DLNA only. A host known to be one, or whose Cast
+    # port answers, gets a Cast entry beside its DLNA one; pychromecast connects by host:port
+    # and fetches the uuid/model itself. Its DLNA entry is kept, as the other way of reaching it.
+    for h, ways in by_host.items():
+        if "cast" in ways:
+            _remember_cast_host(h)
+    known = _cast_hosts()
+    for h, ways in by_host.items():
+        if "cast" not in ways and "dlna" in ways and (h in known or _tcp_open(h, 8009, timeout=1.5)):
+            d = ways["dlna"]
+            log(f"discover: {d.get('name', h)} is a Cast device too")
+            ways["cast"] = {"id": "cast:" + h, "name": d["name"], "host": h, "model": d.get("model", ""),
+                            "kind": "cast", "port": 8009}
+            _remember_cast_host(h)
+    out = [d for d in devs if not d.get("host")]
+    for h, ways in by_host.items():
+        for kind, d in ways.items():
+            d["group"] = h
+            d["preferred"] = (kind == ("dlna" if prefer_dlna else "cast")) if len(ways) > 1 else True
+            out.append(d)
+    out.sort(key=lambda d: (d["name"].lower(), d.get("kind") != ("dlna" if prefer_dlna else "cast")))
+    return out
 
 
 def _tcp_open(host, port, timeout=4):
@@ -2541,10 +2542,11 @@ def serve_control(port):
                     log(f"control: probe rejected ({reason}) {_redact_url(media)[:80]} -> {detail[:120]}")
                     self._json({"ok": False, "reason": reason, "error": detail})
                     return
-            # pick the cast protocol: prefer the discovered device's kind, fall back to the hint
-            # the extension sends, default DLNA. For cast, carry the device's connect details.
+            # pick the cast protocol: the way the popup chose, when the device is known to answer
+            # that way; else the discovered device's own kind; default DLNA. For cast, carry the
+            # device's connect details.
             kind = (q.get("kind", [""])[0]).strip().lower()
-            dev = peek_device_by_host(device)
+            dev = peek_device_by_host(device, kind)
             if dev and dev.get("kind"):
                 kind = dev["kind"]
             if kind not in ("cast", "dlna"):

@@ -50,6 +50,10 @@
   label.dev.sel { border-color:var(--sel-border); background:var(--sel-bg); }
   label.dev .name { font-weight:600; }
   label.dev .model { color:var(--muted); font-size:11px; margin-left:auto; }
+  label.dev .ways { display:flex; gap:2px; }
+  label.dev .way { font-size:10px; line-height:1; padding:3px 6px; border:1px solid var(--border);
+                   border-radius:6px; background:transparent; color:var(--muted); cursor:pointer; }
+  label.dev .way.on { border-color:var(--sel-border); color:var(--fg); background:var(--sel-bg); }
   @keyframes fadein { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
   .pickhead { display:flex; align-items:center; justify-content:space-between; gap:8px; }
   .spin { width:13px; height:13px; border:2px solid var(--border); border-top-color:var(--accent);
