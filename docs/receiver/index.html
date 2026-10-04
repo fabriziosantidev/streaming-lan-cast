@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.35';
+    const RX_VERSION = '1.39';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -56,6 +56,10 @@
     // what gets recorded, and a load starts the cast off meaning to play.
     const intent = { paused: false };
     let tcMode = false;   // the current source is the helper's on-the-fly transcode (tc=1)
+    // rpMode: the current source is a replayed live window (rp=1).
+    // rpOpenAt: the position that window's load asked to open at, checked once playback starts
+    // (0 when there is nothing to check).
+    let rpMode = false, rpOpenAt = 0;
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
     // whether audio and video separately cover a seek target (the media element's .buffered only
@@ -128,16 +132,19 @@
         // is tuned like one. Left to the manifest's own suggestion the player holds three segments
         // back, which is most of a minute away from the edge it was asked to sit at.
         const replay = url.indexOf('rp=1') !== -1;
+        rpMode = replay;
+        rpOpenAt = replay ? (Number(req.currentTime) || 0) : 0;
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
           replay ? 6 : (isVod ? 0 : (lowLat ? 3 : 14));
-        playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod) ? 12 : 30;
+        playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod && !replay) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall
         playbackConfig.shakaConfig.streaming.rebufferingGoal = isVod ? 2 : (lowLat ? 1 : 4);
         // Low-latency HLS: fetch the sub-second #EXT-X-PART parts and ride the edge with blocking reloads.
         // Some hosts deliver ALL media through the parts (the full #EXTINF segments are empty markers), so
         // without this Shaka fetches empty segments and never fills its buffer.
-        playbackConfig.shakaConfig.streaming.lowLatencyMode = lowLat && !isVod;
+        // A replayed window is a plain live playlist hours deep, with no parts to ride.
+        playbackConfig.shakaConfig.streaming.lowLatencyMode = lowLat && !isVod && !replay;
         // A locally transcoded source (tc=1) produces segments on the fly and its server holds a
         // request open until the segment exists; give those requests time to be answered instead of
         // aborting at the 5s no-bytes stall cutoff and re-firing each track on its own clock (tracks
@@ -154,6 +161,25 @@
       } catch (e) { stats.lastError = 'load-intercept/' + e.message; }
       return req;
     });
+
+    // Whether the platform's own screen, such as a transport bar it draws over the player, has
+    // the remote: the platform says so with a focus-state message, where it supports one. The
+    // last few keys seen, and whether each was taken here, travel with the status.
+    const focus = { state: '', at: 0, keys: [] };
+    function noteKey(e, taken) {
+      focus.keys.push((e.key || '?') + ':' + (e.keyCode | 0) + (e.isTrusted ? '' : '*') + (taken ? '!' : ''));
+      if (focus.keys.length > 8) focus.keys.shift();
+    }
+    try {
+      const MT = cast.framework.messages.MessageType;
+      if (MT.FOCUS_STATE) {
+        playerManager.setMessageInterceptor(MT.FOCUS_STATE, (req) => {
+          focus.state = String((req && req.state) || '');
+          focus.at = Date.now();
+          return req;
+        });
+      }
+    } catch (e) { stats.lastError = 'focus-intercept/' + e.message; }
 
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
       intent.paused = true;
@@ -196,6 +222,40 @@
     playerManager.addEventListener(EV.PLAYING, () => {
       splash.classList.add('gone');   // hide the loading logo once playback starts
       nudge.starting = false;         // the load's own seek has landed; the playhead is the element's again
+      // A load of a replayed window can name a position inside the window, but a live load may
+      // start at the edge instead. Once it plays, seek to the named position if the playhead is
+      // more than 30s away from it.
+      if (rpOpenAt > 0) {
+        const want = rpOpenAt;
+        rpOpenAt = 0;
+        const v = mediaEl();
+        if (v && Math.abs(v.currentTime - want) > 30) { try { playerManager.seek(want); } catch (e) {} }
+      }
+    });
+
+    // The live range the cast framework holds for the current load, or null when it holds none.
+    function liveRange() {
+      try {
+        const r = playerManager.getLiveSeekableRange && playerManager.getLiveSeekableRange();
+        if (r && isFinite(r.start) && isFinite(r.end) && r.end > r.start) return { start: r.start, end: r.end };
+      } catch (e) {}
+      return null;
+    }
+    // Room kept from the oldest end of a replayed window: that end moves forward a segment at a
+    // time, and a playhead sitting right on it would be overtaken by the next refresh.
+    const WINDOW_FLOOR = 30;
+    // The helper names a point of a replayed window by its distance from the live edge (0 is the
+    // edge, more than the window is its oldest end). The window slides with the broadcast, so the
+    // receiver converts the distance into a position using the live range the cast framework holds
+    // when the message arrives. It then seeks the load that is already playing, with no new LOAD.
+    context.addCustomMessageListener(NS, (ev) => {
+      const d = ev && ev.data;
+      if (!d || d.type !== 'behind') return;
+      const r = liveRange();
+      if (!r) return;
+      const s = Math.max(0, Number(d.s) || 0);
+      const target = s > 0 ? Math.max(r.start + WINDOW_FLOOR, r.end - s) : r.end;
+      try { playerManager.seek(target); } catch (e) {}
     });
 
     // The media element lives inside <cast-media-player>'s shadow root, so a plain tag lookup finds
@@ -332,8 +392,19 @@
         } catch (e) {}
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
+      let ae = null;
+      try {
+        const a = document.activeElement;
+        if (a && a !== document.body && a !== document.documentElement) {
+          ae = a.tagName.toLowerCase() + (a.id ? '#' + a.id : '') + (a.className ? '.' + String(a.className).slice(0, 24) : '');
+          const inner = a.shadowRoot && a.shadowRoot.activeElement;
+          if (inner) ae += '>' + inner.tagName.toLowerCase() + (inner.id ? '#' + inner.id : '') + (inner.className ? '.' + String(inner.className).slice(0, 24) : '');
+        }
+      } catch (e) {}
       try { context.sendCustomMessage(NS, undefined, { type: 'status', state: st, t, buf, cov, b0,
         pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want), lsr,
+        fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
+        ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
     }, 2000);
 
@@ -438,14 +509,14 @@
       barBox = best; barAt = now;
       return best;
     }
-    function showSpeed(tier, frac, at, dir) {
+    function showSpeed(tier, frac, at, dir, behind) {
       // Ride the player's scrubber when it can be located. Its markup is not ours, so when the shape
       // search comes up empty the marks still appear, over the strip the bar occupies.
       const b = scrubberRect();
       const W = innerWidth || 1280, H = innerHeight || 720;
       const box = b && b.width > 0 ? b : { left: W * 0.06, width: W * 0.88, top: H - 86 };
       frac = Math.min(1, Math.max(0, frac || 0));
-      spdT.textContent = hms(at);
+      spdT.textContent = behind ? '-' + hms(at) : hms(at);
       spdA.textContent = (dir < 0 ? '\u25c2' : '\u25b8').repeat(tier);
       spdEl.style.left = Math.round(box.left + box.width * frac) + 'px';
       spdEl.style.top = Math.round(box.top - 6) + 'px';
@@ -453,12 +524,39 @@
       clearTimeout(spdHide);
       spdHide = setTimeout(() => spdEl.classList.remove('on'), 1200);
     }
+    // Whether the remote is on one of the controls the platform lays over the player. That layer
+    // holds the focus whenever it is idle, on an element of its own; a press of down moves it to a
+    // button or to the scrubber, and left and right then move it between them. The platform may
+    // also say outright that the player is not the one in focus. A control still focused once no
+    // key has come from the remote for a while is a leftover rather than navigation.
+    const NAV_IDLE = 8000;
+    let lastRemoteAt = 0;
+    function navFocused() {
+      if (focus.state === 'NOT_IN_FOCUS') return true;
+      const a = document.activeElement;
+      if (!a || a === document.body || a === document.documentElement) return false;
+      const el = (a.shadowRoot && a.shadowRoot.activeElement) || a;
+      if (el === a) return false;
+      if (/\blayer\b/i.test(String(el.className || ''))) return false;
+      return (Date.now() - lastRemoteAt) < NAV_IDLE;
+    }
     function tryAcceleratedSeek(e) {
       const dir = seekKeyDir(e);
       if (!dir) return false;
+      // On the platform's control layer with a button or the scrubber focused, a left or right
+      // press moves between them and goes through as is. Anywhere else it is a skip.
+      if (navFocused()) return false;
       const v = mediaEl();
-      const dur = v && v.duration;
-      if (!v || !isFinite(dur) || dur < 600) return false;   // short or live: leave the player alone
+      if (!v) return false;
+      // A source with a finite duration runs from 0 to that duration. A replayed window runs over
+      // the live range, and its marker reads as time behind the edge. A plain live edge has no range
+      // worth skipping.
+      const dur = v.duration;
+      const r = rpMode ? liveRange() : null;
+      if (rpMode && !r) return false;
+      const lo = r ? r.start + WINDOW_FLOOR : 0;
+      const hi = r ? r.end : (isFinite(dur) ? Math.max(0, dur - 5) : 0);
+      if (hi - lo < 600) return false;   // short or a plain live edge: leave the player alone
       const now = Date.now();
       if (now - lastSeekKey > SEEK_END) { holdFrom = now; lastTick = 0; }   // a fresh press starts small
       lastSeekKey = now;
@@ -467,15 +565,15 @@
         const held = now - holdFrom;
         let tier = 1;                      // one step per threshold passed, so the list sets the pace
         while (tier < SEEK_STEPS.length && held >= SEEK_TIERS[tier - 1]) tier++;
-        const target = Math.min(Math.max(0, v.currentTime + dir * SEEK_STEPS[tier - 1]),
-                                Math.max(0, dur - 5));
+        const target = Math.min(Math.max(lo, v.currentTime + dir * SEEK_STEPS[tier - 1]), hi);
         // Seek through the player, not the media element: its own clock, scrubber and time readout
         // follow what it was told to do, and a raw element write leaves all three behind.
         try { playerManager.seek(target); } catch (x) {
           try { v.currentTime = target; } catch (y) {}
         }
         wakeControls();
-        showSpeed(tier, target / dur, target, dir);
+        if (r) showSpeed(tier, (target - lo) / (hi - lo), hi - target, dir, true);
+        else showSpeed(tier, target / dur, target, dir, false);
         // Once the gesture is over, a hair's move re-fires seeking with no gesture in flight, which
         // is what runs the track alignment above on where the seek actually settled.
         clearTimeout(settleTimer);
@@ -505,7 +603,9 @@
     let lastKeyAt = 0;
     window.addEventListener('keydown', (e) => {
       const controlsVisible = (Date.now() - lastKeyAt) < 4500;
-      if (tryAcceleratedSeek(e)) { lastKeyAt = Date.now(); return; }
+      if (e.isTrusted) lastRemoteAt = Date.now();
+      if (tryAcceleratedSeek(e)) { noteKey(e, true); lastKeyAt = Date.now(); return; }
+      noteKey(e, false);
       if (isBackKey(e)) {
         if (controlsVisible) {
           lastKeyAt = 0;                           // controls hide now; a later BACK (hidden) will exit
