@@ -779,8 +779,11 @@ async function readPageMedia(tabId) {
     if (r.t > t) { t = r.t; d = r.d || 0; }   // the runtime of the frame the position came from
     blobOnly = blobOnly || !!r.blobOnly;
     live = live || !!r.live;              // the frame carrying the page's own markup is the one that knows
-    if (r.behind > behind) { behind = r.behind; dvrWindow = r.dvrWindow || 0; atEdge = !!r.atEdge; }
+    if (r.behind > behind) { behind = r.behind; atEdge = !!r.atEdge; }
     else if (r.atEdge) atEdge = true;
+    // The page reports the window wherever its player sits, the edge included, where how far behind
+    // it is reads as zero.
+    if ((r.dvrWindow || 0) > dvrWindow) dvrWindow = r.dvrWindow;
   }
   return { url, blobOnly, t, d, live, behind, atEdge, dvrWindow };
 }
@@ -854,6 +857,10 @@ async function castCurrentTab() {
     // rewind. Watching live stays on the low-latency edge either way.
     dvrRec = await tabRecording(tb.id);
   }
+  // A YouTube broadcast that keeps a window behind its edge is cast as that window wherever the page
+  // sits, so the television can move back through it even when the cast opens at the edge.
+  const castWindow = !dvrRec && !supplied && pageWindow > 0
+    && (castBehind > 0 || (pageLive && replayableLive(url)));
   try {
     // POST: the captured request headers (incl. Cookie) go in the body, never the URL/query.
     const body =
@@ -867,7 +874,7 @@ async function castCurrentTab() {
       (dvrRec && castFrom >= 0 ? `&dvrstart=${Math.floor(castFrom)}` : ``) +
       (!dvrRec && castFrom > 0 ? `&start=${Math.floor(castFrom)}` : ``) +
       (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``) +
-      (!dvrRec && castBehind > 0 && pageWindow > 0 ? `&window=${Math.floor(pageWindow)}` : ``);
+      (castWindow ? `&window=${Math.floor(pageWindow)}` : ``);
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
