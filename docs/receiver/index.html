@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.42';
+    const RX_VERSION = '1.47';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -63,6 +63,61 @@
     // rpEdge: the window's load asked for its live edge; once it plays, the receiver seeks back to the
     // edge, since buffering the first segments leaves the playhead behind by however long that took.
     let rpEdge = false;
+    // llMode: the load carries the low-latency tag; edgeSync holds a replayed window with such a
+    // tail at its edge.
+    let llMode = false;
+    // guardMode: the load asked the receiver to take media commands from its own senders alone.
+    // ownSenders are the senders that loaded the cast or spoke on this receiver's own namespace
+    // (the helper, under whichever connection it has); cmds keeps the last few media commands
+    // with where each came from, for the helper's log: L for this page itself, - for the
+    // platform, H: for an own sender, X: for any other, ? where the sender could not be read.
+    let guardMode = false;
+    const ownSenders = new Set();
+    const cmds = [];
+    function who() {
+      if (reqSender == null) return '?';
+      if (reqSender === '') return '-';
+      if (reqSender === LOCAL_SENDER) return 'L';
+      return (ownSenders.has(reqSender) ? 'H:' : 'X:') + reqSender.slice(-6);
+    }
+    function noteCmd(kind, req, extra) {
+      cmds.push(kind + '@' + who() + (extra || ''));
+      if (cmds.length > 6) cmds.shift();
+    }
+    // Under guard, the receiver refuses a media command sent by a device that is not one of its
+    // own senders. Its own requests, the platform's, a command that follows a key of the TV's
+    // remote within two and a half seconds, and one whose sender could not be read all go
+    // through. A refused command gets an error back and a note in cmds.
+    let refused = 0;
+    function guarded(kind, req) {
+      const from = reqSender;
+      if (!guardMode || from == null || from === '' || from === LOCAL_SENDER || ownSenders.has(from)) return null;
+      if (/^__\w+__$/.test(from)) return null;    // the platform's own controls, such as the TV's on-screen buttons
+      if (Date.now() - lastRemoteAt < 2500) return null;
+      refused++;
+      noteCmd(kind, req, '!');
+      try {
+        return new cast.framework.messages.ErrorData(cast.framework.messages.ErrorType.INVALID_REQUEST);
+      } catch (e) { return null; }
+    }
+    // Here a seek by distance resolves against the live range, so a sender that counts from
+    // zero on a live stream still lands near where playback is; an absolute seek lands inside
+    // the range.
+    function boundSeek(req) {
+      const r = liveRange();
+      const v = mediaEl();
+      if (!r || !req) return req;
+      let target = null;
+      if (typeof req.relativeTime === 'number' && isFinite(req.relativeTime)) {
+        const cur = v ? v.currentTime : r.end;
+        target = cur + req.relativeTime;
+        delete req.relativeTime;
+      } else if (typeof req.currentTime === 'number' && isFinite(req.currentTime)) {
+        target = req.currentTime;
+      }
+      if (target != null) req.currentTime = Math.min(r.end, Math.max(r.start + WINDOW_FLOOR, target));
+      return req;
+    }
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
     // whether audio and video separately cover a seek target (the media element's .buffered only
@@ -77,6 +132,31 @@
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
+    // The sender of each media request. The framework hands an interceptor the request alone,
+    // while the function that calls the interceptor holds the request's sender as well.
+    // hookSenders finds that function by the message it logs and wraps it before any interceptor
+    // is set, since setting one binds it. Where it cannot be found, every request reads as from
+    // an unknown sender (?), which the guard lets through.
+    const LOCAL_SENDER = 'slc-local';
+    let reqSender = null, senderHook = false;
+    (function hookSenders() {
+      try {
+        for (let p = Object.getPrototypeOf(playerManager); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+          for (const k of Object.getOwnPropertyNames(p)) {
+            const d = Object.getOwnPropertyDescriptor(p, k);
+            const f = d && d.value;
+            if (typeof f !== 'function' || f.length !== 3) continue;
+            if (Function.prototype.toString.call(f).indexOf('Interceptor changed requestId') === -1) continue;
+            p[k] = function (type, fn, ev) {
+              reqSender = ev && typeof ev.senderId === 'string' ? ev.senderId : null;
+              try { return f.apply(this, arguments); } finally { reqSender = null; }
+            };
+            senderHook = true;
+            return;
+          }
+        }
+      } catch (e) {}
+    })();
     const splash = document.getElementById('splash');   // branded loading overlay (hidden once playing)
 
     // Tolerant Shaka config: survive the source's segment 404s, stalls and discontinuities.
@@ -132,7 +212,9 @@
           m.hlsSegmentFormat = cast.framework.messages.HlsSegmentFormat.TS;
           m.hlsVideoSegmentFormat = cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
         }
-        const isVod = url.indexOf('vod=1') !== -1;
+        // A replayed window is a live presentation whatever else its url says: helper 0.5.13 marks a
+        // YouTube live window with vod=1 as well as rp=1, and loaded as a video it has no live range.
+        const isVod = url.indexOf('vod=1') !== -1 && url.indexOf('rp=1') === -1;
         m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
                              : cast.framework.messages.StreamType.LIVE;
         // Without the ts=1 tag, the player finds the segment format out on its own.
@@ -143,6 +225,10 @@
         // is tuned like one. Left to the manifest's own suggestion the player holds three segments
         // back, which is most of a minute away from the edge it was asked to sit at.
         const replay = url.indexOf('rp=1') !== -1;
+        guardMode = url.indexOf('guard=1') !== -1;
+        if (reqSender && reqSender !== LOCAL_SENDER) ownSenders.add(reqSender);
+        noteCmd('LOAD', req);
+        clearTimeout(doneTimer);
         rpMode = replay;
         rpOpenAt = replay ? (Number(req.currentTime) || 0) : 0;
         // A replayed window that ends in a low-latency live (its tail is the live itself) sits as
@@ -150,6 +236,8 @@
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
           replay ? (lowLat ? 3 : 6) : (isVod ? 0 : (lowLat ? 3 : 14));
         rpEdge = replay && rpOpenAt === 0;
+        llMode = lowLat;
+        sync.low = []; edgeRate(1);
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod && !replay) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall
@@ -196,13 +284,42 @@
     } catch (e) { stats.lastError = 'focus-intercept/' + e.message; }
 
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (req) => {
+      const no = guarded('PAUSE', req);
+      if (no) return no;
+      noteCmd('PAUSE', req);
       intent.paused = true;
       return req;
     });
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, (req) => {
+      const no = guarded('PLAY', req);
+      if (no) return no;
+      noteCmd('PLAY', req);
       intent.paused = false;
       return req;
     });
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.SEEK, (req) => {
+      const no = guarded('SEEK', req);
+      if (no) return no;
+      noteCmd('SEEK', req, ':' + (req && typeof req.relativeTime === 'number' ? 'r' + Math.round(req.relativeTime) : 'c' + Math.round((req && req.currentTime) || 0)));
+      return rpMode ? boundSeek(req) : req;
+    });
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.STOP, (req) => {
+      const no = guarded('STOP', req);
+      if (no) return no;
+      noteCmd('STOP', req);
+      return req;
+    });
+
+    // A load that reached its end, or died, leaves the receiver with nothing to play; after a
+    // minute and a half of that the receiver closes itself, which takes the session off every
+    // device's cast controls. A new load cancels it.
+    let doneTimer = null;
+    function doneSoon(why) {
+      clearTimeout(doneTimer);
+      doneTimer = setTimeout(() => {
+        try { stats.lastError = 'closing/' + why; context.stop(); } catch (e) {}
+      }, 90000);
+    }
 
     // telemetry so the helper log shows whether Shaka plays or chokes (and why)
     const EV = cast.framework.events.EventType;
@@ -220,6 +337,7 @@
       }
       return '{' + out.join(' ') + '}';
     }
+    playerManager.addEventListener(EV.MEDIA_FINISHED, (e) => { doneSoon('finished:' + ((e && e.endedReason) || '')); });
     playerManager.addEventListener(EV.ERROR, (e) => {
       let d = 'shaka/' + (e && e.detailedErrorCode);
       try {
@@ -234,6 +352,7 @@
     });
     playerManager.addEventListener(EV.BUFFERING, () => { stats.stalls++; });
     playerManager.addEventListener(EV.PLAYING, () => {
+      clearTimeout(doneTimer);        // playing again: not done after all
       splash.classList.add('gone');   // hide the loading logo once playback starts
       nudge.starting = false;         // the load's own seek has landed; the playhead is the element's again
       // A load of a replayed window can name a position inside the window, but a live load may
@@ -245,8 +364,8 @@
         const v = mediaEl();
         if (v && Math.abs(v.currentTime - want) > 30) { try { playerManager.seek(want); } catch (e) {} }
       }
-      // A window opened at its edge starts playing wherever the player seated the playhead when the
-      // load began, while the edge kept moving for as long as the first segments took to buffer. Once
+      // A window opened at its edge starts playing wherever the playhead sat when the load
+      // began, while the edge kept moving for as long as the first segments took to buffer. Once
       // it plays, put it back on the edge the range holds by then, if it fell more than a moment short.
       if (rpEdge) {
         rpEdge = false;
@@ -272,6 +391,7 @@
     // receiver converts the distance into a position using the live range the cast framework holds
     // when the message arrives. It then seeks the load that is already playing, with no new LOAD.
     context.addCustomMessageListener(NS, (ev) => {
+      if (ev && typeof ev.senderId === 'string' && ev.senderId) ownSenders.add(ev.senderId);
       const d = ev && ev.data;
       if (!d || d.type !== 'behind') return;
       const r = liveRange();
@@ -384,6 +504,26 @@
         lastT = t;
       });
     }
+    // A replayed window at its edge keeps its distance from the media that has arrived rather than
+    // from the edge the player computes: that edge comes from a clock anchored once at load, and
+    // every stall leaves the playhead further behind it for good. The least buffered ahead over the
+    // last three readings is how close the playhead already runs to what has arrived. With more
+    // than a second of room to spare, the player runs a little fast until the room is under a second.
+    const sync = { low: [], rate: 1 };
+    function edgeRate(rate) {
+      if (sync.rate === rate) return;
+      sync.rate = rate;
+      try { playerManager.setPlaybackRate(rate); } catch (e) {}
+    }
+    function edgeSync(v, st, buf, lsr) {
+      const near = v && lsr && st === 'playing' && !v.paused && (lsr[1] - v.currentTime) < 12;
+      if (!rpMode || !llMode || !near) { sync.low = []; edgeRate(1); return; }
+      sync.low.push(buf);
+      if (sync.low.length > 3) sync.low.shift();
+      const least = Math.min(...sync.low);
+      if (sync.rate === 1 && sync.low.length === 3 && least > 1.2) edgeRate(1.08);
+      else if (sync.rate !== 1 && least <= 0.7) edgeRate(1);
+    }
     setInterval(() => {
       const v = mediaEl();
       hookMedia(v);
@@ -417,6 +557,7 @@
         } catch (e) {}
       }
       if (st === 'playing') splash.classList.add('gone');   // fallback hide (in case the PLAYING event was missed)
+      edgeSync(v, st, buf, lsr);
       let ae = null;
       try {
         const a = document.activeElement;
@@ -431,7 +572,9 @@
         fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
         stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
-        sv: (window.shaka && window.shaka.Player && window.shaka.Player.version) || null }); } catch (e) {}
+        cmds: cmds.length ? cmds.join(' ') : null, gd: guardMode ? 1 : 0, rej: refused || null,
+        sh: senderHook ? 1 : 0,
+        pr: sync.rate !== 1 ? sync.rate : null }); } catch (e) {}
     }, 2000);
 
     // A cast can settle with the playhead on the first buffered sample and never start: the element
@@ -650,6 +793,7 @@
     options.playbackConfig = playbackConfig;
     options.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
     options.maxInactivity = 3600;
+    options.localSenderId = LOCAL_SENDER;   // the sender this page's own requests carry
     context.start(options);
   </script>
 </body>
