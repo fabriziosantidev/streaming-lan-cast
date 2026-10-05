@@ -45,7 +45,7 @@
   <div id="spd"><span id="spdT"></span><span id="spdA"></span></div>
   <script>
     const NS = 'urn:x-cast:slc';
-    const RX_VERSION = '1.39';
+    const RX_VERSION = '1.42';
     const stats = { stalls: 0, lastError: null };
     // Budget for the startup nudge below, held here so the load interceptor can refill it without
     // reaching forward to a declaration that has not run yet.
@@ -60,6 +60,9 @@
     // rpOpenAt: the position that window's load asked to open at, checked once playback starts
     // (0 when there is nothing to check).
     let rpMode = false, rpOpenAt = 0;
+    // rpEdge: the window's load asked for its live edge; once it plays, the receiver seeks back to the
+    // edge, since buffering the first segments leaves the playhead behind by however long that took.
+    let rpEdge = false;
 
     // Capture each MSE SourceBuffer as the player creates it, so the seek recovery below can tell
     // whether audio and video separately cover a seek target (the media element's .buffered only
@@ -121,10 +124,18 @@
         else if (path.endsWith('.mp4') || path.endsWith('.m4v') || path.endsWith('.mov')) m.contentType = 'video/mp4';
         else if (path.endsWith('.mpd')) m.contentType = 'application/dash+xml';
         else m.contentType = 'application/x-mpegurl';
+        // A playlist tagged ts=1 carries MPEG-TS segments, and the load says so. Left to find that
+        // out by itself, the framework reads a whole segment from the middle of the listing before
+        // the load starts. On a window hours deep that is a long segment of the recording: the read
+        // costs seconds, and when it runs long the framework gives the load up as unsupported.
+        if (url.indexOf('ts=1') !== -1) {
+          m.hlsSegmentFormat = cast.framework.messages.HlsSegmentFormat.TS;
+          m.hlsVideoSegmentFormat = cast.framework.messages.HlsVideoSegmentFormat.MPEG2_TS;
+        }
         const isVod = url.indexOf('vod=1') !== -1;
         m.streamType = isVod ? cast.framework.messages.StreamType.BUFFERED
                              : cast.framework.messages.StreamType.LIVE;
-        // Let Shaka autodetect the segment format (don't force hlsSegmentFormat).
+        // Without the ts=1 tag, the player finds the segment format out on its own.
         // A live HLS tagged ll=1 (Twitch/Kick/YouTube) rides closer to the edge with a shallower buffer;
         // a VOD seeks freely and has no live edge, so it drops the presentation delay.
         const lowLat = url.indexOf('ll=1') !== -1;
@@ -134,8 +145,11 @@
         const replay = url.indexOf('rp=1') !== -1;
         rpMode = replay;
         rpOpenAt = replay ? (Number(req.currentTime) || 0) : 0;
+        // A replayed window that ends in a low-latency live (its tail is the live itself) sits as
+        // close to the edge as that live would; one built from a recording alone sits further back.
         playbackConfig.shakaConfig.manifest.defaultPresentationDelay =
-          replay ? 6 : (isVod ? 0 : (lowLat ? 3 : 14));
+          replay ? (lowLat ? 3 : 6) : (isVod ? 0 : (lowLat ? 3 : 14));
+        rpEdge = replay && rpOpenAt === 0;
         playbackConfig.shakaConfig.streaming.bufferingGoal = (lowLat && !isVod && !replay) ? 12 : 30;
         // resume on a thin buffer for a stable/ll live (snappy); wait for a deeper cushion on a flaky
         // non-ll live so a bursty CDN doesn't loop stall-resume-stall
@@ -231,6 +245,15 @@
         const v = mediaEl();
         if (v && Math.abs(v.currentTime - want) > 30) { try { playerManager.seek(want); } catch (e) {} }
       }
+      // A window opened at its edge starts playing wherever the player seated the playhead when the
+      // load began, while the edge kept moving for as long as the first segments took to buffer. Once
+      // it plays, put it back on the edge the range holds by then, if it fell more than a moment short.
+      if (rpEdge) {
+        rpEdge = false;
+        const r = liveRange();
+        const v = mediaEl();
+        if (r && v && r.end - v.currentTime > 1.5) { try { playerManager.seek(r.end); } catch (e) {} }
+      }
     });
 
     // The live range the cast framework holds for the current load, or null when it holds none.
@@ -253,6 +276,8 @@
       if (!d || d.type !== 'behind') return;
       const r = liveRange();
       if (!r) return;
+      // The range's end already sits the manifest delay behind the listing's last instant, so
+      // the edge is the end itself.
       const s = Math.max(0, Number(d.s) || 0);
       const target = s > 0 ? Math.max(r.start + WINDOW_FLOOR, r.end - s) : r.end;
       try { playerManager.seek(target); } catch (e) {}
@@ -405,7 +430,8 @@
         pa, rs, nl: nudge.left, ip: intent.paused, want: Math.round(nudge.want), lsr,
         fs: focus.state ? focus.state + '@' + Math.round((Date.now() - focus.at) / 1000) : null,
         ae, keys: focus.keys.length ? focus.keys.join(' ') : null,
-        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null }); } catch (e) {}
+        stalls: stats.stalls | 0, ver: RX_VERSION, err: stats.lastError || null,
+        sv: (window.shaka && window.shaka.Player && window.shaka.Player.version) || null }); } catch (e) {}
     }, 2000);
 
     // A cast can settle with the playhead on the first buffered sample and never start: the element
