@@ -5530,10 +5530,10 @@ def run_cast(args):
             _marks.append("ll=1")
         if _replay_anchor or _win_open:
             _marks.append("rp=1")    # a replayed window: live and a whole window deep, moved by distance
-        if _win_open and _REPLAY["stitch"]:
-            _marks.append("ts=1")    # its segments are MPEG-TS, so the receiver need not read one to tell
         elif _is_vod:
             _marks.append("vod=1")
+        if _win_open and _REPLAY["stitch"]:
+            _marks.append("ts=1")    # its segments are MPEG-TS, so the receiver need not read one to tell
         _path = ("/window.m3u8" if _win_open
                  else (f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"))
         hls_url = f"http://{ip}:{args.port}{_path}" + ("?" + "&".join(_marks) if _marks else "")
