@@ -5670,7 +5670,13 @@ def run_cast(args):
     _yt_switch_at = 0.0        # when the cast was reloaded onto the downloaded file (0 = not switched)
     _yt_pos_at_switch = 0.0
     _yt_file_failed = False    # the switched file didn't play on this TV -> stay on the HLS remux
-    reconnect_tries = 0
+    lost_at = 0.0                  # when the control connection to the TV dropped, 0 while it holds
+    lost_log_at = 0.0
+    relaunches = 0                 # receiver relaunches after the TV's cast runtime came back without it
+    RECONNECT_FOR = 90             # how long to wait for a dropped control connection: the library
+                                   # reconnects on its own every few seconds, and a TV whose cast
+                                   # runtime restarts takes up to a minute to answer again
+    MAX_RELAUNCHES = 2
     tele = 0                       # telemetry heartbeat (log latency/buffer every ~10s)
     last_stalls = 0
     last_err = None
@@ -5693,6 +5699,42 @@ def run_cast(args):
     dvr_url_sw = (_dvr_base + "&sw=1") if _dvr_base else ""
     cur_src = "win" if _win_open else ("dvr" if _start_in_dvr else "live")   # which source the receiver is on
     _win_sw = (_win_url + "&sw=1") if _win_url else ""
+
+    def _reload_target():
+        """What to load to carry on with the source the cast is on, and where: the recording, the
+        window or the live edge, with the position the receiver last reported playing. A cast watching
+        the recording is not helped by being dropped at the live edge, hours from where the viewer
+        was; a failed recording with no edge to keep falls back to the live edge."""
+        nonlocal cur_src
+        _on_dvr = cur_src == "dvr" and dvr_url_sw
+        _on_win = cur_src == "win" and _win_sw
+        _re_url = dvr_url_sw if _on_dvr else (_win_sw if _on_win else hls_url_sw)
+        _re_ct = "application/x-mpegurl" if _on_dvr else _ct_load
+        _re_type = "BUFFERED" if _on_dvr else ("LIVE" if _on_win else _stream_type)
+        pos = 0.0
+        if _re_type == "BUFFERED":
+            try:
+                mc.update_status()
+                time.sleep(0.3)
+                pos = float(mc.status.current_time or 0)
+            except Exception:
+                pos = 0.0
+        if not pos and _yt_dash is not None and seen_t[1] == cur_src:
+            # an errored load reports no position of its own; resume the video where the
+            # receiver last reported playing it
+            pos = seen_t[0]
+        if not pos and _on_win and seen_t[1] == "win":
+            pos = seen_t[0]       # the window counts from the start of the broadcast, as the position does
+        if not pos and _REPLAY["anchor"] and not _on_dvr and seen_bk > 30:
+            # a replayed window reopens as far behind its edge as it was playing
+            _dur = _REPLAY["anchor"]["dur"]
+            _span = max(1, int(round(_REPLAY["window"] / _dur)))
+            pos = max(0.0, _span * _dur - seen_bk)
+        if not _on_dvr and not _on_win:
+            cur_src = "live"       # a failed recording with no edge to keep falls back to one
+        _what = ("recording" if _on_dvr else ("window" if (_REPLAY["anchor"] or _on_win)
+                 else ("video" if _is_vod else "live edge")))
+        return _re_url, _re_ct, _re_type, pos, _what
 
     def _window_move(t=None, behind=None):
         """Move the window already playing, to t seconds from the start of the broadcast or to a
@@ -5719,26 +5761,67 @@ def run_cast(args):
                                    # LOAD still filling its buffer is working, however long it takes
     while True:
         time.sleep(POLL)
-        app = getattr(cc, "app_id", None)
-        if app != _CAST_RECEIVER_APP:
-            log(f"cast: receiver no longer active on the TV (app={app}); shutting down")
-            break
         try:
             connected = bool(cc.socket_client and cc.socket_client.is_connected)
         except Exception:
             connected = True
         if not connected:
-            reconnect_tries += 1
-            if reconnect_tries > 5:
-                log("cast: control connection lost; shutting down")
+            # The library reconnects on its own, every few seconds. The proxy keeps serving
+            # meanwhile, so a TV that only lost the control connection plays on, and a TV whose
+            # cast runtime restarted is given the time it takes to answer again.
+            _now = time.monotonic()
+            if lost_at == 0.0:
+                lost_at = lost_log_at = _now
+                log("cast: control connection to the TV dropped; waiting for it to come back")
+            elif _now - lost_at > RECONNECT_FOR:
+                log(f"cast: control connection lost for {RECONNECT_FOR}s; shutting down")
                 break
-            log(f"cast: reconnecting to the TV ({reconnect_tries}/5)")
-            try:
-                cc.wait(timeout=8)
-            except Exception:
-                pass
+            elif _now - lost_log_at > 20:
+                lost_log_at = _now
+                log(f"cast: still waiting for the TV ({int(_now - lost_at)}s)")
             continue
-        reconnect_tries = 0
+        _came_back = lost_at != 0.0
+        if _came_back:
+            log(f"cast: control connection back after {int(time.monotonic() - lost_at)}s")
+            lost_at = 0.0
+            # The receiver's status follows the reconnect by a moment; judge the app on it.
+            for _ in range(10):
+                if getattr(cc, "app_id", None) is not None:
+                    break
+                time.sleep(0.5)
+        app = getattr(cc, "app_id", None)
+        if app != _CAST_RECEIVER_APP:
+            # A TV whose cast runtime restarted comes back on its home screen: launch the
+            # receiver again and carry on where the viewer was. A receiver that went away on its
+            # own (the viewer left it, or it crashed twice) ends the cast.
+            if _came_back and relaunches < MAX_RELAUNCHES and played:
+                relaunches += 1
+                log(f"cast: the TV came back without the receiver; launching it again ({relaunches}/{MAX_RELAUNCHES})")
+                try:
+                    cc.start_app(_CAST_RECEIVER_APP)
+                except Exception as e:
+                    log(f"cast: start_app slow ({type(e).__name__}); waiting for the receiver to foreground")
+                for _ in range(40):
+                    if getattr(cc, "app_id", None) == _CAST_RECEIVER_APP:
+                        break
+                    time.sleep(0.5)
+                if getattr(cc, "app_id", None) != _CAST_RECEIVER_APP:
+                    log("cast: receiver app did not launch again; shutting down")
+                    break
+                _re_url, _re_ct, _re_type, pos, _what = _reload_target()
+                log(f"cast: reloading the {_what}" + (f" at t={int(pos)}s" if pos else ""))
+                try:
+                    if pos:
+                        mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type,
+                                      current_time=max(0.0, pos - 2))
+                    else:
+                        mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type)
+                    last_load_at = time.monotonic()
+                except Exception as e:
+                    log(f"cast: reload after relaunch failed: {type(e).__name__}: {str(e)[:60]}")
+                continue
+            log(f"cast: receiver no longer active on the TV (app={app}); shutting down")
+            break
         st = slc.last.get("state") if slc.last else None
         if st == "playing" and not played:
             played = True
@@ -5893,38 +5976,11 @@ def run_cast(args):
                 and err_changed_at and (time.monotonic() - err_changed_at) < 30
                 and mid_reloads < MAX_MID_RELOADS):
             mid_reloads += 1
-            # Recover the source the cast is ON. A cast watching the recording is not helped by being
-            # dropped at the live edge: that is hours from where the viewer was, and on a broadcast
-            # that has ended there is no edge there at all. Whether the position can be read is a
-            # question about the load in the player, not about the source the cast was built from.
-            _on_dvr = cur_src == "dvr" and dvr_url_sw
-            _on_win = cur_src == "win" and _win_sw
-            _re_url = dvr_url_sw if _on_dvr else (_win_sw if _on_win else hls_url_sw)
-            _re_ct = "application/x-mpegurl" if _on_dvr else _ct_load
-            _re_type = "BUFFERED" if _on_dvr else ("LIVE" if _on_win else _stream_type)
-            pos = 0.0
-            if _re_type == "BUFFERED":
-                try:
-                    mc.update_status()
-                    time.sleep(0.3)
-                    pos = float(mc.status.current_time or 0)
-                except Exception:
-                    pos = 0.0
-            if not pos and _yt_dash is not None and seen_t[1] == cur_src:
-                # an errored load reports no position of its own; resume the video where the
-                # receiver last reported playing it
-                pos = seen_t[0]
-            if not pos and _on_win and seen_t[1] == "win":
-                pos = seen_t[0]       # the window counts from the start of the broadcast, as the position does
-            if not pos and _REPLAY["anchor"] and not _on_dvr and seen_bk > 30:
-                # a replayed window reopens as far behind its edge as it was playing
-                _dur = _REPLAY["anchor"]["dur"]
-                _span = max(1, int(round(_REPLAY["window"] / _dur)))
-                pos = max(0.0, _span * _dur - seen_bk)
-            if not _on_dvr and not _on_win:
-                cur_src = "live"       # a failed recording with no edge to keep falls back to one
-            log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading the "
-                f"{'recording' if _on_dvr else ('window' if (_REPLAY['anchor'] or _on_win) else ('video' if _is_vod else 'live edge'))} "
+            # Recover the source the cast is ON (see _reload_target). Whether the position can be
+            # read depends on the load in the player rather than on the source the cast was
+            # built from.
+            _re_url, _re_ct, _re_type, pos, _what = _reload_target()
+            log(f"cast: stream errored mid-play ({err.split(' ')[0]}); reloading the {_what} "
                 f"({mid_reloads}/{MAX_MID_RELOADS})"
                 + (f" at t={int(pos)}s" if pos else ""))
             try:
