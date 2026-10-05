@@ -47,6 +47,7 @@ Usage:
 
 import argparse
 import getpass
+import gzip
 import html
 import http.server
 import json
@@ -62,6 +63,7 @@ import tempfile
 import threading
 import time
 import atexit
+import datetime
 import shutil
 import urllib.parse
 import urllib.request
@@ -90,7 +92,11 @@ _REPLAY = {"anchor": None, "t0": 0.0, "gd": 0, "window": 43200.0,
            "live": 0, "at": 0.0, "text": "",
            # a growing recording served as one open window: its media playlist url, the open
            # listing last built from it, when, and the span it covered then
-           "rec": "", "rec_text": "", "rec_at": 0.0, "rec_dur": 0.0}
+           "rec": "", "rec_text": "", "rec_at": 0.0, "rec_dur": 0.0,
+           # the window stitched to the live edge: the recording up to its edge when the cast
+           # started (base), then every live segment seen since, kept by sequence number (tail);
+           # tail_seq is the last sequence the source has listed
+           "stitch": False, "base": None, "tail": None, "tail_seq": -1}
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
@@ -379,6 +385,7 @@ def clear_cast_state():
         os.remove(STATEFILE)
     except OSError:
         pass
+    _win_cache_clear()
 
 
 # --- Per-install auth token --------------------------------------------------
@@ -1494,6 +1501,237 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                 return src
             log("proxy: source url refused; resolving the page again gave no new url")
             return ""
+
+    # --- The live tail of a window stitched to the live edge -------------------------------------
+    # The source serves a live segment for only a few minutes after it leaves its listing, while
+    # the window has to offer every one of them until the cast ends. So the listing is read here
+    # every second, each new segment is fetched the moment it is known and written under the tail
+    # cache, and /t/<seq> serves it from there. The segment the source announces ahead of listing
+    # it is fetched as well: it arrives as it is produced, which puts its last byte in the cache
+    # the moment the segment ends.
+    def _tail_source_text():
+        """The live listing, from a url re-resolved from the page once this one is refused."""
+        try:
+            return _fetch(cur["src"], timeout=6).read().decode("utf-8", "replace")
+        except _UpstreamError:
+            _fresh = _relink_src(cur["src"])
+            if not _fresh:
+                raise
+            return _fetch(_fresh, timeout=6).read().decode("utf-8", "replace")
+
+    def _tail_fetch(seq, out=None, begin=None):
+        """Fetch tail segment `seq` into the cache, handing each piece to `out` as it arrives when a
+        receiver is waiting on it; begin() is called ahead of the first piece, so the response's
+        status can wait for the fetch to produce something. The entry is already marked busy by
+        the caller. True once the file is complete."""
+        _ent = (_REPLAY["tail"] or {}).get(seq)
+        _path = os.path.join(_win_cache_dir(), f"{seq}.ts")
+        _n = 0
+        try:
+            if not _ent:
+                raise _UpstreamError(404)
+            with _WIN["cv"]:
+                _WIN["tried"][seq] = _ent[0]
+            os.makedirs(os.path.dirname(_path), exist_ok=True)
+            with open(_path, "wb") as f:
+                r = _fetch(_ent[0], timeout=12)
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    f.flush()
+                    _n += len(chunk)
+                    if out is not None:
+                        # A receiver that stops reading (it moved elsewhere) does not stop the
+                        # fetch: the segment is kept for whenever it is asked for again.
+                        try:
+                            if begin is not None:
+                                begin()
+                                begin = None
+                            out.write(chunk)
+                            if time.monotonic() - _SEG_SERVED["at"] > 0.5:
+                                _SEG_SERVED["at"] = time.monotonic()
+                        except OSError:
+                            out = None
+                    with _WIN["cv"]:
+                        _WIN["size"][seq] = _n
+                        _WIN["cv"].notify_all()
+            if _n == 0:
+                raise _UpstreamError(204)
+            with _WIN["cv"]:
+                _WIN["state"][seq] = "done"
+                _WIN["bytes"] += _n
+                _WIN["cv"].notify_all()
+            return True
+        except Exception as e:
+            with _WIN["cv"]:
+                _WIN["tries"][seq] = _WIN["tries"].get(seq, 0) + 1
+                _WIN["state"][seq] = "wait" if _WIN["tries"][seq] < 3 else "fail"
+                _WIN["size"].pop(seq, None)
+                _WIN["failed"] += 1
+                _nf = _WIN["failed"]
+                _WIN["cv"].notify_all()
+            try:
+                os.remove(_path)
+            except OSError:
+                pass
+            if _nf <= 5 or _nf % 50 == 0:
+                _why = e.code if isinstance(e, _UpstreamError) else type(e).__name__
+                log(f"proxy: tail segment {seq} could not be fetched ({_why}); {_nf} so far")
+            return False
+
+    def _tail_worker():
+        """Fetches the tail segments nothing has reached for yet, newest first: the edge is what is
+        being played, and the rest has minutes before the source stops serving it."""
+        while True:
+            with _WIN["cv"]:
+                while True:
+                    _pend = [k for k, v in _WIN["state"].items() if v == "wait"]
+                    if _pend or _WIN["stop"]:
+                        break
+                    _WIN["cv"].wait(1.0)
+                if _WIN["stop"]:
+                    return
+                _seq = max(_pend)
+                _WIN["state"][_seq] = "busy"
+                _WIN["size"][_seq] = 0
+            _tail_fetch(_seq)
+
+    def _tail_serve(seq, h):
+        """Answer a receiver's request for tail segment `seq` from the cache, following the file as
+        a worker fills it, or fetching the segment here when nobody has yet. An error status goes
+        out while nothing has been sent; once the body has begun, a failure ends the connection
+        and the receiver's retry gets it again."""
+        _path = os.path.join(_win_cache_dir(), f"{seq}.ts")
+        with _WIN["cv"]:
+            _st = _WIN["state"].get(seq)
+            if _st in (None, "wait", "fail"):
+                _WIN["state"][seq] = "busy"
+                _WIN["size"][seq] = 0
+                _st = "mine"
+
+        def _head(length=None):
+            h.send_response(200)
+            h.send_header("Content-Type", "video/mp2t")
+            h._cors(([("Content-Length", str(length))] if length is not None else []) + [("Connection", "close")])
+            h.end_headers()
+
+        if _st == "done":
+            _n = os.path.getsize(_path)
+            _head(_n)
+            with open(_path, "rb") as f:
+                shutil.copyfileobj(f, h.wfile, 262144)
+            _SEG_SERVED["at"] = time.monotonic()
+            return
+        if _st == "mine":
+            _begun = []
+            if not _tail_fetch(seq, h.wfile, lambda: (_head(), _begun.append(1))) and not _begun:
+                h.send_error(502)
+            _SEG_SERVED["at"] = time.monotonic()
+            return
+        # Being fetched by a worker: hand over what has landed, then each piece as it does. The
+        # worker creates the file right after marking the entry busy; wait for that.
+        _until = time.monotonic() + 15.0
+        while not os.path.exists(_path) and time.monotonic() < _until:
+            with _WIN["cv"]:
+                if _WIN["state"].get(seq) != "busy":
+                    break
+                _WIN["cv"].wait(0.1)
+        with _WIN["cv"]:
+            _st = _WIN["state"].get(seq)
+        if _st == "done" and os.path.exists(_path):
+            _tail_serve(seq, h)             # it completed while this waited
+            return
+        if _st != "busy" or not os.path.exists(_path):
+            h.send_error(502)              # the fetch failed; the receiver's retry fetches it here
+            return
+        _head()
+        _sent = 0
+        with open(_path, "rb") as f:
+            while True:
+                with _WIN["cv"]:
+                    while _WIN["state"].get(seq) == "busy" and _WIN["size"].get(seq, 0) <= _sent:
+                        _WIN["cv"].wait(0.2)
+                    _st, _have = _WIN["state"].get(seq), _WIN["size"].get(seq, 0)
+                if _st not in ("busy", "done"):
+                    return
+                chunk = f.read(262144)
+                if chunk:
+                    h.wfile.write(chunk)
+                    _sent += len(chunk)
+                    _SEG_SERVED["at"] = time.monotonic()
+                elif _st == "done" and _sent >= _have:
+                    return
+
+    def _tail_keeper():
+        """Builds the window and keeps it growing: the recording as it stands when the cast starts,
+        read once, as the base; then the live listing read every second, each segment it adds
+        fetched as it appears."""
+        _rt = ""
+        for _ in range(3):
+            try:
+                _rt = _fetch(_REPLAY["rec"], timeout=8).read().decode("utf-8", "replace")
+            except Exception:
+                _rt = ""
+            if _rt.lstrip().startswith("#EXTM3U"):
+                break
+            time.sleep(1.0)
+        _b = (_stitch_base(_rt, _REPLAY["rec"]) if _rt.lstrip().startswith("#EXTM3U")
+              else {"lines": [], "dur": 0.0, "end": None, "n": 0})
+        with _WIN["cv"]:
+            _REPLAY["base"] = _b
+            _REPLAY["tail"] = OrderedDict()
+        if _b["n"]:
+            log(f"proxy: window base is {_b['n']} recording segments, {_b['dur'] / 3600:.2f}h, "
+                f"ending {_b['end'].strftime('%H:%M:%S') if _b['end'] else '?'} UTC")
+        else:
+            log("proxy: the recording could not be read; the window starts at the live edge")
+        for _ in range(2):
+            threading.Thread(target=_tail_worker, daemon=True).start()
+        _err_at, _rep_at, _ended = 0.0, time.monotonic(), False
+        while not _WIN["stop"]:
+            _t0 = time.monotonic()
+            try:
+                _text = _tail_source_text()
+            except Exception as e:
+                _text = ""
+                if time.monotonic() - _err_at > 60:
+                    _err_at = time.monotonic()
+                    _why = e.code if isinstance(e, _UpstreamError) else type(e).__name__
+                    log(f"proxy: the live listing could not be read ({_why}); the tail waits")
+            if _text.lstrip().startswith("#EXTM3U"):
+                with _WIN["cv"]:
+                    _tail = _REPLAY["tail"]
+                    _was, _n0 = _REPLAY["tail_seq"], len(_tail)
+                    _REPLAY["tail_seq"] = _stitch_tail(_text, cur["src"], _b["end"], _tail, _was)
+                    _tail_announce(_text, cur["src"], _tail, _REPLAY["tail_seq"])
+                    for _sq, _e in _tail.items():
+                        _st = _WIN["state"].get(_sq)
+                        if _st is None or (_st == "fail" and _WIN["tried"].get(_sq) != _e[0]):
+                            _WIN["state"][_sq] = "wait"
+                    if _was < 0 and _REPLAY["tail_seq"] >= 0:
+                        _t0s = next(iter(_tail.values()))[2]
+                        log(f"proxy: live tail starts at sequence {next(iter(_tail))}"
+                            + (f", {_t0s.strftime('%H:%M:%S')} UTC" if _t0s else ""))
+                    if len(_tail) != _n0 or _REPLAY["tail_seq"] != _was or not _REPLAY["rec_text"]:
+                        _REPLAY["rec_text"] = _stitched_text(_b, _tail)
+                        _REPLAY["rec_dur"] = _b["dur"] + sum(e[1] for e in _tail.values())
+                    _WIN["cv"].notify_all()
+                if "#EXT-X-ENDLIST" in _text and not _ended:
+                    _ended = True
+                    log("proxy: the broadcast ended; the window stays as it is")
+            if time.monotonic() - _rep_at > 600:
+                _rep_at = time.monotonic()
+                with _WIN["cv"]:
+                    _kept = sum(1 for v in _WIN["state"].values() if v == "done")
+                    _gb, _nf = _WIN["bytes"] / 1e9, _WIN["failed"]
+                log(f"proxy: the tail holds {_kept} live segments, {_gb:.2f} GB on disk"
+                    + (f"; {_nf} could not be fetched" if _nf else ""))
+            time.sleep(max(0.2, (5.0 if _ended else 1.0) - (time.monotonic() - _t0)))
+
+    if _REPLAY["rec"] and _REPLAY["stitch"]:
+        threading.Thread(target=_tail_keeper, daemon=True).start()
     _dvrs = [f for f in (dvr_urls or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
     _dvr = {"src": None, "text": None, "at": 0.0}   # resolved recording playlist, briefly cached
     if dvr_anchor:
@@ -1697,6 +1935,34 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if p == "/win.m3u8" and _REPLAY["rec"] and _REPLAY["stitch"]:
+                    # The window stitched to the live edge: the recording as it stood when the cast
+                    # started, then every live segment since, kept up by _tail_keeper. The listing
+                    # only ever grows at its end: a segment once listed keeps its place, its duration
+                    # and its content, which is what lets the player carry on across each refresh.
+                    if not dbg.get("win"):
+                        dbg["win"] = True
+                        log(f"proxy: receiver fetched /win.m3u8 (client {self.client_address[0]})")
+                    with _WIN["cv"]:
+                        _until = time.monotonic() + 4.0
+                        while not _REPLAY["rec_text"] and time.monotonic() < _until:
+                            _WIN["cv"].wait(0.25)
+                        _body = (_REPLAY["rec_text"] or "").encode("utf-8")
+                    if not _body:
+                        self.send_error(503); return
+                    _hd = [("Connection", "close")]
+                    if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                        # Hours of two-second segments make a long listing, read every couple of
+                        # seconds; compressed it is a few percent of that.
+                        _body = gzip.compress(_body, 6)
+                        _hd.append(("Content-Encoding", "gzip"))
+                    _hd.append(("Content-Length", str(len(_body))))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self._cors(_hd)
+                    self.end_headers()
+                    self.wfile.write(_body)
+                    return
                 if p == "/win.m3u8" and _REPLAY["rec"]:
                     # A growing recording served as one open window. The source regenerates it
                     # every half minute or so; it is read again at most every 5s and served open.
@@ -1799,6 +2065,22 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                         dbg["m3u8"] = True
                         log(f"proxy: receiver fetched /live.m3u8 [{_proxy_playlist_note(text)}] (client {self.client_address[0]})")
                     self._serve_m3u8(text, cur["src"])
+                    return
+                if p.startswith("/t/"):
+                    # A segment of the window's live tail, by its sequence in the listing. Served
+                    # from the cache once fetched; followed as it lands while the keeper is fetching
+                    # it; fetched here, and kept, when nothing has reached for it yet.
+                    try:
+                        _seq = int(p[3:])
+                    except ValueError:
+                        self.send_error(400); return
+                    if not (_REPLAY["tail"] or {}).get(_seq):
+                        self.send_error(404); return
+                    _SEG_SERVED["at"] = time.monotonic()
+                    if not dbg["seg"]:
+                        dbg["seg"] = True
+                        log("proxy: receiver fetched first segment/sub-playlist")
+                    _tail_serve(_seq, self)
                     return
                 if p == "/p" or p.startswith("/s/") or p.startswith("/r/"):
                     _seg_t0 = time.monotonic()
@@ -3279,6 +3561,144 @@ def _window_playlist(text, base):
         else:
             out.append("/r/" + t)
     return "\n".join(out) + "\n", dur
+
+
+def _hls_entries(text):
+    """(start datetime or None, duration, uri, discontinuity) per segment of a media playlist, plus
+    the media sequence of its first entry. Dates come from the PROGRAM-DATE-TIME tags, carried
+    forward by the durations where a segment has none of its own; discontinuity is True for a
+    segment a DISCONTINUITY tag precedes."""
+    out, pdt, dur, seq, disc = [], None, None, 0, False
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                seq = int(ln.split(":", 1)[1])
+            except ValueError:
+                pass
+        elif ln == "#EXT-X-DISCONTINUITY":
+            disc = True
+        elif ln.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            try:
+                pdt = datetime.datetime.fromisoformat(ln.split(":", 1)[1].strip().replace("Z", "+00:00"))
+            except ValueError:
+                pdt = None
+        elif ln.startswith("#EXTINF:"):
+            try:
+                dur = float(ln[8:].split(",")[0])
+            except ValueError:
+                dur = None
+        elif ln and not ln.startswith("#"):
+            out.append((pdt, dur or 0.0, ln, disc))
+            pdt = (pdt + datetime.timedelta(seconds=dur or 0.0)) if pdt else None
+            disc = False
+    return out, seq
+
+
+def _stitch_base(rec_text, rec_base):
+    """The recording as the opening stretch of a stitched window: its segments as /r/ names, the
+    span they cover, and the instant the last of them ends, which is where the live tail begins."""
+    entries, _ = _hls_entries(rec_text)
+    lines, dur, end = [], 0.0, None
+    for pdt, d, uri, disc in entries:
+        if disc and lines:
+            lines.append("#EXT-X-DISCONTINUITY")
+        if pdt and (not lines or disc):
+            lines.append("#EXT-X-PROGRAM-DATE-TIME:" + pdt.isoformat().replace("+00:00", "Z"))
+        lines.append(f"#EXTINF:{d:.3f},")
+        lines.append("/p?u=" + urllib.parse.quote(urllib.parse.urljoin(rec_base, uri), safe="")
+                     if re.match(r"https?://", uri) else "/r/" + uri)
+        dur += d
+        if pdt:
+            end = pdt + datetime.timedelta(seconds=d)
+    return {"lines": lines, "dur": dur, "end": end, "n": len(entries)}
+
+
+def _stitch_tail(live_text, live_base, base_end, tail, last_seq):
+    """Append to the tail the live segments not listed before: those with a sequence past the last
+    one listed, leaving out any that begins before the recording's edge, which the recording covers.
+    A segment announced earlier (see _tail_announce) is replaced by its listed self. Returns the
+    last sequence listed. tail maps sequence -> (url, duration, start datetime, discontinuity)."""
+    entries, seq0 = _hls_entries(live_text)
+    for i, (pdt, d, uri, disc) in enumerate(entries):
+        seq = seq0 + i
+        if seq <= last_seq:
+            continue
+        last_seq = seq
+        if base_end and pdt and pdt < base_end - datetime.timedelta(seconds=0.5):
+            continue                          # covered by the recording
+        tail[seq] = (urllib.parse.urljoin(live_base, uri), d, pdt, disc)
+    return last_seq
+
+
+def _tail_announce(live_text, live_base, tail, last_seq):
+    """Add to the tail the segment the source announces ahead of listing it: the first PREFETCH
+    line names the one being produced, which goes under the sequence after the last listed, with
+    that one's duration and the instant it ends at. Its listing then replaces both. Returns the
+    sequence added, or -1 when nothing is announced or it is in already."""
+    pf = re.findall(r"^#EXT-X-PREFETCH:(\S+)", live_text, re.M)
+    if not pf or last_seq < 0 or last_seq not in tail or (last_seq + 1) in tail:
+        return -1
+    url, d, pdt, _ = tail[last_seq]
+    tail[last_seq + 1] = (urllib.parse.urljoin(live_base, pf[0]), d,
+                          (pdt + datetime.timedelta(seconds=d)) if pdt else None, False)
+    return last_seq + 1
+
+
+def _stitched_text(base, tail):
+    """The whole window as one open live playlist: the recording's segments, a discontinuity,
+    then the live tail by sequence number. Only ever grows at its end. The target duration is the
+    tail's, since that is the cadence the player reads the listing at and the distance it keeps
+    from the edge; the recording's longer segments sit behind the edge, where neither matters."""
+    _td = max((e[1] for e in tail.values()), default=2.0)
+    out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{max(1, int(_td + 0.5))}",
+           "#EXT-X-MEDIA-SEQUENCE:0"]
+    out += base["lines"]
+    first = True
+    for seq, (url, d, pdt, disc) in tail.items():
+        if first or disc:
+            out.append("#EXT-X-DISCONTINUITY")
+            if pdt:
+                out.append("#EXT-X-PROGRAM-DATE-TIME:" + pdt.isoformat().replace("+00:00", "Z"))
+            first = False
+        out.append(f"#EXTINF:{d:.3f},")
+        out.append(f"/t/{seq}")
+    return "\n".join(out) + "\n"
+
+
+# The window's live tail on disk, under the temp directory, for as long as the cast runs. state maps
+# a sequence to "wait" (listed, nobody fetching it yet), "busy" (being fetched; size is how much of
+# it is on disk so far), "done" or "fail"; tried is the url the last fetch of it used, tries how
+# many fetches of it have failed. A fetch is given three attempts before the segment is let go.
+_WIN = {"dir": "", "state": {}, "size": {}, "tried": {}, "tries": {}, "cv": threading.Condition(),
+        "bytes": 0, "failed": 0, "stop": False}
+
+
+def _win_cache_dir():
+    """This cast's tail cache, created on first use and dropped when the cast ends."""
+    with _WIN["cv"]:
+        if not _WIN["dir"]:
+            d = os.path.join(tempfile.gettempdir(), f"streaming-lan-cast-win-{os.getpid()}")
+            os.makedirs(d, exist_ok=True)
+            atexit.register(_win_cache_clear)
+            _WIN["dir"] = d
+        return _WIN["dir"]
+
+
+def _win_cache_clear():
+    """Drop this cast's tail cache, and any left behind by a cast proxy that has exited."""
+    _WIN["stop"] = True
+    if _WIN["dir"]:
+        shutil.rmtree(_WIN["dir"], ignore_errors=True)
+        _WIN["dir"] = ""
+    try:
+        names = os.listdir(tempfile.gettempdir())
+    except OSError:
+        return
+    for name in names:
+        m = re.fullmatch(r"streaming-lan-cast-win-(\d+)", name)
+        if m and int(m.group(1)) != os.getpid() and not _pid_is_proxy(int(m.group(1))):
+            shutil.rmtree(os.path.join(tempfile.gettempdir(), name), ignore_errors=True)
 
 
 def _recording_among(candidates, fetch_text, quality=""):
@@ -5009,14 +5429,25 @@ def run_cast(args):
             if not _rec:
                 _rec = _kick_recording(_page, _qsel)
             if _rec:
-                _REPLAY.update(rec=_rec, rec_text="", rec_at=0.0, rec_dur=0.0)
-                _win_url = f"http://{ip}:{args.port}/win.m3u8?rp=1"
+                # The window is stitched to the live edge: the recording as it stands when the cast
+                # starts, then every live segment from there on, kept by the proxy for as long as
+                # the cast runs, so the edge keeps the low-latency live and everything behind it can
+                # be moved through. SLC_KICK_STITCH=0 serves the recording alone, whose edge trails
+                # the live one by up to half a minute.
+                _stitch = os.environ.get("SLC_KICK_STITCH", "1") != "0"
+                _REPLAY.update(rec=_rec, rec_text="", rec_at=0.0, rec_dur=0.0, stitch=_stitch,
+                               base=None, tail=None, tail_seq=-1)
+                _win_url = f"http://{ip}:{args.port}/win.m3u8?rp=1" + ("&ll=1&ts=1" if _stitch else "")
+                _win_open = True
+                _is_vod = True
                 if getattr(args, "dvr_start", -1) >= 0:
-                    _win_open = True
-                    _is_vod = True
                     args.start_at = max(0.0, float(args.dvr_start))
                     args.dvr_start = -1.0
                     log(f"cast: opening the window over the recording at t={int(args.start_at)}s")
+                else:
+                    args.start_at = -1.0
+                    log("cast: opening the window over the recording at its live edge"
+                        if _stitch else "cast: opening the window over the recording at the recording's edge")
         httpd = ThreadingHTTPServer((ip, args.port),
                                     make_hls_proxy(source_url, hdr_map, tv=args.tv, media_kind=_kind,
                                                    dvr_anchor=_replay_anchor,
@@ -5040,10 +5471,12 @@ def run_cast(args):
             except OSError:
                 pass
         _marks = []
-        if _low_latency and _kind != "file" and not _replay_anchor and not _win_open:
+        if _low_latency and _kind != "file" and not _replay_anchor and (not _win_open or _REPLAY["stitch"]):
             _marks.append("ll=1")
         if _replay_anchor or _win_open:
             _marks.append("rp=1")    # a replayed window: live and a whole window deep, moved by distance
+        if _win_open and _REPLAY["stitch"]:
+            _marks.append("ts=1")    # its segments are MPEG-TS, so the receiver need not read one to tell
         elif _is_vod:
             _marks.append("vod=1")
         _path = ("/win.m3u8" if _win_open
