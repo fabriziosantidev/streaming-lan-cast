@@ -44,7 +44,7 @@
   label.dev {
     display:flex; align-items:center; gap:8px; padding:7px 8px;
     border:1px solid var(--border); border-radius:8px; cursor:pointer;
-    animation: fadein .25s ease;
+    animation: fadein .25s ease; user-select:none;
   }
   label.dev:hover { border-color:var(--hover-border); background:var(--card); }
   label.dev.sel { border-color:var(--sel-border); background:var(--sel-bg); }
@@ -52,7 +52,7 @@
   label.dev .model { color:var(--muted); font-size:11px; margin-left:auto; }
   label.dev .ways { display:flex; gap:2px; }
   label.dev .way { font-size:10px; line-height:1; padding:3px 6px; border:1px solid var(--border);
-                   border-radius:6px; background:transparent; color:var(--muted); cursor:pointer; }
+                   border-radius:6px; background:transparent; color:var(--muted); cursor:pointer; user-select:none; }
   label.dev .way.on { border-color:var(--sel-border); color:var(--fg); background:var(--sel-bg); }
   @keyframes fadein { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
   .pickhead { display:flex; align-items:center; justify-content:space-between; gap:8px; }
@@ -93,7 +93,7 @@
                       padding:8px 4px; font-size:12px; font-weight:600; }
   #rewindRow svg, #startRow svg { width:14px; height:14px; flex:none; }
   #rewindRow .lbl, #startRow .lbl { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #backLive .dot { width:8px; height:8px; border-radius:50%; background:#e5484d; flex:none; }
+  #backLive .dot, #startLive .dot { width:8px; height:8px; border-radius:50%; background:#e5484d; flex:none; }
   .linkbtn { display:block; width:100%; margin-top:6px; padding:6px; background:none; border:0;
              color:var(--muted); font-size:12px; cursor:pointer; text-decoration:underline; font-weight:500; }
   .linkbtn:hover { color:var(--fg); }
@@ -189,8 +189,9 @@
       <button type="button" id="manualPaste" class="ghost" data-i18n="paste">Paste</button>
     </div>
     <div id="castRow" class="row"><button id="castBtn" data-i18n="castButton">Cast this tab</button></div>
-    <!-- the page exposes a recording of what it is playing, so the cast starts inside it: these stand
-         in for the plain cast button, which has nothing to reach when the broadcast is over -->
+    <!-- the page exposes a recording of what it is playing, or a window behind its live edge, so the
+         cast can start inside it: these stand in for the plain cast button, and the last one is
+         the live edge itself -->
     <div id="startRow" class="row" hidden>
       <button id="startAtZero">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 19 8 12l10-7z" fill="currentColor"/><path d="M6 5v14"/></svg>
@@ -199,6 +200,10 @@
       <button id="startAtHere">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10a9 9 0 1 1 2 6"/><path d="M3 4v6h6"/></svg>
         <span class="lbl" data-i18n="rewindHere">Position</span>
+      </button>
+      <button id="startLive" hidden>
+        <span class="dot"></span>
+        <span class="lbl" data-i18n="backLive">Live</span>
       </button>
     </div>
     <div id="status"></div>

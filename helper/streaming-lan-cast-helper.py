@@ -100,6 +100,8 @@ _REPLAY = {"anchor": None, "t0": 0.0, "gd": 0, "window": 43200.0,
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
+# The last report of the page's player the popup sent along with a ping (see _ping).
+_PAGE_NOTE = {"last": ""}
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
 YTDLP_STAMP = os.path.join(TOKEN_DIR, "ytdlp-refreshed")   # touched each time _refresh_ytdlp runs
 TOKEN_FILE = os.path.join(TOKEN_DIR, "token")   # per-install secret shared with the extension
@@ -3008,7 +3010,7 @@ def serve_control(port):
             if not urls:
                 # Nothing sniffed yet; a Kick page still names its recording through the site's api.
                 rec = _kick_recording(page, _safe_quality(q.get("quality", [""])[0])) if "kick.com" in page else ""
-                self._json({"ok": True, "rec": rec})
+                self._json({"ok": True, "rec": rec, "live": _kick_live(page)})
                 return
             try:
                 hmap = json.loads((q.get("h", [""])[0]).strip() or "{}")
@@ -3019,7 +3021,7 @@ def serve_control(port):
             key = _safe_quality(q.get("quality", [""])[0]) + "\n" + "\n".join(sorted(urls))
             hit = _rec_cache.get(key)
             if hit and time.time() - hit[1] < 300:
-                self._json({"ok": True, "rec": hit[0]})
+                self._json({"ok": True, "rec": hit[0], "live": _kick_live(page)})
                 return
             rec = _recording_among(urls, lambda u: _fetch_playlist(u, hmap),
                                    _safe_quality(q.get("quality", [""])[0]))
@@ -3029,7 +3031,9 @@ def serve_control(port):
             while len(_rec_cache) > 24:
                 _rec_cache.pop(next(iter(_rec_cache)))
             log(f"recording: {'resolved' if rec else 'none'} among {len(urls)} sniffed playlist(s)")
-            self._json({"ok": True, "rec": rec})
+            # Whether the broadcast is still running travels with the answer, so a page that is
+            # showing its recording still gets its live edge offered.
+            self._json({"ok": True, "rec": rec, "live": _kick_live(page)})
 
         def _rewind(self, q):
             # Switch the running cast between the live edge and the recording. Written for the proxy
@@ -3190,6 +3194,12 @@ def serve_control(port):
                         **({"seekable": _seekable} if (alive and _seekable) else {})})
 
         def _ping(self, q):
+            # The popup reports what the page's own player says each time it reads it, so the
+            # point it offers can be followed in the log; only a changed report is written.
+            _pg = (q.get("pg", [""])[0]).strip()
+            if _pg and _pg != _PAGE_NOTE["last"]:
+                _PAGE_NOTE["last"] = _pg
+                log(f"control: page reports live/behind/window {_pg[:90]}")
             resp = {"ok": True, "pong": True, "version": HELPER_VERSION}
             if _UPDATE["latest"]:
                 resp["latest"] = _UPDATE["latest"]
@@ -3508,6 +3518,14 @@ _KICK_REC = {}      # channel slug -> (media playlist url, resolved at)
 # The #EXT-X-STREAM-INF attributes a recording's master gave its media playlist, by that playlist's
 # url: a window is handed to the player behind a master built from them (see _window_master).
 _REC_INF = {}
+# Whether a Kick channel is live as of its last recording lookup, by channel slug.
+_KICK_LIVE = {}
+
+
+def _kick_live(page_url):
+    """True when the Kick channel a page shows is live as of its last recording lookup."""
+    m = re.match(r"https?://(?:www\.)?kick\.com/([A-Za-z0-9_.-]+)", page_url or "")
+    return bool(m and _KICK_LIVE.get(m.group(1)))
 
 
 def _window_master(rec):
@@ -3546,6 +3564,8 @@ def _kick_recording(page_url, quality=""):
     try:
         st, body = _cf_get(f"https://kick.com/api/v2/channels/{slug}")
         live_id = (json.loads(body).get("livestream") or {}).get("id") if st == 200 else None
+        if st == 200:
+            _KICK_LIVE[slug] = bool(live_id)
         uuid = ""
         if live_id:
             st, body = _cf_get(f"https://kick.com/api/v1/channels/{slug}")
@@ -6054,7 +6074,7 @@ def run_cast(args):
                     f"t={slc.last.get('t')} cov={slc.last.get('cov')} b0={slc.last.get('b0')} "
                     f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} ip={slc.last.get('ip')} want={slc.last.get('want')} lsr={slc.last.get('lsr')} "
                     f"stalls={stalls} err={slc.last.get('err')}"
-                    + "".join(f" {k}={slc.last.get(k)}" for k in ("fs", "ae", "keys", "sv") if slc.last.get(k) is not None))
+                    + "".join(f" {k}={slc.last.get(k)}" for k in ("fs", "ae", "keys", "pr") if slc.last.get(k) is not None))
 
     _quit()
     if httpd:

@@ -21,6 +21,7 @@ let suppressUntil = 0;   // ignore casting:false during a quality re-cast (brief
 let pagePos = 0;         // where the page's own player sits, offered as a starting point
 let pageDur = 0;         // its runtime, as the page's own player reports it
 let pageLive = false;    // the page says it is showing a broadcast that is still running
+let pageLiveKnown = false; // ...and has said so, or the opposite, at least once
 let pageBehind = 0;      // how far behind its edge that broadcast is being watched
 let castBehind = 0;      // the distance the next cast should open at, for a replayable live source
 let castSeekable = false;  // the running cast carries its own timeline, so it can be asked for a moment
@@ -122,6 +123,7 @@ function whatOf(s) { return (s.title || "").trim() || (s.url || ""); }
 // nothing. A page only fetches its recording once the viewer rewinds, so a lookup that comes up empty
 // is worth repeating while the picker is open.
 let recUrl = "";            // the recording once known; kept for the life of the popup
+let recLive = false;        // ...and whether the broadcast it records is still running
 let recTried = 0;           // when the last fruitless lookup ran, so retries stay cheap but keep coming
 async function tabRecording(tabId) {
   if (recUrl) return recUrl;
@@ -143,6 +145,7 @@ async function tabRecording(tabId) {
              + (kick ? "&page=" + encodeURIComponent(page) : "");
   try {
     const r = await call("/recording", { method: "POST", body });
+    recLive = !!(r && r.live);
     return (recUrl = (r && r.rec) || "");
   } catch { return ""; }
 }
@@ -177,8 +180,10 @@ async function init() {
   checkHelperVersion(ping);
   let status = {};
   try { status = await call("/status"); } catch {}
-  if (status.casting) showCasting(status.name || status.device || "", whatOf(status), status.url, status.quality);
-  else await showPicker();
+  if (status.casting) {
+    showCasting(status.name || status.device || "", whatOf(status), status.url, status.quality);
+    refreshPosition();                 // the point on offer, before the first status tick
+  } else await showPicker();
   startStatusPoll();
 }
 
@@ -232,22 +237,11 @@ function startStatusPoll() {
     $("backLive").hidden = (sk && s.seekable !== "replay") || !!s.nolive;
     // A replay offers the window the broadcast itself keeps, and the window travels with it, so all
     // three controls are points of one thing: its oldest moment, where the page is, and its edge.
-    $("rewindHere").hidden = false;
     castReplay = replay;
     if (replay) $("backLive").hidden = false;
     if ((dv || sk) && posTick-- <= 0) {   // the page keeps playing, so refresh the point on offer
-      posTick = 5;
-      const tb = await activeTab();
-      const pm = tb.id != null ? await readPageMedia(tb.id) : { t: 0 };
-      pagePos = pm.t || 0;
-      // On a page showing a running broadcast the point worth naming is how far back it is being
-      // watched, which its own player answers; its position counts from somewhere else entirely.
-      const shown = pm.live ? (pm.atEdge ? 0 : (pm.behind || 0)) : pagePos;
-      castBehindNow = pm.live && !pm.atEdge ? (pm.behind || 0) : 0;
-      const enough = pm.live ? shown > 60 : shown > 30;
-      $("rewindHere").querySelector(".lbl").textContent =
-        enough ? hms(shown) : tOr("rewindHere", "Position");
-      $("rewindHere").disabled = !enough;
+      posTick = 2;
+      refreshPosition();
     }
     castSeekable = sk;
     if (s.casting && !inCasting) showCasting(s.name || s.device || "", whatOf(s), s.url, s.quality);
@@ -261,6 +255,42 @@ function startStatusPoll() {
   }, 1500);
 }
 function stopStatusPoll() { if (statusTimer) { clearInterval(statusTimer); statusTimer = null; } }
+
+// The point the Position control offers while a cast that can be moved is playing: where the page's
+// own player currently sits. On a page showing a running broadcast the point worth naming is how far
+// back it is being watched, which its own player answers; its position counts from somewhere else
+// entirely. Read when the casting view opens and every few seconds after, since the page keeps playing.
+// What the page's player reported, in the shape the helper's log keeps: live or not, how far
+// behind the edge, the window, then the frames read, where the answer came from, window, behind,
+// position, runtime, whether it sits at the edge, and any error reading it.
+function pageNote(pm) {
+  const live = !!pm.live, behind = live && !pm.atEdge ? (pm.behind || 0) : 0;
+  return `${live ? 1 : 0}/${Math.floor(behind)}/${Math.floor(live ? (pm.dvrWindow || 0) : 0)}`
+    + `/f${pm.frames || 0}/${pm.liveSrc || "-"}/w${Math.floor(pm.dvrWindow || 0)}/b${Math.floor(pm.behind || 0)}/t${Math.floor(pm.t || 0)}`
+    + `/d${pm.d === Infinity ? "inf" : Math.floor(pm.d || 0)}`
+    + (pm.atEdge ? `/edge` : ``) + (pm.err ? `/${pm.err}` : ``);
+}
+// Tell the helper what the page reported, for its log; it answers the ping as it always does.
+function tellPage(pm) {
+  call(`/ping?pg=${encodeURIComponent(pageNote(pm))}`).catch(() => {});
+}
+let posBusy = false;
+async function refreshPosition() {
+  if (posBusy) return;
+  posBusy = true;
+  try {
+    const tb = await activeTab();
+    const pm = tb.id != null ? await readPageMedia(tb.id) : { t: 0 };
+    tellPage(pm);
+    pagePos = pm.t || 0;
+    const shown = pm.live ? (pm.atEdge ? 0 : (pm.behind || 0)) : pagePos;
+    castBehindNow = pm.live && !pm.atEdge ? (pm.behind || 0) : 0;
+    const enough = pm.live ? shown > 60 : shown > 30;
+    $("rewindHere").querySelector(".lbl").textContent =
+      enough ? hms(shown) : tOr("rewindHere", "Position");
+    $("rewindHere").hidden = !enough;      // a page at the edge has no point of its own to offer
+  } catch {} finally { posBusy = false; }
+}
 
 function showCasting(name, what, url, quality) {
   stopScan();
@@ -436,9 +466,15 @@ async function refreshStartRow() {
   const tb = await activeTab();
   if (tb.id == null || !isSupported(tb.url || "")) { row.hidden = true; $("castRow").hidden = false; return; }
   const shown = readPageMedia(tb.id).then((pm) => {
+    tellPage(pm);
     pagePos = pm.t || 0;
     pageDur = pm.d || 0;
-    pageLive = !!pm.live;
+    // A player that is starting up reports a runtime of nothing for a moment, which says nothing
+    // about what it is about to show: what it showed last stands until it answers, and on a page
+    // that has not answered yet, what the site is known to keep.
+    const settled = pm.live || (Number.isFinite(pm.d) && pm.d > 1);
+    pageLive = settled ? !!pm.live : (pageLiveKnown ? pageLive : replayableLive(tb.url || ""));
+    pageLiveKnown = pageLiveKnown || settled;
     // On a running broadcast the point on offer is how far back it is being watched, which the page's
     // player answers directly. Sitting at the edge is nothing to offer at all.
     pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
@@ -447,7 +483,7 @@ async function refreshStartRow() {
     const enough = pageLive ? pageBehind > 60 : pagePos > 30;
     $("startAtHere").querySelector(".lbl").textContent =
       enough ? hms(off) : tOr("rewindHere", "Position");
-    $("startAtHere").disabled = !enough;
+    $("startAtHere").hidden = !enough;     // a page at the edge has no point of its own to offer
   }).catch(() => {});
   const rec = await tabRecording(tb.id);
   await shown;
@@ -460,9 +496,14 @@ async function refreshStartRow() {
   const atPos = !rec && (pageLive
     ? replayableLive(tb.url || "") && pageBehind > 60
     : Number.isFinite(pageDur) && pageDur > 0 && pagePos > 30);
-  // A running broadcast has no beginning to offer: what it keeps reaches back only so far, and how
-  // far is the source's answer, not the page's.
-  $("startAtZero").hidden = !!pageLive;
+  // A running broadcast offers its beginning only where something reaches back to it: a recording,
+  // or a window the source keeps behind its edge, whose oldest moment is the source's answer. The
+  // edge itself is offered on any running broadcast, which a page moved back into its recording
+  // still is: the helper says so for a channel it looked up, and a channel page with a recording
+  // is one on a site that keeps recordings of running broadcasts only.
+  $("startAtZero").hidden = !!pageLive && !rec && !replayableLive(tb.url || "");
+  const kickChannel = /^https?:\/\/(www\.)?kick\.com\/[^/?#]+\/?$/i.test(tb.url || "");
+  $("startLive").hidden = !(pageLive || recLive || (kickChannel && !!rec));
   // A device reached over DLNA takes a continuous stream of the live edge and nothing else, so
   // the points to start from are offered only to a device that plays through the receiver.
   const dev = deviceMap.get(selectedId) && deviceMap.get(selectedId).device;
@@ -478,7 +519,7 @@ async function showPicker() {
   deviceMap.clear(); rowMap.clear(); $("devices").replaceChildren();
   selectedId = (await browser.storage.local.get("lastDevice")).lastDevice || null;
   const tb = await activeTab();
-  if ((tb.url || "") !== activeUrl) { recUrl = ""; recTried = 0; }   // another page, another recording
+  if ((tb.url || "") !== activeUrl) { recUrl = ""; recLive = false; recTried = 0; }   // another page, another recording
   activeUrl = tb.url || "";
   try { mergeDevices((await call("/devices")).devices || []); }
   catch { stopAll(); setLive(false); return view("noHelper"); }
@@ -568,7 +609,7 @@ function updateDeviceEl(group) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "way"; b.dataset.id = d.id;
       b.textContent = d.kind === "cast" ? "Cast" : "DLNA";
-      b.addEventListener("click", (e) => { e.preventDefault(); wayPick.set(group, d.kind); selectDevice(d.id); });
+      b.addEventListener("click", (e) => { e.preventDefault(); wayPick.set(group, d.kind); selectDevice(d.id); b.blur(); });
       ways.appendChild(b);
     }
   }
@@ -817,15 +858,42 @@ async function readPageMedia(tabId) {
         atEdge = !!ps.isAtLiveHead;
       }
     } catch (e) {}
-    let best = "", bestArea = -1, blobOnly = false, bestT = 0, bestD = 0;
+    // The address comes from the largest element with an ordinary one. The position comes from
+    // the element that is playing, else the largest: a page that moves between a broadcast and a
+    // recording of it can keep both elements around, the same size, the idle one at zero.
+    let best = "", bestArea = -1, blobOnly = false, bestT = 0, bestD = 0, el = null, elScore = -1;
     for (const v of document.querySelectorAll("video")) {
       const s = v.currentSrc || v.src || "";
+      if (!s) continue;
       const a = (v.videoWidth || v.clientWidth || 0) * (v.videoHeight || v.clientHeight || 0);
       if (/^https?:\/\//i.test(s)) {
-        if (a > bestArea) { bestArea = a; best = s; bestT = v.currentTime || 0; bestD = v.duration || 0; }
-      } else if (s) {
+        if (a > bestArea) { bestArea = a; best = s; }
+      } else {
         blobOnly = true;                       // a MediaSource src still reports a usable position
-        if (a > bestArea) { bestArea = a; bestT = v.currentTime || 0; bestD = v.duration || 0; }
+      }
+      const score = (!v.paused && v.readyState >= 2 ? 1e12 : 0) + a;
+      if (score > elScore) { elScore = score; el = v; bestT = v.currentTime || 0; bestD = v.duration || 0; }
+    }
+    // Away from the player above, the element itself says what it is showing. A running broadcast
+    // reports no runtime, or a placeholder of months, and its seekable range is the window it can
+    // move through, the range's end being its live edge; its position counts from wherever
+    // playback began. A recording reports its runtime, and its position is a point of it.
+    if (!mp && el) {
+      if (bestD === Infinity || bestD > 1e7) {
+        live = true; liveSrc = "e"; atEdge = true;
+        try {
+          const sk = el.seekable;
+          if (sk && sk.length) {
+            const end = sk.end(sk.length - 1);
+            behind = Math.max(0, end - (el.currentTime || 0));
+            dvrWindow = Math.max(0, end - sk.start(0));
+            // Bounds as long as the runtime placeholder say nothing about where the edge is.
+            if (!isFinite(behind) || behind > 259200) { behind = 0; dvrWindow = 0; }
+            atEdge = behind < 12;
+          }
+        } catch (e) {}
+      } else if (bestD > 0) {
+        live = false; liveSrc = "e";
       }
     }
     return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, liveSrc, behind, atEdge, dvrWindow };
@@ -834,21 +902,25 @@ async function readPageMedia(tabId) {
   // methods the page script hangs on its element, and an isolated world sees the element without
   // them. The media element itself reads the same either way, so a world that cannot be had costs
   // only the live bounds.
+  // The page's own frame first, which is where the player of every site handled here lives; the
+  // frames inside it only when that one shows no video, since a page can carry dozens of them and
+  // reaching into each is what makes the reading slow.
   let res, err = "";
   const why = (e) => String((e && e.message) || e).slice(0, 60);
+  const hasVideo = (rs) => (rs || []).some((f) => f && f.result && (f.result.url || f.result.blobOnly));
   try {
-    res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, world: "MAIN", func: probe });
+    res = await browser.scripting.executeScript({ target: { tabId }, world: "MAIN", func: probe });
+    if (!hasVideo(res)) {
+      res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, world: "MAIN", func: probe });
+    }
   } catch (e1) {
     err = why(e1);
     try {
-      res = await browser.scripting.executeScript({ target: { tabId }, world: "MAIN", func: probe });
-    } catch {
-      try { res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: probe }); }
-      catch {
-        try { res = await browser.scripting.executeScript({ target: { tabId }, func: probe }); }
-        catch (e4) { return { url: "", blobOnly: false, err: err + "|" + why(e4) }; }
+      res = await browser.scripting.executeScript({ target: { tabId }, func: probe });
+      if (!hasVideo(res)) {
+        res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: probe });
       }
-    }
+    } catch (e4) { return { url: "", blobOnly: false, err: err + "|" + why(e4) }; }
   }
   let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false, liveSrc = "";
   let behind = 0, atEdge = false, dvrWindow = 0;
@@ -942,8 +1014,7 @@ async function castCurrentTab() {
     pageLive = !!pm.live;
     pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
     pageWindow = pageLive ? (pm.dvrWindow || 0) : 0;
-    pgNote = `/f${pm.frames || 0}/${pm.liveSrc || "-"}/w${Math.floor(pm.dvrWindow || 0)}/b${Math.floor(pm.behind || 0)}/t${Math.floor(pm.t || 0)}`
-      + (pm.atEdge ? `/edge` : ``) + (pm.err ? `/${pm.err}` : ``);
+    pgNote = pageNote(pm);
   }
   // A YouTube broadcast that keeps a window behind its edge is cast as that window wherever the page
   // sits, so the television can move back through it even when the cast opens at the edge.
@@ -964,7 +1035,7 @@ async function castCurrentTab() {
       (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``) +
       (castWindow ? `&window=${Math.floor(pageWindow)}` : ``) +
       // what the page reported, for the helper's log
-      `&pg=${encodeURIComponent(`${pageLive ? 1 : 0}/${Math.floor(pageBehind)}/${Math.floor(pageWindow)}${pgNote}`)}`;
+      (pgNote ? `&pg=${encodeURIComponent(pgNote)}` : ``);
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
@@ -1010,7 +1081,13 @@ $("manualPaste").addEventListener("click", async () => {
   catch { $("manualUrl").focus(); }   // clipboard read blocked -> the keyboard paste still works
   syncCastLabel();
 });
-$("startAtZero").addEventListener("click", () => { castFrom = 0; castCurrentTab(); });
+$("startAtZero").addEventListener("click", () => {
+  // The beginning of a window kept behind a live edge is however far back the source reaches, asked
+  // for as more distance than any broadcast has; a recording's beginning is its moment zero.
+  if (pageLive && !recUrl) { castBehind = FROM_THE_TOP; castFrom = -1; } else { castFrom = 0; castBehind = 0; }
+  castCurrentTab();
+});
+$("startLive").addEventListener("click", () => { castFrom = -1; castBehind = 0; castCurrentTab(); });
 $("startAtHere").addEventListener("click", () => {
   if (pageLive) { castBehind = pageBehind; castFrom = -1; } else { castFrom = pagePos; }
   castCurrentTab();
