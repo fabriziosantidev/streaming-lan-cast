@@ -28,6 +28,12 @@
            font-weight:600; color:var(--accent-fg); background:var(--accent); }
   button.ghost { background:var(--card); color:var(--fg); border:1px solid var(--border); }
   #saved { font-size:12px; opacity:0; transition:opacity .2s; }
+  h2 { font-size:14px; margin:22px 0 4px; }
+  label.opt { display:flex; gap:10px; align-items:flex-start; margin:10px 0; cursor:pointer;
+              font-weight:400; }
+  label.opt input { width:16px; height:16px; flex:none; padding:0; margin:2px 0 0;
+                    accent-color:var(--accent); }
+  label.opt span { flex:1; }
   #saved.on { opacity:1; }
 </style>
 </head>
@@ -43,6 +49,10 @@
     <button id="save" data-i18n="save">Save</button>
     <span id="saved"></span>
   </div>
+  <h2 data-i18n="optCastHead">Cast controls on other devices</h2>
+  <p class="muted" data-i18n="optCastHelp">Phones on your network can show a card with controls for a cast running on a TV. These settings decide what that card shows and whether it can act on the cast. A cast to a DLNA device shows no card.</p>
+  <label class="opt"><input id="castMeta" type="checkbox"> <span data-i18n="optCastMeta">Show the stream's title and image on those controls</span></label>
+  <label class="opt"><input id="castOthers" type="checkbox"> <span data-i18n="optCastOthers">Let other devices on the network control the cast (play, pause, seek, stop)</span></label>
 <script src="browser-polyfill.js"></script>
 <script src="constants.js"></script>
 <script src="options.js"></script>

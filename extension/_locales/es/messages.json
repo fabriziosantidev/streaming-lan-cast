@@ -139,5 +139,17 @@
   },
   "sourceNone": {
     "message": "Sin fuente de video detectada todavía"
+  },
+  "optCastHead": {
+    "message": "Controles de la transmisión en otros dispositivos"
+  },
+  "optCastHelp": {
+    "message": "Los celulares de tu red pueden mostrar una tarjeta con controles de una transmisión que corre en un TV. Estas opciones deciden qué muestra esa tarjeta y si puede actuar sobre la transmisión. Una transmisión a un dispositivo DLNA no muestra tarjeta."
+  },
+  "optCastMeta": {
+    "message": "Mostrar el título y la imagen de la transmisión en esos controles"
+  },
+  "optCastOthers": {
+    "message": "Permitir que otros dispositivos de la red controlen la transmisión (reproducir, pausar, saltar, detener)"
   }
 }

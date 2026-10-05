@@ -1723,6 +1723,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                 if "#EXT-X-ENDLIST" in _text and not _ended:
                     _ended = True
                     log("proxy: the broadcast ended; the window stays as it is")
+                    _WIN["ended_at"] = time.monotonic()
             if time.monotonic() - _rep_at > 600:
                 _rep_at = time.monotonic()
                 with _WIN["cv"]:
@@ -2527,7 +2528,8 @@ def serve_control(port):
 
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
                         src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
-                        dvr_start=-1.0, start_at=-1.0, dvr_back=0.0, dvr_window=0.0):
+                        dvr_start=-1.0, start_at=-1.0, dvr_back=0.0, dvr_window=0.0,
+                        meta=False, thumb="", others=False):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -2562,6 +2564,12 @@ def serve_control(port):
                 extra += ["--src-ll"]
         if title:
             extra += ["--title", title]      # shown on the renderer instead of the raw URL
+        if meta:
+            extra += ["--meta"]
+            if thumb.startswith(("http://", "https://")):
+                extra += ["--thumb", thumb]
+        if others:
+            extra += ["--others"]
         if kind == "cast" and cast:
             if cast.get("port"):
                 extra += ["--cast-port", str(cast["port"])]
@@ -2887,12 +2895,18 @@ def serve_control(port):
             _pg = (q.get("pg", [""])[0]).strip()
             if _pg:
                 log(f"control: page reports live/behind/window {_pg[:40]}")
+            # What the cast shows to the other devices on the network, and whether they can control it:
+            # both off unless the extension's settings say otherwise.
+            _meta = (q.get("meta", [""])[0]).strip() == "1"
+            _thumb = (q.get("thumb", [""])[0]).strip()[:500]
+            _others = (q.get("others", [""])[0]).strip() == "1"
             if _dvr_back > 0 or _dvr_win > 0:
                 log(f"control: page sits {int(_dvr_back)}s behind its edge, window {_dvr_win / 3600:.1f}h")
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
                                     dvr=dvr_state["urls"], dvr_start=_dvr_start,
-                                    start_at=_start_at, dvr_back=_dvr_back, dvr_window=_dvr_win)
+                                    start_at=_start_at, dvr_back=_dvr_back, dvr_window=_dvr_win,
+                                    meta=_meta, thumb=_thumb, others=_others)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -3548,6 +3562,48 @@ def _window_master(rec):
     return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:" + ",".join(attrs) + "\n/win.m3u8\n"
 
 
+def _cast_card(page_url, title, thumb=""):
+    """The title, subtitle and image a cast shows on the receiver and on the cast controls of the
+    other devices on the network: for a Kick channel its broadcast title, the channel and its
+    category, and the channel's picture; for a YouTube video its title and author with the
+    video's own thumbnail; for any other page the title the cast already has, the site, and
+    the image the page names for itself, when it names one."""
+    sub, img = "", thumb if thumb.startswith(("http://", "https://")) else ""
+    try:
+        host = urllib.parse.urlsplit(page_url or "").netloc.lower()
+    except ValueError:
+        host = ""
+    m = re.match(r"https?://(?:www\.)?kick\.com/([A-Za-z0-9_.-]+)/?$", page_url or "")
+    if m:
+        try:
+            st, body = _cf_get(f"https://kick.com/api/v2/channels/{m.group(1)}")
+            j = json.loads(body) if st == 200 else {}
+            ls, user = j.get("livestream") or {}, j.get("user") or {}
+            title = ls.get("session_title") or title
+            cat = ((ls.get("categories") or [{}])[0] or {}).get("name") or ""
+            sub = " · ".join(x for x in (user.get("username") or m.group(1), cat) if x)
+            img = user.get("profile_pic") or img
+        except Exception:
+            pass
+    elif "youtube.com" in host or "youtu.be" in host:
+        vid = re.search(r"(?:v=|youtu\.be/|/live/|/shorts/)([A-Za-z0-9_-]{11})", page_url or "")
+        if vid:
+            img = f"https://i.ytimg.com/vi/{vid.group(1)}/hqdefault.jpg"
+        try:
+            meta = stream_meta(page_url)
+            title, sub = meta.get("title") or title, meta.get("author") or ""
+        except Exception:
+            pass
+    else:
+        sub = host.replace("www.", "")
+    card = {"metadataType": 0, "title": (title or "")[:120]}
+    if sub:
+        card["subtitle"] = sub[:120]
+    if img:
+        card["images"] = [{"url": img}]
+    return card
+
+
 def _kick_recording(page_url, quality=""):
     """The media playlist of the recording Kick keeps of a channel's running broadcast, or ''. The
     channel's current livestream names a video, and that video's source is the master playlist of
@@ -3726,7 +3782,7 @@ def _stitched_text(base, tail):
 # it is on disk so far), "done" or "fail"; tried is the url the last fetch of it used, tries how
 # many fetches of it have failed. A fetch is given three attempts before the segment is let go.
 _WIN = {"dir": "", "state": {}, "size": {}, "tried": {}, "tries": {}, "cv": threading.Condition(),
-        "bytes": 0, "failed": 0, "stop": False}
+        "bytes": 0, "failed": 0, "stop": False, "ended_at": 0.0}
 
 
 def _win_cache_dir():
@@ -5476,6 +5532,9 @@ def run_cast(args):
         # to open at a point starts in the window; a cast of the edge keeps the low-latency live and
         # moves into the window the first time a point is asked for.
         _win_url, _win_open = "", False
+        # Unless the cast was asked to let other devices on the network control it, the receiver
+        # takes media commands from this sender alone; the load's url says so.
+        _guard_q = "" if getattr(args, "others", False) else "&guard=1"
         if "kick.com" in _page and _kind == "hls" and not _is_vod and not _replay_anchor:
             _qsel = "" if args.quality == "best" else (args.quality or "")
             _rec = ""
@@ -5492,7 +5551,7 @@ def run_cast(args):
                 _stitch = os.environ.get("SLC_KICK_STITCH", "1") != "0"
                 _REPLAY.update(rec=_rec, rec_text="", rec_at=0.0, rec_dur=0.0, stitch=_stitch,
                                base=None, tail=None, tail_seq=-1)
-                _win_url = f"http://{ip}:{args.port}/window.m3u8?rp=1" + ("&ll=1&ts=1" if _stitch else "")
+                _win_url = f"http://{ip}:{args.port}/window.m3u8?rp=1" + ("&ll=1&ts=1" if _stitch else "") + _guard_q
                 _win_open = True
                 _is_vod = True
                 if getattr(args, "dvr_start", -1) >= 0:
@@ -5534,6 +5593,8 @@ def run_cast(args):
             _marks.append("vod=1")
         if _win_open and _REPLAY["stitch"]:
             _marks.append("ts=1")    # its segments are MPEG-TS, so the receiver need not read one to tell
+        if _guard_q:
+            _marks.append("guard=1") # the receiver takes media commands from this sender alone
         _path = ("/window.m3u8" if _win_open
                  else (f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"))
         hls_url = f"http://{ip}:{args.port}{_path}" + ("?" + "&".join(_marks) if _marks else "")
@@ -5647,9 +5708,21 @@ def run_cast(args):
     elif _open_at is not None:
         log(f"cast: opening at t={int(_open_at)}s")
     mc = cc.media_controller
+    # Every load carries the same card, when the cast was asked to show one: what the receiver
+    # and the cast controls on the other devices of the network display for it.
+    _card = _cast_card(_page or source_url, _title, getattr(args, "thumb", "")) if getattr(args, "meta", False) else None
+    if _card:
+        log(f"cast: card: {_card.get('title', '')[:60]!r}" + (f" / {_card['subtitle'][:40]}" if _card.get("subtitle") else "")
+            + (" with image" if _card.get("images") else ""))
+
+    def _play(url, ct, **kw):
+        if _card:
+            kw.setdefault("metadata", _card)
+            kw["title"] = _card["title"]      # the card's title names the broadcast; the author is its subtitle
+        mc.play_media(url, ct, **kw)
     _open_kw = {"current_time": _open_at} if _open_at is not None else {}
     try:
-        mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
+        _play(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
         try:
             mc.block_until_active(timeout=10)
         except Exception:
@@ -5677,6 +5750,7 @@ def run_cast(args):
                                    # reconnects on its own every few seconds, and a TV whose cast
                                    # runtime restarts takes up to a minute to answer again
     MAX_RELAUNCHES = 2
+    ended_idle_since = 0.0         # since when the receiver has had nothing to play after the broadcast ended
     tele = 0                       # telemetry heartbeat (log latency/buffer every ~10s)
     last_stalls = 0
     last_err = None
@@ -5748,7 +5822,7 @@ def run_cast(args):
             slc.send_message({"type": "behind", "s": behind if behind is not None else max(0.0, _span - t)})
         else:
             _at = t if t is not None else max(0.0, _span - behind)
-            mc.play_media(_win_sw, _ct_load, title=_title, stream_type="LIVE", current_time=max(0.0, _at))
+            _play(_win_sw, _ct_load, title=_title, stream_type="LIVE", current_time=max(0.0, _at))
     _safe_unlink(PROXY_CTL_FILE)   # a stale switch request from an earlier cast must not fire here
     _ctl_seen = 0.0
     MAX_LOAD_ATTEMPTS = 5          # if the receiver reports a load error before playback starts, the
@@ -5812,10 +5886,10 @@ def run_cast(args):
                 log(f"cast: reloading the {_what}" + (f" at t={int(pos)}s" if pos else ""))
                 try:
                     if pos:
-                        mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type,
+                        _play(_re_url, _re_ct, title=_title, stream_type=_re_type,
                                       current_time=max(0.0, pos - 2))
                     else:
-                        mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type)
+                        _play(_re_url, _re_ct, title=_title, stream_type=_re_type)
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: reload after relaunch failed: {type(e).__name__}: {str(e)[:60]}")
@@ -5823,6 +5897,16 @@ def run_cast(args):
             log(f"cast: receiver no longer active on the TV (app={app}); shutting down")
             break
         st = slc.last.get("state") if slc.last else None
+        # A broadcast that ended leaves the receiver with nothing more to play; two minutes of that
+        # and the cast closes, which takes the session off every device's cast controls.
+        if _WIN["ended_at"] and st in (None, "idle", "buffering", "paused"):
+            if ended_idle_since == 0.0:
+                ended_idle_since = time.monotonic()
+            elif time.monotonic() - ended_idle_since > 120:
+                log("cast: the broadcast ended and the receiver has nothing left to play; closing the cast")
+                break
+        else:
+            ended_idle_since = 0.0
         if st == "playing" and not played:
             played = True
             log(f"cast: playing (receiver rx={slc.last.get('ver')})")
@@ -5868,7 +5952,7 @@ def run_cast(args):
                 _nct = (("video/webm" if _yt_fname.endswith(".webm") else "video/mp4")
                         if _file_ready else "application/x-mpegurl")
                 try:
-                    mc.play_media(_nurl, _nct, title=_title, stream_type="BUFFERED",
+                    _play(_nurl, _nct, title=_title, stream_type="BUFFERED",
                                   current_time=max(0.0, pos - 1))
                     last_load_at = time.monotonic()
                     log(f"cast: {'full file landed' if _file_ready else 'remux finished'} -> "
@@ -5894,7 +5978,7 @@ def run_cast(args):
                 _yt_vod_reloaded = False
                 _yt_switch_at = 0.0
                 try:
-                    mc.play_media(hls_url, "application/x-mpegurl", title=_title,
+                    _play(hls_url, "application/x-mpegurl", title=_title,
                                   stream_type="BUFFERED", current_time=max(0.0, _yt_pos_at_switch - 1))
                     last_load_at = time.monotonic()
                     log(f"cast: the downloaded file failed on this TV ({_e or st}); back to the stream remux")
@@ -5956,7 +6040,7 @@ def run_cast(args):
                     # a position, is not the live edge, and a retry aimed there lands somewhere the
                     # viewer never asked for. Nothing has played yet here, so the opening load is
                     # still what the cast is meant to be showing.
-                    mc.play_media(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
+                    _play(_first[0], _first[1], title=_title, stream_type=_first[2], **_open_kw)
                     last_load_at = last_progress_at = time.monotonic()
                     deepest_buf = -1.0      # the new LOAD buffers from zero
                 except Exception as e:
@@ -5985,10 +6069,10 @@ def run_cast(args):
                 + (f" at t={int(pos)}s" if pos else ""))
             try:
                 if pos:
-                    mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type,
+                    _play(_re_url, _re_ct, title=_title, stream_type=_re_type,
                                   current_time=max(0.0, pos - 2))
                 else:
-                    mc.play_media(_re_url, _re_ct, title=_title, stream_type=_re_type)
+                    _play(_re_url, _re_ct, title=_title, stream_type=_re_type)
                 last_load_at = time.monotonic()
             except Exception as e:
                 log(f"cast: mid-play reload failed: {type(e).__name__}: {str(e)[:60]}")
@@ -6025,7 +6109,7 @@ def run_cast(args):
                         except OSError:
                             pass
                         log(f"cast: moving into the window over the recording at t={int(_t)}s")
-                        mc.play_media(_win_sw, _ct_load, title=_title, stream_type="LIVE", current_time=_t)
+                        _play(_win_sw, _ct_load, title=_title, stream_type="LIVE", current_time=_t)
                         last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: move failed: {type(e).__name__}: {str(e)[:60]}")
@@ -6037,7 +6121,7 @@ def run_cast(args):
                 cur_src = "dvr"
                 log(f"cast: rewinding onto the recording at t={int(_t)}s")
                 try:
-                    mc.play_media(dvr_url_sw, "application/x-mpegurl", title=_title,
+                    _play(dvr_url_sw, "application/x-mpegurl", title=_title,
                                   stream_type="BUFFERED", current_time=_t)
                     last_load_at = time.monotonic()
                 except Exception as e:
@@ -6075,7 +6159,7 @@ def run_cast(args):
                     _span = max(1, int(round(_REPLAY["window"] / _dur)))
                     _kw = {"current_time": max(0.0, _span * _dur - _bk)} if _bk > 0 else {}
                     try:
-                        mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type,
+                        _play(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type,
                                       **_kw)
                         last_load_at = time.monotonic()
                     except Exception as e:
@@ -6089,7 +6173,7 @@ def run_cast(args):
                 _sk_ct = "application/x-mpegurl" if (cur_src == "dvr" and dvr_url_sw) else _ct_load
                 log(f"cast: moving to t={int(_t)}s within this cast")
                 try:
-                    mc.play_media(_sk_url, _sk_ct, title=_title, stream_type="BUFFERED",
+                    _play(_sk_url, _sk_ct, title=_title, stream_type="BUFFERED",
                                   current_time=_t)
                     last_load_at = time.monotonic()
                 except Exception as e:
@@ -6100,7 +6184,7 @@ def run_cast(args):
                 cur_src = "live"
                 log("cast: back to the live edge")
                 try:
-                    mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
+                    _play(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
                     last_load_at = time.monotonic()
                 except Exception as e:
                     log(f"cast: live load failed: {type(e).__name__}: {str(e)[:60]}")
@@ -6114,7 +6198,7 @@ def run_cast(args):
             cur_src = "live"
             log("cast: recording caught up; back to the live edge")
             try:
-                mc.play_media(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
+                _play(hls_url_sw, _ct_load, title=_title, stream_type=_stream_type)
                 last_load_at = time.monotonic()
             except Exception as e:
                 log(f"cast: live load failed: {type(e).__name__}: {str(e)[:60]}")
@@ -6130,7 +6214,7 @@ def run_cast(args):
                     f"t={slc.last.get('t')} cov={slc.last.get('cov')} b0={slc.last.get('b0')} "
                     f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} ip={slc.last.get('ip')} want={slc.last.get('want')} lsr={slc.last.get('lsr')} "
                     f"stalls={stalls} err={slc.last.get('err')}"
-                    + "".join(f" {k}={slc.last.get(k)}" for k in ("fs", "ae", "keys", "pr") if slc.last.get(k) is not None))
+                    + "".join(f" {k}={slc.last.get(k)}" for k in ("fs", "ae", "keys", "pr", "cmds", "gd", "rej", "sh") if slc.last.get(k) is not None))
 
     _quit()
     if httpd:
@@ -6269,6 +6353,9 @@ def main():
     ap.add_argument("--src-vod", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--src-ll", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--title", default="", help="title to show on the renderer (defaults to the URL)")
+    ap.add_argument("--meta", action="store_true", help=argparse.SUPPRESS)    # send title, subtitle and image with the load
+    ap.add_argument("--thumb", default="", help=argparse.SUPPRESS)            # the page's own image, for that
+    ap.add_argument("--others", action="store_true", help=argparse.SUPPRESS)  # let other senders on the network control the cast
     ap.add_argument("--add-header", action="append", default=[], metavar="NAME=VALUE",
                     help="extra HTTP header for streamlink, repeatable (e.g. Referer=..., Cookie=...)")
     ap.add_argument("--insecure", action="store_true", help="don't verify TLS for the media fetch")

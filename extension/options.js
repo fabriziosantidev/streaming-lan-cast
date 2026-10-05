@@ -3,7 +3,15 @@
 const $ = (id) => document.getElementById(id);
 
 async function load() {
-  $("token").value = (await browser.storage.local.get("token")).token || "";
+  const st = await browser.storage.local.get(["token", "castMeta", "castOthers"]);
+  $("token").value = st.token || "";
+  $("castMeta").checked = !!st.castMeta;
+  $("castOthers").checked = !!st.castOthers;
+}
+// Both are off until turned on here: a cast shows nothing about itself to the other devices on
+// the network and takes no commands from them.
+for (const id of ["castMeta", "castOthers"]) {
+  $(id).addEventListener("change", () => browser.storage.local.set({ [id]: $(id).checked }));
 }
 
 async function save() {

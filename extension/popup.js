@@ -545,8 +545,8 @@ async function scanLoop() {
 }
 
 // A device reachable more than one way (Cast and DLNA) comes as one entry per way, sharing a
-// group. The list shows one row per group; a row with two ways carries a chooser, and the
-// selection is always one entry, so the cast goes out the chosen way.
+// group. The list shows one row per group with a chip per way; a row with two ways lets the user
+// choose between them, and the selection is always one entry, so the cast goes out the chosen way.
 const rowMap = new Map();      // group -> row element
 const wayPick = new Map();     // group -> kind last chosen for it
 function groupOf(d) { return d.group || d.id; }
@@ -604,14 +604,14 @@ function updateDeviceEl(group) {
   el.querySelector(".model").textContent = shown.model || "";
   const ways = el.querySelector(".ways");
   ways.replaceChildren();
-  if (es.length > 1) {
-    for (const d of es.slice().sort((a, b) => (a.kind === "cast" ? 0 : 1) - (b.kind === "cast" ? 0 : 1))) {
-      const b = document.createElement("button");
-      b.type = "button"; b.className = "way"; b.dataset.id = d.id;
-      b.textContent = d.kind === "cast" ? "Cast" : "DLNA";
-      b.addEventListener("click", (e) => { e.preventDefault(); wayPick.set(group, d.kind); selectDevice(d.id); b.blur(); });
-      ways.appendChild(b);
-    }
+  // A chip for each way the device can be reached: a single chip names the only way there is, and
+  // two let the user choose between them.
+  for (const d of es.slice().sort((a, b) => (a.kind === "cast" ? 0 : 1) - (b.kind === "cast" ? 0 : 1))) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "way"; b.dataset.id = d.id;
+    b.textContent = d.kind === "cast" ? "Cast" : "DLNA";
+    b.addEventListener("click", (e) => { e.preventDefault(); wayPick.set(group, d.kind); selectDevice(d.id); b.blur(); });
+    ways.appendChild(b);
   }
 }
 function removeDeviceEl(id) {
@@ -896,7 +896,13 @@ async function readPageMedia(tabId) {
         live = false; liveSrc = "e";
       }
     }
-    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, liveSrc, behind, atEdge, dvrWindow };
+    // The page's own preview image, for the card a cast can show.
+    let og = "";
+    try {
+      const im = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]');
+      og = (im && im.content) || "";
+    } catch (e) {}
+    return { url: best, area: bestArea, blobOnly, t: bestT, d: bestD, live, liveSrc, behind, atEdge, dvrWindow, og };
   };
   // In the page's own world, where a player that answers for its live bounds is reachable: those are
   // methods the page script hangs on its element, and an isolated world sees the element without
@@ -922,11 +928,12 @@ async function readPageMedia(tabId) {
       }
     } catch (e4) { return { url: "", blobOnly: false, err: err + "|" + why(e4) }; }
   }
-  let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false, liveSrc = "";
+  let url = "", area = -1, blobOnly = false, t = 0, d = 0, live = false, liveSrc = "", og = "";
   let behind = 0, atEdge = false, dvrWindow = 0;
   for (const f of res || []) {
     const r = f && f.result;
     if (!r) continue;
+    if (r.og && !og) og = r.og;
     if (r.url && r.area > area) { area = r.area; url = r.url; }
     if (r.t > t) { t = r.t; d = r.d || 0; }   // the runtime of the frame the position came from
     blobOnly = blobOnly || !!r.blobOnly;
@@ -937,7 +944,7 @@ async function readPageMedia(tabId) {
     // it is reads as zero.
     if ((r.dvrWindow || 0) > dvrWindow) dvrWindow = r.dvrWindow;
   }
-  return { url, blobOnly, t, d, live, liveSrc, behind, atEdge, dvrWindow, err, frames: (res || []).length };
+  return { url, blobOnly, t, d, live, liveSrc, behind, atEdge, dvrWindow, og, err, frames: (res || []).length };
 }
 
 // Read off the path, so a signed query string does not hide the extension.
@@ -961,7 +968,9 @@ async function castCurrentTab() {
   const tb = await activeTab();
   const url = tb.url || "";
   const quality = qCtx.quality.value || "best";
-  let media = "", headers = "", medias = "", ladder = "", dvrRec = "", pgNote = "";
+  let media = "", headers = "", medias = "", ladder = "", dvrRec = "", pgNote = "", pageImage = "";
+  let castOpts = {};
+  try { castOpts = await browser.storage.local.get(["castMeta", "castOthers"]); } catch {}
   const supplied = manualMedia();
   // A supplied address is unrelated to the open page, so the tab's title names the wrong thing; sent
   // empty, the helper reads a title off the page url, which is the tab again. So send a fixed label.
@@ -986,6 +995,7 @@ async function castCurrentTab() {
     if (!src) {
       // Nothing crossed the wire; ask the page what its own elements point at.
       const el = await readPageMedia(tb.id);
+      pageImage = el.og || "";
       if (!el.url) {
         castEnabled();
         notify(el.blobOnly
@@ -1015,6 +1025,7 @@ async function castCurrentTab() {
     pageBehind = pageLive && !pm.atEdge ? (pm.behind || 0) : 0;
     pageWindow = pageLive ? (pm.dvrWindow || 0) : 0;
     pgNote = pageNote(pm);
+    pageImage = pm.og || "";
   }
   // A YouTube broadcast that keeps a window behind its edge is cast as that window wherever the page
   // sits, so the television can move back through it even when the cast opens at the edge.
@@ -1035,7 +1046,11 @@ async function castCurrentTab() {
       (!dvrRec && castBehind > 0 ? `&behind=${Math.floor(castBehind)}` : ``) +
       (castWindow ? `&window=${Math.floor(pageWindow)}` : ``) +
       // what the page reported, for the helper's log
-      (pgNote ? `&pg=${encodeURIComponent(pgNote)}` : ``);
+      (pgNote ? `&pg=${encodeURIComponent(pgNote)}` : ``) +
+      // what the cast shows the other devices on the network, and whether they can control it (settings page)
+      (castOpts.castMeta ? `&meta=1` : ``) +
+      (castOpts.castMeta && pageImage ? `&thumb=${encodeURIComponent(pageImage)}` : ``) +
+      (castOpts.castOthers ? `&others=1` : ``);
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {

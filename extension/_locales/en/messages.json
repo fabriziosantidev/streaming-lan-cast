@@ -139,5 +139,17 @@
   },
   "sourceNone": {
     "message": "No video source detected yet"
+  },
+  "optCastHead": {
+    "message": "Cast controls on other devices"
+  },
+  "optCastHelp": {
+    "message": "Phones on your network can show a card with controls for a cast running on a TV. These settings decide what that card shows and whether it can act on the cast. A cast to a DLNA device shows no card."
+  },
+  "optCastMeta": {
+    "message": "Show the stream's title and image on those controls"
+  },
+  "optCastOthers": {
+    "message": "Let other devices on the network control the cast (play, pause, seek, stop)"
   }
 }
