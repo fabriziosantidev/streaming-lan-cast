@@ -5715,10 +5715,20 @@ def run_cast(args):
         log(f"cast: card: {_card.get('title', '')[:60]!r}" + (f" / {_card['subtitle'][:40]}" if _card.get("subtitle") else "")
             + (" with image" if _card.get("images") else ""))
 
+    # Every device on the network can read from the session whatever a load tells the TV about the
+    # cast. So without the card, a load names the cast after the add-on alone and leaves the stream's
+    # title out. Unless the cast lets other devices control it, every load's url tells the receiver to
+    # take media commands from this sender alone, whichever source the load opens.
+    _guard_load = not getattr(args, "others", False)
+
     def _play(url, ct, **kw):
         if _card:
             kw.setdefault("metadata", _card)
             kw["title"] = _card["title"]      # the card's title names the broadcast; the author is its subtitle
+        else:
+            kw["title"] = "Streaming LAN Cast"
+        if _guard_load and "guard=1" not in url:
+            url += ("&" if "?" in url else "?") + "guard=1"
         mc.play_media(url, ct, **kw)
     _open_kw = {"current_time": _open_at} if _open_at is not None else {}
     try:
