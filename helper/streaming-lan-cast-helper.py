@@ -1935,6 +1935,15 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if p == "/window.m3u8" and _REPLAY["rec"]:
+                    # The window's master: one variant, the listing below, with its codecs named.
+                    _body = _window_master(_REPLAY["rec"]).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self._cors([("Content-Length", str(len(_body))), ("Connection", "close")])
+                    self.end_headers()
+                    self.wfile.write(_body)
+                    return
                 if p == "/win.m3u8" and _REPLAY["rec"] and _REPLAY["stitch"]:
                     # The window stitched to the live edge: the recording as it stood when the cast
                     # started, then every live segment since, kept up by _tail_keeper. The listing
@@ -3496,6 +3505,31 @@ def _cf_get(url, headers=None, timeout=12):
 _KICK_REC = {}      # channel slug -> (media playlist url, resolved at)
 
 
+# The #EXT-X-STREAM-INF attributes a recording's master gave its media playlist, by that playlist's
+# url: a window is handed to the player behind a master built from them (see _window_master).
+_REC_INF = {}
+
+
+def _window_master(rec):
+    """A master playlist with one variant, the window's media playlist, carrying the codecs. Told the
+    codecs up front, the player loads straight from the listing. Left to find them out, it reads a
+    whole segment from the middle of the listing first, and on a window hours deep that is one of the
+    recording's long segments: the read takes seconds, the player anchors its live edge to a listing
+    that old, and a read that runs long has the load given up as unsupported."""
+    inf = _REC_INF.get(rec, "")
+    attrs = []
+    for key in ("BANDWIDTH", "RESOLUTION", "FRAME-RATE"):
+        m = re.search(key + r"=([^,\s]+)", inf)
+        if m:
+            attrs.append(f"{key}={m.group(1)}")
+    m = re.search(r'CODECS="([^"]+)"', inf)
+    attrs.append(f'CODECS="{m.group(1) if m else "avc1.4D402A,mp4a.40.2"}"')
+    if not any(a.startswith("BANDWIDTH=") for a in attrs):
+        attrs.insert(0, "BANDWIDTH=7000000")
+    attrs.append("CLOSED-CAPTIONS=NONE")
+    return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:" + ",".join(attrs) + "\n/win.m3u8\n"
+
+
 def _kick_recording(page_url, quality=""):
     """The media playlist of the recording Kick keeps of a channel's running broadcast, or ''. The
     channel's current livestream names a video, and that video's source is the master playlist of
@@ -3530,6 +3564,7 @@ def _kick_recording(page_url, quality=""):
                     pick = next((v for v in variants if want and int(v.get("height") or 0) == int(want.group(1))), None)
                     pick = pick or variants[0]
                     rec = pick["url"]
+                    _REC_INF[rec] = pick.get("inf", "")
                     log(f"recording: kick keeps one of this broadcast ({pick['quality']} of {len(variants)} offered)")
         if not rec:
             log("recording: kick keeps none of this broadcast" + ("" if live_id else " (not live)"))
@@ -3849,7 +3884,7 @@ def _parse_master_variants(url, text):
         out.append({"quality": f"{height}p" + (str(fps) if fps > 30 else ""),
                     "url": urllib.parse.urljoin(url, uri), "height": height,
                     "bw": int(mbw.group(1)) if mbw else 0,
-                    "codecs": codecs, "vcodec": _codec_family(codecs)})
+                    "codecs": codecs, "vcodec": _codec_family(codecs), "inf": ln.strip()})
     best = {}
     for v in out:
         cur = best.get(v["quality"])
@@ -5437,7 +5472,7 @@ def run_cast(args):
                 _stitch = os.environ.get("SLC_KICK_STITCH", "1") != "0"
                 _REPLAY.update(rec=_rec, rec_text="", rec_at=0.0, rec_dur=0.0, stitch=_stitch,
                                base=None, tail=None, tail_seq=-1)
-                _win_url = f"http://{ip}:{args.port}/win.m3u8?rp=1" + ("&ll=1&ts=1" if _stitch else "")
+                _win_url = f"http://{ip}:{args.port}/window.m3u8?rp=1" + ("&ll=1&ts=1" if _stitch else "")
                 _win_open = True
                 _is_vod = True
                 if getattr(args, "dvr_start", -1) >= 0:
@@ -5479,7 +5514,7 @@ def run_cast(args):
             _marks.append("ts=1")    # its segments are MPEG-TS, so the receiver need not read one to tell
         elif _is_vod:
             _marks.append("vod=1")
-        _path = ("/win.m3u8" if _win_open
+        _path = ("/window.m3u8" if _win_open
                  else (f"/live.{_container}" if _kind in ("file", "dash") else "/live.m3u8"))
         hls_url = f"http://{ip}:{args.port}{_path}" + ("?" + "&".join(_marks) if _marks else "")
         log(f"{_kind} proxy at {hls_url} -> cast ({'VOD/seekable' if _is_vod else 'live'}) to {args.cast_name or args.tv}")
@@ -6019,7 +6054,7 @@ def run_cast(args):
                     f"t={slc.last.get('t')} cov={slc.last.get('cov')} b0={slc.last.get('b0')} "
                     f"pa={slc.last.get('pa')} rs={slc.last.get('rs')} nl={slc.last.get('nl')} ip={slc.last.get('ip')} want={slc.last.get('want')} lsr={slc.last.get('lsr')} "
                     f"stalls={stalls} err={slc.last.get('err')}"
-                    + "".join(f" {k}={slc.last.get(k)}" for k in ("fs", "ae", "keys") if slc.last.get(k) is not None))
+                    + "".join(f" {k}={slc.last.get(k)}" for k in ("fs", "ae", "keys", "sv") if slc.last.get(k) is not None))
 
     _quit()
     if httpd:
