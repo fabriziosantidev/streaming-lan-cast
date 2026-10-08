@@ -99,15 +99,19 @@ function record(tabId, src) {
   // (which the helper needs to read the stream's qualities and audio).
   const key = src.url.split("?")[0];
   const fresh = !m.has(key);                             // a genuinely new playlist, not a chunklist refresh
+  if (!fresh) m.delete(key);                             // fetched again: it counts as recent from here
   m.set(key, src);
   while (m.size > 40) {                                  // bound memory
     let victim = null;
-    for (const k of m.keys()) {                          // 1st choice: oldest rolling chunklist that isn't a master
+    for (const [k, s] of m) {                            // 1st choice: the oldest standalone file
+      if (s.type === "file") { victim = k; break; }
+    }
+    if (victim == null) for (const k of m.keys()) {      // 2nd: oldest rolling chunklist that isn't a master
       const b = baseName(k);
       if (!MASTER_NAME_RE.test(b) && SEGMENT_PLAYLIST_RE.test(b)) { victim = k; break; }
     }
-    if (victim == null) for (const k of m.keys()) {      // else oldest non-master, so a master survives
-      if (!MASTER_NAME_RE.test(baseName(k))) { victim = k; break; }
+    if (victim == null) for (const [k, s] of m) {        // 3rd: oldest non-master playlist; a DASH manifest
+      if (s.type !== "dash" && !MASTER_NAME_RE.test(baseName(k))) { victim = k; break; }   // is one too
     }
     m.delete(victim != null ? victim : m.keys().next().value);   // all masters -> drop oldest
   }
@@ -280,6 +284,9 @@ function onHeadersReceived(d) {
     }
     return;
   }
+  const odir = dirOf(d.url);
+  const owner = d.tabId >= 0 ? d.tabId : (dirTab.has(odir) ? dirTab.get(odir) : -1);
+  if (type === "file" && owner >= 0 && underManifest(owner, d.url)) return;
   const src = { url: d.url, type, headers: hdrStash.get(d.requestId) || {}, ts: Date.now() };
   const dir = dirOf(d.url);
   if (d.tabId >= 0) {
@@ -296,6 +303,20 @@ function onHeadersReceived(d) {
   }
 }
 function cleanup(d) { hdrStash.delete(d.requestId); }
+
+// A media file in the directory of a playlist or manifest the tab has loaded, or below it, is one of
+// that stream's segments (some hosts name their DASH fragments .mp4), not a file to cast on its own.
+function underManifest(tabId, url) {
+  const m = perTab.get(tabId);
+  const d = dirOf(url);
+  if (!m || !d) return false;
+  for (const s of m.values()) {
+    if (s.type !== "hls" && s.type !== "dash") continue;
+    const md = dirOf(s.url);
+    if (md && (d === md || d.startsWith(md + "/"))) return true;
+  }
+  return false;
+}
 
 function installListeners() {
   if (installed || !browser.webRequest) return;

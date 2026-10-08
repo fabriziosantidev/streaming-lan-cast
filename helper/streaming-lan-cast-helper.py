@@ -785,6 +785,30 @@ def _source_reachable(url, headers):
     return "mpegurl" in ct or ct.startswith("video/")
 
 
+def _declares_drm(url, headers):
+    """True when a playlist or manifest declares key delivery of its own: SAMPLE-AES in an HLS
+    playlist, or ContentProtection in a DASH manifest. Such a stream needs the page's license
+    exchange to play, which a cast receiver does not have. headers as for _source_reachable."""
+    try:
+        h = {}
+        for x in (headers or []):
+            name, sep, value = x.partition("=")
+            if sep and name.lower() in ("referer", "origin", "user-agent"):
+                h[name] = value
+        h.setdefault("User-Agent", "Mozilla/5.0")
+        h["Range"] = "bytes=0-65535"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=6) as r:
+            ct = (r.headers.get("Content-Type") or "").lower()
+            body = r.read(200_000)
+    except Exception:
+        return False
+    if body[:64].lstrip().startswith(b"#EXTM3U"):
+        return b"SAMPLE-AES" in body
+    if "dash+xml" in ct or (body.lstrip()[:1] == b"<" and b"<MPD" in body[:4096]):
+        return b"ContentProtection" in body
+    return False
+
+
 # headers the extension is allowed to replay to streamlink (the ones a player needs to
 # fetch a protected stream). Anything else is dropped: no arbitrary header injection.
 # This set is the SECURITY BOUNDARY; keep it in sync with the extension's WANT list in
@@ -2835,6 +2859,10 @@ def serve_control(port):
                     ok, reason, detail = probe_stream(_proto_target(media), cfg)
                 finally:
                     _safe_unlink(cfg)
+                if _declares_drm(media, headers):
+                    # streamlink's verdict aside (a probe that could not run passes): a stream that
+                    # declares its own key delivery cannot play on the receiver.
+                    ok, reason, detail = False, "drm", "the stream declares its own key delivery"
                 if not ok and reason == "unplayable" and _source_reachable(media, headers):
                     # streamlink's resolver can't open some CDN media playlists (fragmented-MP4, a
                     # .mp4/ path) that the cast's own reverse-proxy serves fine -> trust the proxy.
