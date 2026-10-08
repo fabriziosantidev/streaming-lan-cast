@@ -2420,6 +2420,95 @@ def _tcp_open(host, port, timeout=4):
         return False
 
 
+# --- Keeping the computer awake while a cast runs ---------------------------------------------
+# A computer left alone suspends after a while, and a suspended computer stops serving the TV. For as
+# long as a cast process runs it holds the operating system's request to stay awake, which every
+# platform drops by itself when the process ends, however it ends. The screen still turns off and
+# locks wherever the system can be asked for the one without the other: Windows, macOS, GNOME and
+# KDE. A desktop that only takes the screensaver's request (COSMIC among them) keeps the screen on
+# and unlocked until the cast ends, or until the user locks it.
+_AWAKE = {"held": [], "conn": None}
+
+
+def _holding(argv):
+    """Start a process that holds a stay-awake request while this one lives; True if it is still
+    running a moment later, which is when the request was granted (a refused one exits at once)."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    time.sleep(0.4)
+    return p.poll() is None
+
+
+def _keep_awake(why):
+    """Ask the system to stay awake for as long as this process runs. Returns what was held, for the
+    log, or '' when nothing could be."""
+    held = []
+    if IS_WIN:
+        try:
+            import ctypes
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            # Held by the calling thread, which is the cast's main thread for the whole cast.
+            if ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED):
+                held.append("system-required")
+        except Exception as e:
+            log(f"awake: Windows request failed: {type(e).__name__}")
+    elif sys.platform == "darwin":
+        exe = shutil.which("caffeinate")
+        if exe and _holding([exe, "-i", "-w", str(os.getpid())]):
+            held.append("caffeinate")
+    else:
+        # logind's lock covers a suspend asked by anyone but this same user; tail exits with this
+        # process, and the lock with it.
+        inh, tail = shutil.which("systemd-inhibit"), shutil.which("tail")
+        if inh and tail and _holding([inh, "--what=sleep", "--who=Streaming LAN Cast", f"--why={why}",
+                                      "--mode=block", tail, f"--pid={os.getpid()}", "-f", "/dev/null"]):
+            held.append("logind")
+        # The desktop decides its own idle suspend, so it is asked too, through whichever interface
+        # it serves: GNOME's and KDE's hold off the suspend alone, the screensaver's holds off the
+        # screen's timers as well. The request lives as long as this connection to the session bus.
+        try:
+            from jeepney import DBusAddress, new_method_call
+            from jeepney.io.blocking import open_dbus_connection
+            from jeepney.wrappers import unwrap_msg
+            conn = open_dbus_connection(bus="SESSION")
+            bus = DBusAddress("/org/freedesktop/DBus", bus_name="org.freedesktop.DBus",
+                              interface="org.freedesktop.DBus")
+
+            def owned(name):
+                return bool(unwrap_msg(conn.send_and_get_reply(
+                    new_method_call(bus, "NameHasOwner", "s", (name,)), timeout=3))[0])
+            if owned("org.gnome.SessionManager"):
+                a = DBusAddress("/org/gnome/SessionManager", bus_name="org.gnome.SessionManager",
+                                interface="org.gnome.SessionManager")
+                unwrap_msg(conn.send_and_get_reply(new_method_call(
+                    a, "Inhibit", "susu", ("streaming-lan-cast", 0, why, 4)), timeout=3))   # 4: suspend
+                held.append("gnome-session")
+            elif owned("org.freedesktop.PowerManagement"):
+                a = DBusAddress("/org/freedesktop/PowerManagement/Inhibit",
+                                bus_name="org.freedesktop.PowerManagement",
+                                interface="org.freedesktop.PowerManagement.Inhibit")
+                unwrap_msg(conn.send_and_get_reply(new_method_call(
+                    a, "Inhibit", "ss", ("Streaming LAN Cast", why)), timeout=3))
+                held.append("power-management")
+            elif owned("org.freedesktop.ScreenSaver"):
+                a = DBusAddress("/org/freedesktop/ScreenSaver", bus_name="org.freedesktop.ScreenSaver",
+                                interface="org.freedesktop.ScreenSaver")
+                unwrap_msg(conn.send_and_get_reply(new_method_call(
+                    a, "Inhibit", "ss", ("Streaming LAN Cast", why)), timeout=3))
+                held.append("screensaver")
+            if held and held[-1] != "logind":
+                _AWAKE["conn"] = conn      # the desktop's request lasts while this connection is open
+            else:
+                conn.close()
+        except Exception as e:
+            log(f"awake: session bus request failed: {type(e).__name__}: {str(e)[:60]}")
+    _AWAKE["held"] = held
+    return " + ".join(held)
+
+
 def _cast_connect(host, port, uuid, model, name, timeout=15):
     """Connect to a Cast device by host (no rediscovery needed) and wait for it to be ready."""
     import pychromecast
@@ -2553,7 +2642,7 @@ def serve_control(port):
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
                         src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
                         dvr_start=-1.0, start_at=-1.0, dvr_back=0.0, dvr_window=0.0,
-                        meta=False, thumb="", others=False):
+                        meta=False, thumb="", others=False, awake=True):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -2594,6 +2683,8 @@ def serve_control(port):
                 extra += ["--thumb", thumb]
         if others:
             extra += ["--others"]
+        if not awake:
+            extra += ["--no-awake"]
         if kind == "cast" and cast:
             if cast.get("port"):
                 extra += ["--cast-port", str(cast["port"])]
@@ -2928,13 +3019,14 @@ def serve_control(port):
             _meta = (q.get("meta", [""])[0]).strip() == "1"
             _thumb = (q.get("thumb", [""])[0]).strip()[:500]
             _others = (q.get("others", [""])[0]).strip() == "1"
+            _awake = (q.get("awake", [""])[0]).strip() != "0"     # on unless the settings turn it off
             if _dvr_back > 0 or _dvr_win > 0:
                 log(f"control: page sits {int(_dvr_back)}s behind its edge, window {_dvr_win / 3600:.1f}h")
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
                                     dvr=dvr_state["urls"], dvr_start=_dvr_start,
                                     start_at=_start_at, dvr_back=_dvr_back, dvr_window=_dvr_win,
-                                    meta=_meta, thumb=_thumb, others=_others)
+                                    meta=_meta, thumb=_thumb, others=_others, awake=_awake)
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -5640,6 +5732,10 @@ def run_cast(args):
         if httpd:
             httpd.shutdown()
         _safe_unlink(PIDFILE); clear_cast_state(); os._exit(1)
+    if not getattr(args, "no_awake", False):
+        _held = _keep_awake(f"Casting to {args.cast_name or args.tv}")
+        log(f"cast: keeping the computer awake ({_held})" if _held
+            else "cast: could not ask the system to stay awake; it may sleep during the cast")
 
     class _SlcChannel(BaseController):
         """Private receiver channel: sends play/stop, receives {type:'status'} pushes."""
@@ -6318,6 +6414,10 @@ def run_proxy(args):
         + (", remuxed with a clock" if _remux else "") + ")")
     set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}")
     log("pushed (live). Ctrl+C stops the server and playback.")
+    if not getattr(args, "no_awake", False):
+        _held = _keep_awake(f"Casting to {args.tv}")
+        log(f"keeping the computer awake ({_held})" if _held
+            else "could not ask the system to stay awake; it may sleep during the cast")
     played, gone, retries = False, 0, 0
     DLNA_MAX_RETRIES = 3
     try:
@@ -6394,6 +6494,7 @@ def main():
     ap.add_argument("--meta", action="store_true", help=argparse.SUPPRESS)    # send title, subtitle and image with the load
     ap.add_argument("--thumb", default="", help=argparse.SUPPRESS)            # the page's own image, for that
     ap.add_argument("--others", action="store_true", help=argparse.SUPPRESS)  # let other senders on the network control the cast
+    ap.add_argument("--no-awake", action="store_true", help=argparse.SUPPRESS)  # let the computer sleep during the cast
     ap.add_argument("--add-header", action="append", default=[], metavar="NAME=VALUE",
                     help="extra HTTP header for streamlink, repeatable (e.g. Referer=..., Cookie=...)")
     ap.add_argument("--insecure", action="store_true", help="don't verify TLS for the media fetch")

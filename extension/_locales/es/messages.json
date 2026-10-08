@@ -151,5 +151,11 @@
   },
   "optCastOthers": {
     "message": "Permitir que otros dispositivos de la red controlen la transmisión (reproducir, pausar, saltar, detener)"
+  },
+  "optAwakeHead": {
+    "message": "Esta computadora"
+  },
+  "optCastAwake": {
+    "message": "Mantener esta computadora despierta mientras transmite"
   }
 }

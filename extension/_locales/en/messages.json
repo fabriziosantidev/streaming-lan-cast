@@ -151,5 +151,11 @@
   },
   "optCastOthers": {
     "message": "Let other devices on the network control the cast (play, pause, seek, stop)"
+  },
+  "optAwakeHead": {
+    "message": "This computer"
+  },
+  "optCastAwake": {
+    "message": "Keep this computer awake while casting"
   }
 }

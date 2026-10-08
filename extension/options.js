@@ -3,14 +3,15 @@
 const $ = (id) => document.getElementById(id);
 
 async function load() {
-  const st = await browser.storage.local.get(["token", "castMeta", "castOthers"]);
+  const st = await browser.storage.local.get(["token", "castMeta", "castOthers", "castAwake"]);
   $("token").value = st.token || "";
   $("castMeta").checked = !!st.castMeta;
   $("castOthers").checked = !!st.castOthers;
+  $("castAwake").checked = st.castAwake !== false;    // on until turned off here
 }
 // Both are off until turned on here: a cast shows nothing about itself to the other devices on
 // the network and takes no commands from them.
-for (const id of ["castMeta", "castOthers"]) {
+for (const id of ["castMeta", "castOthers", "castAwake"]) {
   $(id).addEventListener("change", () => browser.storage.local.set({ [id]: $(id).checked }));
 }
 

@@ -970,7 +970,7 @@ async function castCurrentTab() {
   const quality = qCtx.quality.value || "best";
   let media = "", headers = "", medias = "", ladder = "", dvrRec = "", pgNote = "", pageImage = "";
   let castOpts = {};
-  try { castOpts = await browser.storage.local.get(["castMeta", "castOthers"]); } catch {}
+  try { castOpts = await browser.storage.local.get(["castMeta", "castOthers", "castAwake"]); } catch {}
   const supplied = manualMedia();
   // A supplied address is unrelated to the open page, so the tab's title names the wrong thing; sent
   // empty, the helper reads a title off the page url, which is the tab again. So send a fixed label.
@@ -1050,7 +1050,8 @@ async function castCurrentTab() {
       // what the cast shows the other devices on the network, and whether they can control it (settings page)
       (castOpts.castMeta ? `&meta=1` : ``) +
       (castOpts.castMeta && pageImage ? `&thumb=${encodeURIComponent(pageImage)}` : ``) +
-      (castOpts.castOthers ? `&others=1` : ``);
+      (castOpts.castOthers ? `&others=1` : ``) +
+      (castOpts.castAwake === false ? `&awake=0` : ``);
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
