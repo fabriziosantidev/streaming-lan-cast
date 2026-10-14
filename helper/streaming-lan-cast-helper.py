@@ -1447,9 +1447,19 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
         # dependency: when it's absent the refusal stands (no retry).
         try:
             from curl_cffi import requests as _cffi_requests
-            _cffi_sess = _cffi_requests.Session()
         except Exception:
-            _cffi_sess = None
+            _cffi_requests = None
+        _cffi_local = threading.local()
+
+        def _cffi_sess():
+            """This thread's browser-like TLS session (one per thread: segments fetched ahead run in
+            threads of their own), or None when curl_cffi is not installed."""
+            if _cffi_requests is None:
+                return None
+            s = getattr(_cffi_local, "sess", None)
+            if s is None:
+                s = _cffi_local.sess = _cffi_requests.Session()
+            return s
 
         class _Resp:
             # .read() over iter_content (curl_cffi exposes the streamed body only there, not via .content):
@@ -1470,10 +1480,10 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
 
         def _fetch(url, timeout=10):
             r = _sess.get(url, headers=HDRS, stream=True, timeout=timeout)
-            if r.status_code in (403, 410) and _cffi_sess is not None:
+            if r.status_code in (403, 410) and _cffi_sess() is not None:
                 r.close()
                 hdrs = {k: v for k, v in HDRS.items() if k.lower() not in _IMPERSONATE_OWNS}
-                r = _cffi_sess.get(url, headers=hdrs, stream=True, timeout=timeout, impersonate="chrome")
+                r = _cffi_sess().get(url, headers=hdrs, stream=True, timeout=timeout, impersonate="chrome")
             if r.status_code >= 400:
                 code = r.status_code; r.close(); raise _UpstreamError(code)
             return _Resp(r)
@@ -1483,10 +1493,10 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
             if range_hdr:
                 h["Range"] = range_hdr
             r = _sess.get(url, headers=h, stream=True, timeout=timeout)
-            if r.status_code in (403, 410) and _cffi_sess is not None:
+            if r.status_code in (403, 410) and _cffi_sess() is not None:
                 r.close()
                 ch = {k: v for k, v in h.items() if k.lower() not in _IMPERSONATE_OWNS}
-                r = _cffi_sess.get(url, headers=ch, stream=True, timeout=timeout, impersonate="chrome")
+                r = _cffi_sess().get(url, headers=ch, stream=True, timeout=timeout, impersonate="chrome")
             return r.status_code, r.headers, r.iter_content(65536), r
     except ImportError:
         def _fetch(url, timeout=10):
@@ -1514,7 +1524,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
 
     def _rewrite(text, base):
         # point every URL (segment, variant, key, map) at /p?u=<absolute> so it stays proxied
-        out = []
+        out, segs = [], []
         for ln in text.splitlines():
             s = ln.rstrip("\r")
             if not s.strip():
@@ -1526,8 +1536,78 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     s = s[:m.start(1)] + "/p?u=" + urllib.parse.quote(au, safe="") + s[m.end(1):]
                 out.append(s); continue
             au = urllib.parse.urljoin(base, s.strip())
+            segs.append(au)
             out.append("/p?u=" + urllib.parse.quote(au, safe=""))
+        if "#EXTINF" in text:
+            _ahead_listed(segs)        # a media playlist: its order is what gets fetched ahead
         return "\n".join(out) + "\n"
+
+    # --- Segments fetched ahead of the one being served --------------------------------------------
+    # The receiver asks for one segment at a time and waits for it, so a source that takes seconds
+    # to answer each request, however small the segment, starves playback that its throughput would
+    # carry. While one segment is served, the next few the listing names are fetched into memory
+    # and handed over from there when asked for. Only segments a listing served here names are
+    # fetched, so a live listing is never asked for one it has not announced.
+    AHEAD_N = 4                      # segments in flight beyond the one being served
+    AHEAD_KEEP = 64 * 1024 * 1024    # bytes held for segments fetched and not yet asked for
+    _ahead = {"order": [], "index": {}, "held": OrderedDict(), "busy": set(), "bytes": 0,
+              "lock": threading.Lock()}
+
+    class _Held:
+        """A segment already in memory, read like a response."""
+        def __init__(self, data, headers):
+            self.headers, self._data, self._at = headers, data, 0
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                out, self._at = self._data[self._at:], len(self._data)
+            else:
+                out = self._data[self._at:self._at + n]
+                self._at += len(out)
+            return out
+
+    def _ahead_listed(urls):
+        """Remember the order the listing served last names its segments in."""
+        with _ahead["lock"]:
+            _ahead["order"] = urls
+            _ahead["index"] = {u: i for i, u in enumerate(urls)}
+
+    def _ahead_fetch(u):
+        try:
+            r = _fetch(u, timeout=20)
+            data = r.read(-1)
+            hdrs = {"Content-Type": r.headers.get("Content-Type", "") or ""}
+        except Exception:
+            data = None                # the request made when it is asked for reports the failure
+        with _ahead["lock"]:
+            _ahead["busy"].discard(u)
+            if data is None or u not in _ahead["index"]:
+                return
+            _ahead["held"][u] = (data, hdrs)
+            _ahead["bytes"] += len(data)
+            while _ahead["bytes"] > AHEAD_KEEP and len(_ahead["held"]) > 1:
+                _old, (_d, _h) = _ahead["held"].popitem(last=False)
+                _ahead["bytes"] -= len(_d)
+
+    def _ahead_take(u):
+        """The segment u from memory when it was fetched ahead, else None. Either way the segments
+        listed after it start fetching, and the ones held from before it are let go."""
+        with _ahead["lock"]:
+            held = _ahead["held"].pop(u, None)
+            if held:
+                _ahead["bytes"] -= len(held[0])
+            i = _ahead["index"].get(u)
+            todo = []
+            if i is not None:
+                for nxt in _ahead["order"][i + 1:i + 1 + AHEAD_N]:
+                    if nxt not in _ahead["held"] and nxt not in _ahead["busy"]:
+                        _ahead["busy"].add(nxt)
+                        todo.append(nxt)
+                for past in [k for k in _ahead["held"] if _ahead["index"].get(k, i) < i]:
+                    _ahead["bytes"] -= len(_ahead["held"].pop(past)[0])
+        for nxt in todo:
+            threading.Thread(target=_ahead_fetch, args=(nxt,), daemon=True).start()
+        return _Held(*held) if held else None
 
     def _qparam(path, key):
         """Every value for a query key, unquoted without parse_qs's +->space rule - a proxied segment url
@@ -1535,7 +1615,8 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
         qs = path.split("?", 1)[1] if "?" in path else ""
         return [urllib.parse.unquote(kv[len(key) + 1:]) for kv in qs.split("&") if kv.startswith(key + "=")]
 
-    dbg = {"m3u8": False, "seg": False, "segn": 0, "refused": False, "err": 0, "dewrap": False, "frange": 0, "paths": set()}   # log the first of each event only once
+    dbg = {"m3u8": False, "seg": False, "segn": 0, "refused": False, "err": 0, "dewrap": False, "frange": 0, "paths": set(),
+           "ahead": False}   # log the first of each event only once
     cur = {"src": source_url}      # the playlist being served; recovery below may move it to a fallback
     _spawned = time.monotonic()
     _fallbacks = [f for f in (fallbacks or []) if isinstance(f, str) and f.startswith(("http://", "https://"))]
@@ -2182,7 +2263,9 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     res_tail = _redact_url(u).rsplit("/", 1)[-1] or p
                     is_pl = u.split("?")[0].endswith(".m3u8")
                     try:
-                        r = _fetch(_ll_fetch_url(u, self.path) if is_pl else u)   # forward blocking-reload for a nested LL chunklist
+                        r = None if is_pl else _ahead_take(u)
+                        if r is None:
+                            r = _fetch(_ll_fetch_url(u, self.path) if is_pl else u)   # forward blocking-reload for a nested LL chunklist
                     except _UpstreamError as e:
                         # A replay playing forward crosses out of the generation it was anchored in,
                         # and the next one refuses the numbers that are not its own. Refusal is the
@@ -2254,10 +2337,14 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     # the receiver has identified the media, and it identifies it by reading a whole
                     # segment, so this is the size and the wait the first frame is behind.
                     _SEG_SERVED["at"] = time.monotonic()
+                    if isinstance(r, _Held) and not dbg["ahead"]:
+                        dbg["ahead"] = True
+                        log("proxy: serving segments fetched ahead of the receiver")
                     if dbg["segn"] < 3:
                         dbg["segn"] += 1
                         log(f"proxy: segment {dbg['segn']} served {_sent / 1048576:.1f}MB in "
-                            f"{time.monotonic() - _seg_t0:.1f}s")
+                            f"{time.monotonic() - _seg_t0:.1f}s"
+                            + (" from memory" if isinstance(r, _Held) else ""))
                     return
                 self.send_error(404)
             except _UpstreamError as e:
@@ -5992,7 +6079,7 @@ def run_cast(args):
                 pos = float(mc.status.current_time or 0)
             except Exception:
                 pos = 0.0
-        if not pos and _yt_dash is not None and seen_t[1] == cur_src:
+        if not pos and (_yt_dash is not None or _is_vod) and seen_t[1] == cur_src:
             # an errored load reports no position of its own; resume the video where the
             # receiver last reported playing it
             pos = seen_t[0]
