@@ -83,6 +83,8 @@
             font-size:12px; line-height:1.45; word-break:break-word; white-space:pre-line;
             background:var(--card); border:1px solid var(--border); color:var(--fg); cursor:pointer; }
   .notice.err { border-color:var(--danger); }
+  .notice.auto { display:flex; flex-direction:column; gap:7px; cursor:default; white-space:normal; }
+  .notice.auto button { align-self:flex-start; padding:5px 10px; font-size:12px; }
   #helperOld { white-space:normal; }
   #helperOld a { display:inline-block; margin-top:4px; color:var(--accent); font-weight:600; }
   [hidden] { display:none !important; }   /* a class display rule must not override the hidden attribute */
@@ -223,6 +225,11 @@
       <span id="castQSpin" class="spin"></span>
     </div>
     <div id="castQualityMenu" class="qmenu" hidden></div>
+    <!-- shown when the helper stepped the quality down because the TV takes less than it needed -->
+    <div id="autoNote" class="notice auto" hidden>
+      <span id="autoText"></span>
+      <button type="button" id="autoUp" class="ghost"></button>
+    </div>
     <div class="row"><button id="stopBtn" class="danger" data-i18n="stopButton">Stop</button></div>
     <!-- shown when the cast's page exposed a recording of the ongoing broadcast: jump the cast to the
          beginning, to where the page's own player sits, or back to the live edge -->

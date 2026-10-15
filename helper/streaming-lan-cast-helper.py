@@ -87,6 +87,7 @@ PROXY_ERR_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-e
 PROXY_CTL_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-proxy-ctl.json")    # control->proxy: switch the cast between live and the recording
 PROXY_NOLIVE_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-nolive")         # proxy->control: this cast has no live edge to return to
 PROXY_SEEK_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-seekable")         # proxy->control: this cast carries its own timeline, so it can be moved through
+PROXY_LINK_FILE = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-link.json")      # proxy->control: the TV takes less than this quality needs
 # The live stream this cast is replaying and where from. Held here because the playlist is served on
 # one thread and re-anchored on another, and both have to agree on which moment the cast starts at.
 _REPLAY = {"anchor": None, "t0": 0.0, "gd": 0, "window": 43200.0,
@@ -101,6 +102,43 @@ _REPLAY = {"anchor": None, "t0": 0.0, "gd": 0, "window": 43200.0,
 # When this proxy last finished handing the receiver a segment. Segments leaving the proxy are the
 # one account of a load making progress that does not depend on the receiver's own reading of it.
 _SEG_SERVED = {"at": 0.0}
+# What the link to the TV carried, segment by segment: (when, bytes, seconds taken, seconds of media).
+# Only segments the proxy already held in full are counted, so the source's own pace is out of it.
+_LINK = {"samples": [], "lock": threading.Lock()}
+
+
+def _link_sample(nbytes, secs, dur):
+    if nbytes < 131072 or secs <= 0 or not dur or dur <= 0:
+        return
+    with _LINK["lock"]:
+        _LINK["samples"].append((time.monotonic(), nbytes, secs, dur))
+        del _LINK["samples"][:-16]
+
+
+def _sock_unsent(sock):
+    """Bytes handed to the kernel that the other end has not yet taken, or None where the system
+    cannot say."""
+    try:
+        if sys.platform.startswith("linux"):
+            import fcntl, termios, struct
+            buf = fcntl.ioctl(sock.fileno(), termios.TIOCOUTQ, b"\0" * 4)
+            return struct.unpack("i", buf)[0]
+        if sys.platform == "darwin":
+            return sock.getsockopt(socket.SOL_SOCKET, 0x1024)      # SO_NWRITE
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _await_drain(sock, timeout=20.0):
+    """Wait until the other end has taken everything written to sock, so the time measured is the
+    time the bytes took to arrive and not the time the kernel took to accept them."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        left = _sock_unsent(sock)
+        if not left:
+            return
+        time.sleep(0.02)
 # The last report of the page's player the popup sent along with a ping (see _ping).
 _PAGE_NOTE = {"last": ""}
 TOKEN_DIR = os.path.join(os.path.expanduser("~"), ".streaming-lan-cast")
@@ -347,12 +385,17 @@ def proxy_alive():
 # --- Cast-state persistence --------------------------------------------------
 # Single source of truth for the cast-state shape: the fields a /status or /cast snapshot
 # returns, and the empty/default record. Defined once so adding a field is a one-line edit.
-_CAST_SNAP_FIELDS = ("url", "device", "name", "title", "quality")
+_CAST_SNAP_FIELDS = ("url", "device", "name", "title", "quality", "auto")
 
 
 def _empty_cast_state():
     return {"url": "", "device": "", "name": "", "title": "", "quality": "best",
-            "media": "", "headers": [], "epoch": 0, "kind": "dlna", "cast": {}}
+            "media": "", "headers": [], "epoch": 0, "kind": "dlna", "cast": {},
+            # auto: a quality step the control server took because the TV took less than the
+            # quality needed (from/to/mbps/need); hold: the viewer picked a quality, so no step
+            # is taken; ladder: the page's renditions by height; opts: the rest of what the
+            # cast was asked with, so a re-cast carries it.
+            "auto": {}, "hold": False, "ladder": {}, "opts": {}}
 
 
 def save_cast_state(d, grace_until=0.0):
@@ -365,6 +408,8 @@ def save_cast_state(d, grace_until=0.0):
         rec["headers"] = d.get("headers", []) or []
         rec["kind"] = d.get("kind", "dlna")      # dlna (SOAP) vs cast (Chromecast) target
         rec["cast"] = d.get("cast") or {}        # cast device details (port/uuid/name/model)
+        for k in ("hold", "ladder", "opts"):
+            rec[k] = d.get(k) or _empty_cast_state()[k]
         rec["grace_until"] = grace_until   # survive a restart that lands mid quality-recast
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(rec, f)
@@ -1524,7 +1569,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
 
     def _rewrite(text, base):
         # point every URL (segment, variant, key, map) at /p?u=<absolute> so it stays proxied
-        out, segs = [], []
+        out, segs, durs, dur = [], [], [], 0.0
         for ln in text.splitlines():
             s = ln.rstrip("\r")
             if not s.strip():
@@ -1534,12 +1579,19 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                 if m:
                     au = urllib.parse.urljoin(base, m.group(1))
                     s = s[:m.start(1)] + "/p?u=" + urllib.parse.quote(au, safe="") + s[m.end(1):]
+                elif s.startswith("#EXTINF:"):
+                    try:
+                        dur = float(s[8:].split(",", 1)[0])
+                    except ValueError:
+                        dur = 0.0
                 out.append(s); continue
             au = urllib.parse.urljoin(base, s.strip())
             segs.append(au)
+            durs.append(dur)
+            dur = 0.0
             out.append("/p?u=" + urllib.parse.quote(au, safe=""))
         if "#EXTINF" in text:
-            _ahead_listed(segs)        # a media playlist: its order is what gets fetched ahead
+            _ahead_listed(segs, durs)  # a media playlist: its order is what gets fetched ahead
         return "\n".join(out) + "\n"
 
     # --- Segments fetched ahead of the one being served --------------------------------------------
@@ -1550,7 +1602,7 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
     # fetched, so a live listing is never asked for one it has not announced.
     AHEAD_N = 4                      # segments in flight beyond the one being served
     AHEAD_KEEP = 64 * 1024 * 1024    # bytes held for segments fetched and not yet asked for
-    _ahead = {"order": [], "index": {}, "held": OrderedDict(), "busy": set(), "bytes": 0,
+    _ahead = {"order": [], "index": {}, "dur": {}, "held": OrderedDict(), "busy": set(), "bytes": 0,
               "lock": threading.Lock()}
 
     class _Held:
@@ -1566,11 +1618,12 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                 self._at += len(out)
             return out
 
-    def _ahead_listed(urls):
-        """Remember the order the listing served last names its segments in."""
+    def _ahead_listed(urls, durs):
+        """Remember the order the listing served last names its segments in, and their lengths."""
         with _ahead["lock"]:
             _ahead["order"] = urls
             _ahead["index"] = {u: i for i, u in enumerate(urls)}
+            _ahead["dur"] = {u: d for u, d in zip(urls, durs)}
 
     def _ahead_fetch(u):
         try:
@@ -1757,11 +1810,35 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
             h._cors(([("Content-Length", str(length))] if length is not None else []) + [("Connection", "close")])
             h.end_headers()
 
+        # The time the receiver's end took the bytes, kept apart from the time spent waiting on
+        # the source: the link's own pace, whichever way the segment was served.
+        _wr = {"t": 0.0, "n": 0}
+
+        def _put(chunk):
+            _t = time.monotonic()
+            h.wfile.write(chunk)
+            _wr["t"] += time.monotonic() - _t
+            _wr["n"] += len(chunk)
+
+        def _sample():
+            _ent = (_REPLAY["tail"] or {}).get(seq)
+            _link_sample(_wr["n"], _wr["t"], _ent[1] if _ent else 0)
+
         if _st == "done":
             _n = os.path.getsize(_path)
             _head(_n)
-            with open(_path, "rb") as f:
-                shutil.copyfileobj(f, h.wfile, 262144)
+            try:
+                with open(_path, "rb") as f:
+                    while True:
+                        chunk = f.read(262144)
+                        if not chunk:
+                            break
+                        _put(chunk)
+                _t = time.monotonic()
+                _await_drain(h.connection)
+                _wr["t"] += time.monotonic() - _t
+            finally:
+                _sample()
             _SEG_SERVED["at"] = time.monotonic()
             return
         if _st == "mine":
@@ -1788,21 +1865,27 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
             return
         _head()
         _sent = 0
-        with open(_path, "rb") as f:
-            while True:
-                with _WIN["cv"]:
-                    while _WIN["state"].get(seq) == "busy" and _WIN["size"].get(seq, 0) <= _sent:
-                        _WIN["cv"].wait(0.2)
-                    _st, _have = _WIN["state"].get(seq), _WIN["size"].get(seq, 0)
-                if _st not in ("busy", "done"):
-                    return
-                chunk = f.read(262144)
-                if chunk:
-                    h.wfile.write(chunk)
-                    _sent += len(chunk)
-                    _SEG_SERVED["at"] = time.monotonic()
-                elif _st == "done" and _sent >= _have:
-                    return
+        try:
+            with open(_path, "rb") as f:
+                while True:
+                    with _WIN["cv"]:
+                        while _WIN["state"].get(seq) == "busy" and _WIN["size"].get(seq, 0) <= _sent:
+                            _WIN["cv"].wait(0.2)
+                        _st, _have = _WIN["state"].get(seq), _WIN["size"].get(seq, 0)
+                    if _st not in ("busy", "done"):
+                        return
+                    chunk = f.read(262144)
+                    if chunk:
+                        _put(chunk)
+                        _sent += len(chunk)
+                        _SEG_SERVED["at"] = time.monotonic()
+                    elif _st == "done" and _sent >= _have:
+                        _t = time.monotonic()
+                        _await_drain(h.connection)
+                        _wr["t"] += time.monotonic() - _t
+                        return
+        finally:
+            _sample()
 
     def _tail_keeper():
         """Builds the window and keeps it growing: the recording as it stands when the cast starts,
@@ -2321,18 +2404,28 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                     self.send_response(200)
                     self.send_header("Content-Type", ct)
                     self._cors([("Connection", "close")]); self.end_headers()
-                    _sent = 0
-                    if first:
-                        self.wfile.write(first)
-                        _sent = len(first)
-                    while True:
-                        chunk = r.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        _sent += len(chunk)
-                        if time.monotonic() - _SEG_SERVED["at"] > 0.5:
-                            _SEG_SERVED["at"] = time.monotonic()   # bytes still moving = still progressing
+                    _sent, _held, _w0 = 0, isinstance(r, _Held), time.monotonic()
+                    try:
+                        if first:
+                            self.wfile.write(first)
+                            _sent = len(first)
+                        while True:
+                            chunk = r.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            _sent += len(chunk)
+                            if time.monotonic() - _SEG_SERVED["at"] > 0.5:
+                                _SEG_SERVED["at"] = time.monotonic()   # bytes still moving = still progressing
+                    except OSError:
+                        # The receiver gave the segment up; what reached it before that still says
+                        # what the link carried in the meantime.
+                        if _held:
+                            _link_sample(_sent, time.monotonic() - _w0, _ahead["dur"].get(u))
+                        raise
+                    if _held:
+                        _await_drain(self.connection)
+                        _link_sample(_sent, time.monotonic() - _w0, _ahead["dur"].get(u))
                     # What one segment costs, for the first few of a cast. Playback cannot begin until
                     # the receiver has identified the media, and it identifies it by reading a whole
                     # segment, so this is the size and the wait the first frame is behind.
@@ -2739,6 +2832,28 @@ def _refresh_ytdlp_loop():
         time.sleep(24 * 3600)
 
 
+def _lower_quality(snap):
+    """The quality one step below the cast's, as (label, media url), from the page's ladder
+    when the cast has one, else from the renditions the resolver lists for the page; ('', '')
+    when there is none below. The label a 'best' cast plays is the top of that list."""
+    cur = snap["quality"] or "best"
+    lad = snap.get("ladder") or {}
+    if lad:
+        hs = sorted((int(k) for k in lad if str(k).isdigit()), reverse=True)
+        m = re.match(r"(\d+)", cur)
+        curh = int(m.group(1)) if m else (hs[0] if hs else 0)
+        lower = [h for h in hs if h < curh]
+        return (f"{lower[0]}p", lad[str(lower[0])], f"{curh}p") if lower else ("", "", f"{curh}p")
+    if snap.get("media"):
+        return "", "", cur          # one fixed rendition, nothing below it to pick
+    quals = [str(x) for x in (stream_meta(snap["url"]).get("qualities") or [])]   # highest first
+    if not quals:
+        return "", "", cur
+    at = quals.index(cur) if cur in quals else 0
+    now = quals[at]
+    return (quals[at + 1], "", now) if at + 1 < len(quals) else ("", "", now)
+
+
 def serve_control(port):
     self_script = os.path.abspath(__file__)
     _rotate_log_on_version_change()   # a helper update starts a fresh log (old one -> LOGFILE.old)
@@ -2780,7 +2895,7 @@ def serve_control(port):
     def build_cast_args(u, d, qy, media, kind="dlna", cast=None, title="",
                         src_kind="", src_vod=False, src_ll=False, fallbacks=None, dvr=None,
                         dvr_start=-1.0, start_at=-1.0, dvr_back=0.0, dvr_window=0.0,
-                        meta=False, thumb="", others=False, awake=True):
+                        meta=False, thumb="", others=False, awake=True, hold=False):
         """(url, device, quality, media, kind) -> proxy CLI argv. kind 'cast' targets a Chromecast
         (HLS + pychromecast); 'dlna' targets a UPnP renderer (MPEG-TS + SOAP). Replay headers are
         NOT here. They ride in the env (see launch). --managed = control server owns kill+pidfile."""
@@ -2823,6 +2938,8 @@ def serve_control(port):
             extra += ["--others"]
         if not awake:
             extra += ["--no-awake"]
+        if hold:
+            extra += ["--hold-quality"]
         if kind == "cast" and cast:
             if cast.get("port"):
                 extra += ["--cast-port", str(cast["port"])]
@@ -2868,10 +2985,35 @@ def serve_control(port):
         _write_pidfile(proc.pid)
         return proc.pid
 
-    def relaunch_current(u, d, qy, media, headers, kind="dlna", cast=None, title=""):
-        """Re-cast the given stream at quality qy (snapshot args, not live state reads)."""
+    def relaunch_current(u, d, qy, media, headers, kind="dlna", cast=None, title="", opts=None, hold=False):
+        """Re-cast the given stream at quality qy (snapshot args, not live state reads). opts is the
+        rest of what the cast was first asked with, so the re-cast shows and allows the same."""
+        o = opts or {}
         return _spawn_proxy(build_cast_args(u, d, qy, media, kind, cast, title,
-                                            dvr=dvr_state["urls"]), headers)
+                                            src_kind=o.get("src_kind", ""), src_vod=bool(o.get("src_vod")),
+                                            src_ll=bool(o.get("src_ll")), fallbacks=o.get("fallbacks"),
+                                            dvr=dvr_state["urls"], meta=bool(o.get("meta")),
+                                            thumb=o.get("thumb", "") or "", others=bool(o.get("others")),
+                                            awake=o.get("awake", True) is not False, hold=hold), headers)
+
+    def relaunch_locked(**changes):
+        """Apply state changes and re-cast the current stream (the caller holds _state_lock).
+        Returns the response dict."""
+        if not state["url"]:
+            state.update(changes)
+            return {"ok": True, "casting": False}
+        state.update(changes)
+        u2, d2 = state["url"], state["device"]
+        m2, h2 = state["media"], state["headers"]
+        k2, c2 = state.get("kind", "dlna"), state.get("cast") or {}
+        t2 = state.get("title", "")
+        epoch["n"] += 1
+        state["epoch"] = epoch["n"]
+        grace["until"] = time.time() + 10        # tolerate the brief proxy gap during relaunch
+        save_cast_state(state, grace["until"])
+        relaunch_current(u2, d2, state["quality"], m2, h2, k2, c2, t2,
+                         opts=state.get("opts") or {}, hold=bool(state.get("hold")))
+        return {"ok": True, "casting": True}
 
     class CtrlHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # no keep-alive: each request closes cleanly
@@ -3164,13 +3306,19 @@ def serve_control(port):
             _thumb = (q.get("thumb", [""])[0]).strip()[:500]
             _others = (q.get("others", [""])[0]).strip() == "1"
             _awake = (q.get("awake", [""])[0]).strip() != "0"     # on unless the settings turn it off
+            _hold = (q.get("hold", [""])[0]).strip() == "1"       # the viewer picked this quality: never step it down
+            # The page's renditions by height, kept so a step down can pick the next one by its own url.
+            _ladder = {str(k): v for k, v in _lad.items()
+                       if isinstance(v, str) and v.startswith(("http://", "https://"))}
             if _dvr_back > 0 or _dvr_win > 0:
                 log(f"control: page sits {int(_dvr_back)}s behind its edge, window {_dvr_win / 3600:.1f}h")
             extra = build_cast_args(url, device, quality, media, kind, cinfo, title,
                                     src_kind, src_vod, src_ll, fallbacks=_fb,
                                     dvr=dvr_state["urls"], dvr_start=_dvr_start,
                                     start_at=_start_at, dvr_back=_dvr_back, dvr_window=_dvr_win,
-                                    meta=_meta, thumb=_thumb, others=_others, awake=_awake)
+                                    meta=_meta, thumb=_thumb, others=_others, awake=_awake, hold=_hold)
+            _opts = {"src_kind": src_kind, "src_vod": src_vod, "src_ll": src_ll, "fallbacks": _fb,
+                     "meta": _meta, "thumb": _thumb, "others": _others, "awake": _awake}
             already, this_epoch = None, 0
             with _state_lock:
                 if proxy_alive() and time.time() >= stopping["until"]:   # re-check atomically
@@ -3180,12 +3328,14 @@ def serve_control(port):
                     _safe_unlink(PROXY_ERR_FILE)         # clear a stale expired-source flag from a prior cast
                     _safe_unlink(PROXY_NOLIVE_FILE)      # and a stale "no live edge" marker
                     _safe_unlink(PROXY_SEEK_FILE)        # and a stale "this one can be moved through"
+                    _safe_unlink(PROXY_LINK_FILE)        # and a stale word on the TV's link
                     _spawn_proxy(extra, headers)        # kill old (if any) + launch + record pid
                     epoch["n"] += 1
                     this_epoch = epoch["n"]
                     grace["until"] = time.time() + 10   # cover the child's startup window
                     state.update(url=url, device=device, name=name, title=title, quality=quality,
-                                 media=media, headers=headers, epoch=this_epoch, kind=kind, cast=cinfo)
+                                 media=media, headers=headers, epoch=this_epoch, kind=kind, cast=cinfo,
+                                 auto={}, hold=_hold, ladder=_ladder, opts=_opts)
                     save_cast_state(state, grace["until"])
             if already is not None:
                 self._json({"ok": True, "already": True, **already})
@@ -3358,36 +3508,24 @@ def serve_control(port):
             log(f"control: rewind -> {req}")
             self._json({"ok": True, **req})
 
-        def _relaunch_locked(self, **changes):
-            """Apply state changes and re-cast the current stream (caller holds _state_lock).
-            Returns the response dict. Used by /quality."""
-            if not state["url"]:
-                state.update(changes)
-                return {"ok": True, "casting": False}
-            state.update(changes)
-            u2, d2 = state["url"], state["device"]
-            m2, h2 = state["media"], state["headers"]
-            k2, c2 = state.get("kind", "dlna"), state.get("cast") or {}
-            t2 = state.get("title", "")
-            epoch["n"] += 1
-            state["epoch"] = epoch["n"]
-            grace["until"] = time.time() + 10        # tolerate the brief proxy gap during relaunch
-            save_cast_state(state, grace["until"])
-            relaunch_current(u2, d2, state["quality"], m2, h2, k2, c2, t2)
-            return {"ok": True, "casting": True}
-
         def _quality(self, q):
+            # A quality the viewer picks holds for the cast: no step down is taken from it, and a
+            # step already taken is no longer reported.
             val = _safe_quality(q.get("value", [""])[0])
+            _safe_unlink(PROXY_LINK_FILE)
             with _state_lock:
                 if state["url"] and val == state["quality"]:
+                    state.update(hold=True, auto={})
+                    save_cast_state(state, grace["until"])
                     resp = {"ok": True, "quality": val, "casting": True, "unchanged": True}  # no-op
                 else:
-                    resp = self._relaunch_locked(quality=val)
+                    resp = relaunch_locked(quality=val, hold=True, auto={})
                 resp["quality"] = val
             self._json(resp)
 
         def _stop(self, q):
             _safe_unlink(PROXY_ERR_FILE)   # the cast is over: clear any expired-source flag so /status stops reporting it
+            _safe_unlink(PROXY_LINK_FILE)
             with _state_lock:
                 dev = state.get("device") or ""               # the casting TV, capture before clearing
                 kind = state.get("kind", "dlna")
@@ -3523,6 +3661,45 @@ def serve_control(port):
 
     threading.Thread(target=_update_check_loop, daemon=True).start()   # keeps /ping's latest/min_ext fresh
     threading.Thread(target=_refresh_ytdlp_loop, daemon=True).start()  # keeps YouTube resolves working
+    def _link_watch_loop():
+        """Steps the cast's quality down once the proxy reports that the TV takes less than it
+        needs, and records the step for the popup; a quality the viewer picked is left alone."""
+        while True:
+            time.sleep(2)
+            try:
+                with open(PROXY_LINK_FILE, encoding="utf-8") as f:
+                    info = json.load(f)
+            except (OSError, ValueError):
+                continue
+            _safe_unlink(PROXY_LINK_FILE)
+            try:
+                if info.get("pid") != _read_pidfile() or time.time() - float(info.get("ts", 0)) > 120:
+                    continue
+                with _state_lock:
+                    if not state["url"] or state.get("hold") or state.get("kind") != "cast":
+                        continue
+                    snap = {k: state.get(k) for k in ("url", "quality", "media", "ladder", "epoch")}
+                to, to_media, now = _lower_quality(snap)     # may resolve the page: outside the lock
+                with _state_lock:
+                    if state.get("epoch") != snap["epoch"] or state.get("hold"):
+                        continue
+                    note = {"from": now, "to": to, "mbps": info.get("mbps"), "need": info.get("need")}
+                    if to:
+                        log(f"control: the TV takes {info.get('mbps')} Mb/s and {now} needs {info.get('need')}: "
+                            f"stepping down to {to}")
+                        changes = {"quality": to, "auto": note}
+                        if to_media:
+                            changes["media"] = to_media
+                        relaunch_locked(**changes)
+                    else:
+                        log(f"control: the TV takes {info.get('mbps')} Mb/s and {now} needs {info.get('need')}; "
+                            f"nothing below it to step down to")
+                        state["auto"] = note
+                        save_cast_state(state, grace["until"])
+            except Exception as e:
+                log(f"control: quality step failed: {type(e).__name__}: {str(e)[:80]}")
+
+    threading.Thread(target=_link_watch_loop, daemon=True).start()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), CtrlHandler)
     log(f"control server on http://127.0.0.1:{port}  (/cast?url=  /stop  /ping  /devices)")
     httpd.serve_forever()
@@ -6058,6 +6235,8 @@ def run_cast(args):
     ended_idle_since = 0.0         # since when the receiver has had nothing to play after the broadcast ended
     tele = 0                       # telemetry heartbeat (log latency/buffer every ~10s)
     last_stalls = 0
+    stall_times = []               # when the receiver reported each stall
+    link_told = False              # the control server has been told the TV takes less than this quality needs
     last_err = None
     load_attempts = 1              # the initial play_media above is attempt 1
     last_load_at = time.monotonic()
@@ -6514,6 +6693,31 @@ def run_cast(args):
             if stalls > last_stalls:
                 log(f"cast: receiver stall (#{stalls}, state {st})")
                 last_stalls = stalls
+                stall_times.append(time.monotonic())
+                del stall_times[:-20]
+            # The link to the TV against what the quality needs, from segments the proxy already
+            # held in full when the TV asked for them: the source's pace plays no part in those.
+            # When the link carries less than the media runs and the receiver keeps stalling, the
+            # control server is told once, and it steps the quality down and says so in the popup.
+            # A quality the viewer picked is never stepped.
+            if not link_told and not getattr(args, "hold_quality", False):
+                _now = time.monotonic()
+                with _LINK["lock"]:
+                    _recent = [s for s in _LINK["samples"] if _now - s[0] < 120]
+                if len(_recent) >= 4 and sum(1 for _t in stall_times if _now - _t < 120) >= 3:
+                    _ratios = sorted(s[3] / s[2] for s in _recent)        # link pace over media pace
+                    if _ratios[len(_ratios) // 2] < 1.05:
+                        _mbps = sorted(8 * s[1] / s[2] / 1e6 for s in _recent)[len(_recent) // 2]
+                        _need = sorted(8 * s[1] / s[3] / 1e6 for s in _recent)[len(_recent) // 2]
+                        link_told = True
+                        log(f"cast: the TV takes {_mbps:.1f} Mb/s and this quality needs {_need:.1f}; "
+                            f"asking for a lower one")
+                        try:
+                            with open(PROXY_LINK_FILE, "w", encoding="utf-8") as _lf:
+                                json.dump({"mbps": round(_mbps, 1), "need": round(_need, 1),
+                                           "ts": time.time(), "pid": os.getpid()}, _lf)
+                        except OSError:
+                            pass
             tele += 1
             if tele >= 7:          # ~ every 10s
                 tele = 0
@@ -6681,6 +6885,7 @@ def main():
     ap.add_argument("--thumb", default="", help=argparse.SUPPRESS)            # the page's own image, for that
     ap.add_argument("--others", action="store_true", help=argparse.SUPPRESS)  # let other senders on the network control the cast
     ap.add_argument("--no-awake", action="store_true", help=argparse.SUPPRESS)  # let the computer sleep during the cast
+    ap.add_argument("--hold-quality", action="store_true", help=argparse.SUPPRESS)  # the viewer picked this quality: never ask for a lower one
     ap.add_argument("--add-header", action="append", default=[], metavar="NAME=VALUE",
                     help="extra HTTP header for streamlink, repeatable (e.g. Referer=..., Cookie=...)")
     ap.add_argument("--insecure", action="store_true", help="don't verify TLS for the media fetch")

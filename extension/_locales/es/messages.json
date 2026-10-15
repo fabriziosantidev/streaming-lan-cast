@@ -157,5 +157,17 @@
   },
   "optCastAwake": {
     "message": "Mantener esta computadora despierta mientras transmite"
+  },
+  "autoDownMsg": {
+    "message": "Bajé a $1: el TV recibe $2 Mb/s y $3 necesita $4.",
+    "description": "$1 calidad nueva, $2 Mb/s medidos, $3 calidad anterior, $4 Mb/s que necesita"
+  },
+  "autoNoLowerMsg": {
+    "message": "El TV recibe $1 Mb/s y $2 necesita $3; no hay una calidad menor a la que bajar.",
+    "description": "$1 Mb/s medidos, $2 calidad, $3 Mb/s que necesita"
+  },
+  "autoBackBtn": {
+    "message": "Volver a $1",
+    "description": "$1 la calidad desde la que el helper bajó"
   }
 }

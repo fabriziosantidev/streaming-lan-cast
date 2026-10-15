@@ -18,6 +18,8 @@ let statusTimer = null;
 let activeUrl = "";
 let themeMode = "auto";
 let suppressUntil = 0;   // ignore casting:false during a quality re-cast (brief proxy gap)
+let recastHold = false;  // the next /cast carries a quality the viewer picked: the helper never steps it down
+let autoNote = null;     // the quality step the helper last reported, for the "back up" control
 let pagePos = 0;         // where the page's own player sits, offered as a starting point
 let pageDur = 0;         // its runtime, as the page's own player reports it
 let pageLive = false;    // the page says it is showing a broadcast that is still running
@@ -251,8 +253,41 @@ function startStatusPoll() {
       $("castingTitle").textContent = whatOf(s);
       // recover the quality dropdown if state arrived after the view was shown (e.g. helper restart)
       if (s.url && s.url !== qCtx.castQuality.url) populateCastQuality(s.url, s.quality);
+      // the helper may have stepped the quality itself: the trigger names what plays now
+      else if (s.quality && s.quality !== qCtx.castQuality.value) { qCtx.castQuality.value = s.quality; qSyncTrig("castQuality"); }
+      renderAuto(s);
     }
   }, 1500);
+}
+
+// A quality step the helper took because the TV pulled less than the quality needs: show the
+// measured and needed rates and offer the way back up. Without a lower quality to step to, it only
+// reports the shortfall.
+function renderAuto(s) {
+  const a = (s.casting && s.auto && s.auto.from) ? s.auto : null;
+  autoNote = a;
+  const box = $("autoNote");
+  if (!a) { box.hidden = true; return; }
+  const mb = (x) => String(Math.round((Number(x) || 0) * 10) / 10);
+  if (a.to) {
+    $("autoText").textContent = t("autoDownMsg", [a.to, mb(a.mbps), a.from, mb(a.need)]);
+    $("autoUp").textContent = t("autoBackBtn", [a.from]);
+    $("autoUp").hidden = false;
+  } else {
+    $("autoText").textContent = t("autoNoLowerMsg", [mb(a.mbps), a.from, mb(a.need)]);
+    $("autoUp").hidden = true;
+  }
+  box.hidden = false;
+}
+
+// Back to the quality the helper stepped down from. The helper keeps that pick for the rest of the
+// cast and does not step it down again.
+async function backUpQuality() {
+  const a = autoNote;
+  if (!a || !a.from) return;
+  $("autoUp").disabled = true;
+  try { await changeCastQuality(a.from); }
+  finally { $("autoUp").disabled = false; $("autoNote").hidden = true; }
 }
 function stopStatusPoll() { if (statusTimer) { clearInterval(statusTimer); statusTimer = null; } }
 
@@ -297,6 +332,7 @@ function showCasting(name, what, url, quality) {
   setLive(true);
   $("castingName").textContent = name;
   $("castingTitle").textContent = what || "";
+  $("autoNote").hidden = true;
   populateCastQuality(url || "", quality || "best");
   view("casting");
 }
@@ -443,9 +479,9 @@ async function changeCastQuality(val) {
   try {
     if (url && !isSupported(url)) {
       const tb = await activeTab();
-      if (tb && tb.url === url) { qCtx.quality.value = val; await castCurrentTab(); }   // re-cast at the new quality
+      if (tb && tb.url === url) { qCtx.quality.value = val; recastHold = true; await castCurrentTab(); }   // re-cast at the new quality
     } else {
-      await call("/quality?value=" + encodeURIComponent(val));
+      await call("/quality?value=" + encodeURIComponent(val) + "&hold=1");
     }
   } catch { notify(t("errNoHelper"), "err"); }
   setTimeout(() => setQSpin(false), RECAST_REENABLE_MS);       // proxy is up by then
@@ -1051,8 +1087,11 @@ async function castCurrentTab() {
       (castOpts.castMeta ? `&meta=1` : ``) +
       (castOpts.castMeta && pageImage ? `&thumb=${encodeURIComponent(pageImage)}` : ``) +
       (castOpts.castOthers ? `&others=1` : ``) +
-      (castOpts.castAwake === false ? `&awake=0` : ``);
+      (castOpts.castAwake === false ? `&awake=0` : ``) +
+      // a quality the viewer picked while casting holds: the helper never steps it down
+      (recastHold ? `&hold=1` : ``);
     castFrom = -1; castBehind = 0;      // consumed: a later plain cast opens on the live edge
+    recastHold = false;
     const r = await call("/cast", { method: "POST", body });
     if (r.ok) {
       // remember this cast's quality list extension-wide so the cast view shows it in any window/tab
@@ -1082,6 +1121,7 @@ document.addEventListener("click", (e) => {   // click outside a trigger/menu cl
 }, true);
 $("enableDetect").addEventListener("click", enableDetection);
 $("stopBtn").addEventListener("click", stopCast);
+$("autoUp").addEventListener("click", backUpQuality);
 $("retryHelper").addEventListener("click", init);
 $("getHelper").addEventListener("click", () => browser.tabs.create({ url: SITE_URL }));
 $("openOptions").addEventListener("click", () => browser.runtime.openOptionsPage());
