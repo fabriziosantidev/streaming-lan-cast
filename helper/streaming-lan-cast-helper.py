@@ -5984,6 +5984,25 @@ def run_cast(args):
     elif _open_at is not None:
         log(f"cast: opening at t={int(_open_at)}s")
     mc = cc.media_controller
+
+    def _media_channel_up(timeout=20.0):
+        """Wait for the receiver in the foreground to announce its media channel. The library sends
+        a load through that channel, and when the device has not listed it yet the library launches
+        the default media receiver in our receiver's place instead, which ends the cast at once. A
+        device that is slow to bring the receiver up lists the app before its channels."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                up = mc.is_active
+                if up() if callable(up) else up:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False
+
+    if not _media_channel_up():
+        log("cast: the receiver is up but has not announced its media channel; sending the load anyway")
     # Every load carries the same card, when the cast was asked to show one: what the receiver
     # and the cast controls on the other devices of the network display for it.
     _card = _cast_card(_page or source_url, _title, getattr(args, "thumb", "")) if getattr(args, "meta", False) else None
@@ -6168,6 +6187,8 @@ def run_cast(args):
                 if getattr(cc, "app_id", None) != _CAST_RECEIVER_APP:
                     log("cast: receiver app did not launch again; shutting down")
                     break
+                if not _media_channel_up():
+                    log("cast: the receiver is up but has not announced its media channel; sending the load anyway")
                 _re_url, _re_ct, _re_type, pos, _what = _reload_target()
                 log(f"cast: reloading the {_what}" + (f" at t={int(pos)}s" if pos else ""))
                 try:
