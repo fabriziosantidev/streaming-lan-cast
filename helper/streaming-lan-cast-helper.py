@@ -5347,6 +5347,7 @@ def run_cast(args):
     # resolved, fall back to proxying the given URL.
     _page = args.url or ""
     _low_latency = False
+    _win_url, _win_open = "", False   # a window over a recording, opened only by the HLS path below
     _relink = None      # resolves the page again when the source refuses the url being served
     _yt_dir = None      # temp dir + ffmpeg proc, set when a YouTube VOD is remuxed locally
     _yt_ff = None
