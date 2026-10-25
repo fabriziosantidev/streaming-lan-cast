@@ -943,22 +943,51 @@ def _redact_url(url):
     return (url or "").split("?", 1)[0]
 
 
-def _candidate_source_ips():
-    """Fast (no subprocess) list of local IPv4 source addresses to probe, with
-    loopback / APIPA / Tailscale-CGNAT filtered out. Returns [''] (default NIC)
-    if none survive."""
+def _local_ipv4s():
+    """The IPv4 addresses of this host's interfaces. Windows resolves the host name to every
+    adapter; Linux is asked interface by interface over ioctl, since its host
+    name resolves to loopback alone; macOS is read from ifconfig. Loopback and link-local are
+    left out."""
     ips = set()
-    p = _primary_multicast_ip()
-    if p:
-        ips.add(p)
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ips.add(info[4][0])
     except OSError:
         pass
+    if sys.platform.startswith("linux"):
+        try:
+            import fcntl, struct
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                for _idx, name in socket.if_nameindex():
+                    try:
+                        req = struct.pack("256s", name[:15].encode())
+                        ips.add(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, req)[20:24]))   # SIOCGIFADDR
+                    except OSError:
+                        pass                                   # an interface with no IPv4 address
+            finally:
+                s.close()
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3).stdout
+            ips.update(re.findall(r"^\s*inet (\d+\.\d+\.\d+\.\d+)", out, re.M))
+        except Exception:
+            pass
+    return {ip for ip in ips if not ip.startswith(("127.", "169.254."))}
+
+
+def _candidate_source_ips():
+    """The local IPv4 source addresses a LAN probe goes out from: every interface address that
+    is not loopback, link-local or Tailscale CGNAT (100.64.0.0/10), the routing table's pick for
+    multicast first when it survives the filter. With a VPN exit node, the routing table sends
+    multicast out the tunnel, where no TV answers; the interface list still has the LAN address.
+    Returns [''] (the default NIC) if none survive."""
+    primary = _primary_multicast_ip()
     out = []
-    for ip in ips:
-        if ip.startswith("127.") or ip.startswith("169.254."):
+    for ip in [primary] + sorted(_local_ipv4s() - {primary}):
+        if not ip or ip.startswith(("127.", "169.254.")):
             continue
         if ip.startswith("100."):                      # Tailscale CGNAT 100.64.0.0/10
             try:
