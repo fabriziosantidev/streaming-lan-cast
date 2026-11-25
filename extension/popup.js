@@ -501,7 +501,14 @@ async function refreshStartRow() {
   const row = $("startRow");
   const tb = await activeTab();
   if (tb.id == null || !isSupported(tb.url || "")) { row.hidden = true; $("castRow").hidden = false; return; }
-  const shown = readPageMedia(tb.id).then((pm) => {
+  const shown = readPageMedia(tb.id).then(async (pm) => {
+    // A player reporting a finite runtime with its position right behind it may be a broadcast
+    // whose runtime grows (see readPageMedia): read it again a moment later before deciding.
+    if (!pm.live && Number.isFinite(pm.d) && pm.d > 1 && pm.d - (pm.t || 0) < 60) {
+      await new Promise(r => setTimeout(r, 2200));
+      const again = await readPageMedia(tb.id).catch(() => null);
+      if (again && again.url) pm = again;
+    }
     tellPage(pm);
     pagePos = pm.t || 0;
     pageDur = pm.d || 0;
@@ -980,8 +987,21 @@ async function readPageMedia(tabId) {
     // it is reads as zero.
     if ((r.dvrWindow || 0) > dvrWindow) dvrWindow = r.dvrWindow;
   }
+  // A running broadcast whose element reports a finite runtime is one whose runtime is the end of
+  // what has arrived so far: it grows in step with the clock, and the position sits a few seconds
+  // short of it. Two readings a few seconds apart tell it from a video, which keeps its runtime.
+  const now = Date.now();
+  if (!live && Number.isFinite(d) && d > 0 && probeSeen.at && now - probeSeen.at >= 1500) {
+    const grew = d - probeSeen.d, dt = (now - probeSeen.at) / 1000;
+    if (grew >= 0.7 * dt && grew <= 1.5 * dt + 2 && d - t < 60) {
+      live = true; liveSrc = (liveSrc || "e") + "g";
+      behind = Math.max(0, d - t); atEdge = behind < 12; dvrWindow = 0;
+    }
+  }
+  probeSeen = { d, t, at: now };
   return { url, blobOnly, t, d, live, liveSrc, behind, atEdge, dvrWindow, og, err, frames: (res || []).length };
 }
+let probeSeen = { d: 0, t: 0, at: 0 };   // the last reading of the page's player, for the growth check above
 
 // Read off the path, so a signed query string does not hide the extension.
 function isHlsPlaylist(u) {
