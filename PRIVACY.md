@@ -70,7 +70,11 @@ the casting. The helper:
 - uses [streamlink](https://streamlink.github.io/) to fetch the live stream from the
   site you chose to cast, and
 - sends that stream to the DLNA or Google Cast device you select on your local
-  network (e.g. your TV), using standard UPnP/DLNA or the Google Cast protocol.
+  network (e.g. your TV), using standard UPnP/DLNA or the Google Cast protocol, and
+- reads the project's version file on GitHub every few hours, and fetches a newer
+  helper from the project's GitHub releases if you have turned on automatic updates
+  in the extension's Options or when you click "Update it" on the popup's new-version
+  notice. Those requests carry only the helper's version, in the User-Agent.
 
 These connections are made by your own machine, to destinations you choose, and are
 under your control. The helper does not report anything back to the developer. Its

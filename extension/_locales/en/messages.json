@@ -53,6 +53,15 @@
   "updateHelper": {
     "message": "Update it"
   },
+  "updatingHelper": {
+    "message": "Updating…"
+  },
+  "updateBusyMsg": {
+    "message": "Stop the cast first, then update the helper."
+  },
+  "updateFailedMsg": {
+    "message": "The helper could not update itself. Click the notice again to get the new version from the project's page."
+  },
   "castingTo": {
     "message": "Casting to"
   },
@@ -169,5 +178,42 @@
   "autoBackBtn": {
     "message": "Back to $1",
     "description": "$1 the quality the helper stepped down from"
+  },
+  "optUpdAsk": {
+    "message": "Should the helper update itself?"
+  },
+  "optUpdAskHelp": {
+    "message": "It installs only versions signed by the project, never during a cast. You can change this later under Helper updates."
+  },
+  "optUpdYes": {
+    "message": "Yes, update it automatically"
+  },
+  "optUpdNo": {
+    "message": "No, I'll update it myself"
+  },
+  "optUpdHead": {
+    "message": "Helper updates"
+  },
+  "optAutoUpdate": {
+    "message": "Install new helper versions automatically"
+  },
+  "optAutoUpdateHelp": {
+    "message": "Signed versions only, never during a cast."
+  },
+  "optAutoUpdOffEnv": {
+    "message": "Turned off on this computer by SLC_AUTO_UPDATE=0, whatever this box says."
+  },
+  "optAutoUpdOffSource": {
+    "message": "This helper runs from a copy of the source code, so it updates through git rather than by itself."
+  },
+  "optAutoUpdOffReadonly": {
+    "message": "The helper cannot write to the folder it is installed in, so it cannot update itself. Run the installer again to update it."
+  },
+  "optAutoUpdOffPlatform": {
+    "message": "This helper build does not update itself. Run the installer again to update it."
+  },
+  "helperUpdatedMsg": {
+    "message": "The helper now runs version $1.",
+    "description": "$1 the helper version now running"
   }
 }

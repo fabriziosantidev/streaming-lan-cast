@@ -142,8 +142,22 @@ A python.org build of Python keeps its identity across updates, so the permissio
 
 ## Updating
 
-Re-run the installer (the one-liner, or `./installer/unix/install.sh` from a checkout). It reuses the
-venv, updates streamlink and the helper, and restarts.
+From 0.6.0 on, the helper can update itself. This is off until you turn it on: the extension's
+Options ask about it next to the token, and keep the switch under **Helper updates**. With it on,
+every few hours the helper reads the project's release manifest, and when a newer version is out it
+installs it once nothing is casting, then restarts. It installs
+only a release signed with the project's key, and it adds to its venv any Python package the new
+version needs. The file it replaced stays beside it as `streaming-lan-cast-helper.py.prev`, and a
+new version that keeps stopping right after it starts goes back to that file on its own.
+
+To turn it off again, clear **Install new helper versions automatically** in the extension's
+Options, or set `SLC_AUTO_UPDATE=0` in the service's environment. A helper run from a git checkout never
+updates itself: `git pull` and restart it.
+
+To update by hand from 0.6.0 on, click **Update it** in the popup's notice about a new version: the
+helper installs it right away, as long as nothing is casting. From a version older than 0.6.0,
+re-run the installer (the one-liner, or `./installer/unix/install.sh` from a checkout). It reuses the venv, updates streamlink and the
+helper, and restarts.
 
 ---
 

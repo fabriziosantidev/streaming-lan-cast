@@ -8,6 +8,47 @@ async function load() {
   $("castMeta").checked = !!st.castMeta;
   $("castOthers").checked = !!st.castOthers;
   $("castAwake").checked = st.castAwake !== false;    // on until turned off here
+  loadAutoUpdate();
+}
+
+// The update setting lives in the helper, which acts on it without the extension: the box shows
+// what the helper reports, and a change is sent to it (and kept here, so the popup can resend it
+// to a helper that was not running when it changed). It starts off, and until it is answered the
+// token step asks about it.
+const AUTO_OFF_MSG = { env: "optAutoUpdOffEnv", source: "optAutoUpdOffSource",
+                       readonly: "optAutoUpdOffReadonly", platform: "optAutoUpdOffPlatform" };
+async function loadAutoUpdate() {
+  const st = await browser.storage.local.get(["token", "autoUpdate"]);
+  $("autoUpdate").checked = st.autoUpdate === true;
+  $("updAsk").hidden = typeof st.autoUpdate === "boolean";
+  try {
+    const r = await fetch(CONTROL + "/ping", { cache: "no-store", headers: { [TOKEN_HEADER]: st.token || "" } });
+    if (!r.ok) return;
+    const ping = await r.json();
+    if (typeof st.autoUpdate !== "boolean" && typeof ping.auto_update === "boolean") $("autoUpdate").checked = ping.auto_update;
+    const why = ping.auto_update_off && AUTO_OFF_MSG[ping.auto_update_off];
+    $("autoUpdOff").textContent = why ? (browser.i18n.getMessage(why) || "") : "";
+    $("autoUpdOff").hidden = !why;
+  } catch {}
+}
+async function saveAutoUpdate() {
+  const on = $("autoUpdate").checked;
+  await browser.storage.local.set({ autoUpdate: on });
+  const { token } = await browser.storage.local.get("token");
+  try {
+    await fetch(CONTROL + "/settings", {
+      method: "POST", cache: "no-store", body: "auto_update=" + (on ? "1" : "0"),
+      headers: { [TOKEN_HEADER]: token || "", "Content-Type": "application/x-www-form-urlencoded" },
+    });
+  } catch {}
+}
+$("autoUpdate").addEventListener("change", saveAutoUpdate);
+for (const [id, on] of [["updYes", true], ["updNo", false]]) {
+  $(id).addEventListener("click", () => {
+    $("autoUpdate").checked = on;
+    $("updAsk").hidden = true;
+    saveAutoUpdate();
+  });
 }
 // Both are off until turned on here: a cast shows nothing about itself to the other devices on
 // the network and takes no commands from them.

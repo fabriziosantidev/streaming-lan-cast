@@ -180,6 +180,7 @@ async function init() {
   try { ping = await call("/ping", { timeoutMs: 2500 }); }
   catch (e) { stopAll(); setLive(false); return view(e && e.unauthorized ? "needToken" : "noHelper"); }
   checkHelperVersion(ping);
+  syncHelperUpdates(ping);
   let status = {};
   try { status = await call("/status"); } catch {}
   if (status.casting) {
@@ -206,7 +207,63 @@ function checkHelperVersion(ping) {
   } else {
     behind = !helper || mm(helper) < mm(browser.runtime.getManifest().version);
   }
-  $("helperOld").hidden = !behind;
+  // A helper that installs updates itself needs no nudge, unless an install failed or it cannot.
+  if (ping && ping.auto_update === true && !ping.auto_update_off && !ping.update_failed) behind = false;
+  helperUpdateReady = (ping && ping.update_ready) || "";
+  if (!updatingHelper) $("helperOld").hidden = !behind;
+}
+
+// "Update it" asks a helper that can replace itself to install the new version now; the notice then
+// waits for the restarted helper to report it. An older helper, or one that cannot, gets the
+// download page instead.
+let helperUpdateReady = "", updatingHelper = false;
+async function updateHelperNow() {
+  updatingHelper = true;
+  const link = $("updateHelperLink");
+  link.textContent = t("updatingHelper");
+  const stop = (msg) => {
+    updatingHelper = false;
+    helperUpdateReady = "";                  // the next click opens the download page
+    link.textContent = t("updateHelper");
+    if (msg) notify(msg, "err");
+  };
+  let r = {};
+  try { r = await call("/update", { method: "POST", body: "" }); } catch {}
+  if (!r.ok) {
+    if (r.error === "casting") { updatingHelper = false; link.textContent = t("updateHelper"); notify(t("updateBusyMsg"), "err"); }
+    else stop(t("updateFailedMsg"));
+    return;
+  }
+  const until = Date.now() + 180000;
+  while (Date.now() < until) {
+    await new Promise((res) => setTimeout(res, 2000));
+    let p = null;
+    try { p = await call("/ping", { timeoutMs: 2000 }); } catch {}
+    if (p && p.version === r.version) {
+      updatingHelper = false;
+      link.textContent = t("updateHelper");
+      checkHelperVersion(p);
+      syncHelperUpdates(p);
+      return;
+    }
+  }
+  stop(t("updateFailedMsg"));
+}
+
+// Send the update setting chosen in the options to a helper that reports another one (it was not
+// running when the option changed), and say once that the helper updated itself.
+async function syncHelperUpdates(ping) {
+  if (!ping) return;
+  let st = {};
+  try { st = await browser.storage.local.get(["autoUpdate", "updateSeen"]); } catch {}
+  if (typeof st.autoUpdate === "boolean" && typeof ping.auto_update === "boolean" && st.autoUpdate !== ping.auto_update) {
+    call("/settings", { method: "POST", body: "auto_update=" + (st.autoUpdate ? "1" : "0") }).catch(() => {});
+  }
+  const up = ping.updated;
+  if (up && up.to && up.to === ping.version && st.updateSeen !== up.to) {
+    notify(t("helperUpdatedMsg", [up.to]), "");
+    browser.storage.local.set({ updateSeen: up.to }).catch(() => {});
+  }
 }
 function stopAll() { stopScan(); stopStatusPoll(); }
 
@@ -1199,7 +1256,12 @@ $("backLive").addEventListener("click", async () => {
   catch { notify(t("errNoHelper"), "err"); }
 });
 $("notice").addEventListener("click", () => { $("notice").hidden = true; clearTimeout(noticeTimer); });
-$("helperOld").addEventListener("click", (e) => { e.preventDefault(); browser.tabs.create({ url: SITE_URL + "#update" }); });
+$("helperOld").addEventListener("click", (e) => {
+  e.preventDefault();
+  if (updatingHelper) return;
+  if (helperUpdateReady) updateHelperNow();
+  else browser.tabs.create({ url: SITE_URL + "#update" });
+});
 
 // boot
 localize();

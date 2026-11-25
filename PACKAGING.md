@@ -138,6 +138,49 @@ at least `min_extension`. So:
 A helper too old to report `latest` falls back to comparing against the extension's own version, so
 bumping the extension still nudges those users.
 
+## Self-update
+
+From 0.6.0 on, `docs/version.json` also carries an `update` block, and a helper whose user turned
+self-update on installs it by itself:
+
+```
+"update": {
+  "version": "0.6.0",
+  "files": {
+    "python":  { "url": "https://raw.githubusercontent.com/.../v0.6.0/helper/streaming-lan-cast-helper.py",
+                 "sha256": "...", "size": 123456, "pip": ["streamlink", "pychromecast", "curl_cffi", "yt-dlp"] },
+    "windows": { "url": "https://github.com/.../releases/download/v0.6.0/Streaming-LAN-Cast-Setup-0.6.0.exe",
+                 "sha256": "...", "size": 85000000 }
+  },
+  "sig": "<Ed25519 signature, hex>"
+}
+```
+
+The signature covers `slc-update-v1\n` followed by the block without `sig`, as JSON with sorted keys
+and no spaces. The helper checks it against the public key it carries (`UPDATE_PUBKEY`); the
+private key stays with the maintainer, outside the repository. A block that does not verify is
+ignored, and a download whose size or SHA-256 differs from the signed entry is discarded.
+
+An update runs only while nothing is casting and the extension has sent nothing for ten minutes:
+
+- **Python helper (Linux, macOS):** the new file has to compile, the helper installs the packages in
+  `pip` into its own interpreter, and the new file has to answer `--self-check` with the announced
+  version. Then it replaces the running file (the old one stays as `.prev`) and the process restarts
+  in place. A new version that stops three times right after starting restores `.prev`.
+- **Windows:** the new installer runs with `/VERYSILENT`; it stops the helper, replaces the files and
+  starts the helper again, keeping the token.
+
+A verified update can also be installed on request: the popup's notice about a new version sends
+`POST /update`, which installs it at once unless a cast is running, whether or not self-update is
+on. `/ping` reports such an update as `update_ready`. The helper still refuses it when
+`SLC_AUTO_UPDATE=0` is set, when it runs from a git checkout or when the install is read-only.
+
+The helper tries each version at most twice on its own. Self-update is off by default. The extension's Options
+ask about it next to the token and have a switch to turn it on or off; the helper keeps that choice in
+`~/.streaming-lan-cast/settings.json`, and `SLC_AUTO_UPDATE=0` turns it off regardless. A distribution
+package that ships its own updates should set that variable. A helper run from a git checkout never
+updates itself.
+
 ## Quick reference
 ```
 web-ext lint  -s extension                 # check

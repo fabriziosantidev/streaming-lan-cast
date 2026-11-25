@@ -53,6 +53,15 @@
   "updateHelper": {
     "message": "Actualizar"
   },
+  "updatingHelper": {
+    "message": "Actualizando…"
+  },
+  "updateBusyMsg": {
+    "message": "Primero detené la transmisión y después actualizá el ayudante."
+  },
+  "updateFailedMsg": {
+    "message": "El ayudante no pudo actualizarse solo. Tocá el aviso de nuevo para bajar la versión nueva desde la página del proyecto."
+  },
   "castingTo": {
     "message": "Casteando a"
   },
@@ -169,5 +178,42 @@
   "autoBackBtn": {
     "message": "Volver a $1",
     "description": "$1 la calidad desde la que el helper bajó"
+  },
+  "optUpdAsk": {
+    "message": "¿Querés que el ayudante se actualice solo?"
+  },
+  "optUpdAskHelp": {
+    "message": "Instala solo versiones firmadas por el proyecto, nunca durante una transmisión. Podés cambiarlo después en Actualizaciones del ayudante."
+  },
+  "optUpdYes": {
+    "message": "Sí, que se actualice solo"
+  },
+  "optUpdNo": {
+    "message": "No, lo actualizo yo"
+  },
+  "optUpdHead": {
+    "message": "Actualizaciones del ayudante"
+  },
+  "optAutoUpdate": {
+    "message": "Instalar automáticamente las versiones nuevas del ayudante"
+  },
+  "optAutoUpdateHelp": {
+    "message": "Solo versiones firmadas, nunca durante una transmisión."
+  },
+  "optAutoUpdOffEnv": {
+    "message": "Desactivado en esta computadora por SLC_AUTO_UPDATE=0, diga lo que diga esta casilla."
+  },
+  "optAutoUpdOffSource": {
+    "message": "Este ayudante corre desde una copia del código fuente, así que se actualiza con git y no por su cuenta."
+  },
+  "optAutoUpdOffReadonly": {
+    "message": "El ayudante no puede escribir en la carpeta donde está instalado, así que no puede actualizarse solo. Para actualizarlo, corré el instalador de nuevo."
+  },
+  "optAutoUpdOffPlatform": {
+    "message": "Esta versión del ayudante no se actualiza sola. Para actualizarlo, corré el instalador de nuevo."
+  },
+  "helperUpdatedMsg": {
+    "message": "El ayudante ya está en la versión $1.",
+    "description": "$1 la versión del helper que corre ahora"
   }
 }

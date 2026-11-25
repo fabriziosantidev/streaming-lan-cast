@@ -48,6 +48,7 @@ Usage:
 import argparse
 import getpass
 import gzip
+import hashlib
 import html
 import http.server
 import json
@@ -75,7 +76,10 @@ HELPER_VERSION = "0.5.17"  # reported to the extension via /ping; for a release 
 # Canonical "latest published helper" manifest, checked in the background so /ping can tell the
 # extension when a newer helper is out and the minimum extension that helper needs (docs/version.json).
 VERSION_URL = "https://fabriziosantidev.github.io/streaming-lan-cast/version.json"
-_UPDATE = {"latest": "", "min_ext": ""}   # last successful check; stays empty until/unless one succeeds
+_UPDATE = {"latest": "", "min_ext": "",   # last successful check; stays empty until/unless one succeeds
+           "block": None,                # the published update block, kept only when its signature verifies
+           "updated": None,              # {"from", "to"} after this helper updated itself, for the popup
+           "failed": ""}                 # a version this helper tried to install and could not
 DEFAULT_URL = ""           # the extension passes the stream URL per cast
 DEFAULT_TV = ""            # the extension passes the chosen renderer's IP per cast
 DMR_PORT = 9197
@@ -2807,24 +2811,42 @@ def cast_quit(host, port, uuid, model, name):
 
 def _check_latest_version():
     """Best-effort background check of the published version manifest, so /ping can tell the extension
-    whether a newer helper exists and the minimum extension that helper needs. Never raises; a failed
-    or missing check leaves the cache empty and the extension falls back to its own version compare."""
+    whether a newer helper exists and the minimum extension that helper needs, and so the self-update
+    knows what a release offers. Never raises; a failed or missing check leaves the cache as it was and
+    the extension falls back to its own version compare."""
     try:
-        req = urllib.request.Request(VERSION_URL, headers={"User-Agent": f"streaming-lan-cast/{HELPER_VERSION}"})
+        url = os.environ.get("SLC_UPDATE_URL") or VERSION_URL
+        req = urllib.request.Request(url, headers={"User-Agent": f"streaming-lan-cast/{HELPER_VERSION}"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read(4096).decode("utf-8", "replace"))
+            data = json.loads(r.read(65536).decode("utf-8", "replace"))
         latest = str(data.get("helper", "")).strip()
         if re.match(r"^\d+\.\d+", latest):
             _UPDATE["latest"] = latest
             _UPDATE["min_ext"] = str(data.get("min_extension", "") or "").strip()
+        block = data.get("update")
+        if isinstance(block, dict) and _update_block_ok(block):
+            _UPDATE["block"] = block
+        elif block:
+            _UPDATE["block"] = None
+            log("update: the published update block does not carry a valid signature; ignoring it")
     except Exception:
         pass
 
 
-def _update_check_loop():
+def _update_check_loop(is_idle=None):
+    """Checks the manifest every few hours. Between checks, a verified update newer than this helper
+    is installed as soon as is_idle() says nothing is casting and the extension has gone quiet."""
+    every = float(os.environ.get("SLC_UPDATE_EVERY") or 6 * 3600)
     while True:
         _check_latest_version()
-        time.sleep(6 * 3600)
+        deadline = time.monotonic() + every
+        while True:
+            if is_idle is not None:
+                _maybe_self_update(is_idle)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(300.0, left))
 
 
 def _refresh_ytdlp():
@@ -2861,6 +2883,310 @@ def _refresh_ytdlp_loop():
         time.sleep(24 * 3600)
 
 
+# --- Self-update ------------------------------------------------------------------------------
+# A release lists in version.json an "update" block: the new version and, for each platform, the
+# url, size and SHA-256 of what to install, signed with the release key whose public half is
+# UPDATE_PUBKEY. The helper installs an update only when that signature verifies and the download
+# matches, only while nothing is casting and the extension has been quiet for UPDATE_IDLE_SECS, and
+# only while the setting is on. The setting starts off: the extension asks about it when the token
+# is set up. The Python helper swaps its own file and restarts in place; the
+# Windows build runs the new installer silently, which replaces the files and starts the helper.
+UPDATE_PUBKEY = "a18d82c98a4aebea3948a5bba222a43869998a168f27b626647a11d71c440029"
+UPDATE_DOMAIN = b"slc-update-v1\n"       # prefixed to the signed content, so the key signs nothing else
+SETTINGS_FILE = os.path.join(TOKEN_DIR, "settings.json")
+UPDATE_DIR = os.path.join(TOKEN_DIR, "update")
+UPDATE_MARK = os.path.join(UPDATE_DIR, "pending.json")   # written before an install, read by the next start
+UPDATE_LAST = os.path.join(UPDATE_DIR, "last.json")      # the last update that took, for the popup's notice
+UPDATE_STATE = os.path.join(UPDATE_DIR, "state.json")    # install attempts per version
+UPDATE_IDLE_SECS = float(os.environ.get("SLC_UPDATE_IDLE") or 600)
+UPDATE_MAX_BYTES = 300 * 1024 * 1024
+UPDATE_TRIES = 2                         # attempts per version before it is left alone
+_ACTIVITY = {"at": time.monotonic()}     # the last request from the extension other than a ping
+_UPDATE_LOCK = threading.Lock()          # one install at a time, from the loop or from /update
+
+
+def _ed25519_verify(pub, msg, sig):
+    """RFC 8032 Ed25519 verification ([S]B == R + [k]A) in plain integer arithmetic."""
+    p = 2 ** 255 - 19
+    q = 2 ** 252 + 27742317777372353535851937790883648493
+    d = -121665 * pow(121666, p - 2, p) % p
+    sqrt_m1 = pow(2, (p - 1) // 4, p)
+
+    def recover_x(y, sign):
+        if y >= p:
+            return None
+        x2 = (y * y - 1) * pow(d * y * y + 1, p - 2, p) % p
+        if x2 == 0:
+            return None if sign else 0
+        x = pow(x2, (p + 3) // 8, p)
+        if (x * x - x2) % p:
+            x = x * sqrt_m1 % p
+        if (x * x - x2) % p:
+            return None
+        return p - x if (x & 1) != sign else x
+
+    def add(a, b):
+        A = (a[1] - a[0]) * (b[1] - b[0]) % p
+        B = (a[1] + a[0]) * (b[1] + b[0]) % p
+        C = 2 * a[3] * b[3] * d % p
+        D = 2 * a[2] * b[2] % p
+        E, F, G, H = B - A, D - C, D + C, B + A
+        return (E * F % p, G * H % p, F * G % p, E * H % p)
+
+    def mul(n, pt):
+        acc = (0, 1, 1, 0)
+        while n:
+            if n & 1:
+                acc = add(acc, pt)
+            pt = add(pt, pt)
+            n >>= 1
+        return acc
+
+    def point(b):
+        y = int.from_bytes(b, "little")
+        sign, y = y >> 255, y & ((1 << 255) - 1)
+        x = recover_x(y, sign)
+        return None if x is None else (x, y, 1, x * y % p)
+
+    if len(pub) != 32 or len(sig) != 64:
+        return False
+    by = 4 * pow(5, p - 2, p) % p
+    bx = recover_x(by, 0)
+    base = (bx, by, 1, bx * by % p)
+    A, R = point(pub), point(sig[:32])
+    s_ = int.from_bytes(sig[32:], "little")
+    if A is None or R is None or s_ >= q:
+        return False
+    k = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % q
+    lhs, rhs = mul(s_, base), add(R, mul(k, A))
+    return (lhs[0] * rhs[2] - rhs[0] * lhs[2]) % p == 0 and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % p == 0
+
+
+def _update_block_ok(block):
+    """True when the update block carries the release key's signature over the rest of itself."""
+    try:
+        body = {k: v for k, v in block.items() if k != "sig"}
+        msg = UPDATE_DOMAIN + json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        key = os.environ.get("SLC_UPDATE_KEY") or UPDATE_PUBKEY
+        return _ed25519_verify(bytes.fromhex(key), msg, bytes.fromhex(str(block.get("sig") or "")))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _ver_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:3]) or (0,)
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path, data):
+    """Owner-only, replaced in one step so a reader never sees half a file."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _auto_update_setting():
+    return _read_json(SETTINGS_FILE).get("auto_update") is True   # off until turned on
+
+
+def _self_update_blocker():
+    """Why this helper does not update itself ('' when it does): turned off in the settings or by
+    SLC_AUTO_UPDATE=0, a source checkout (which updates through git), a file it cannot replace, or
+    a frozen build other than the Windows one."""
+    if os.environ.get("SLC_AUTO_UPDATE", "").strip() == "0":
+        return "env"
+    if not _auto_update_setting():
+        return "setting"
+    if FROZEN:
+        return "" if IS_WIN else "platform"
+    here = os.path.abspath(__file__)
+    d = os.path.dirname(here)
+    if os.path.exists(os.path.join(d, ".git")) or os.path.exists(os.path.join(os.path.dirname(d), ".git")):
+        return "source"
+    if not (os.access(here, os.W_OK) and os.access(d, os.W_OK)):
+        return "readonly"
+    return ""
+
+
+def _pending_update():
+    """(version, file entry) of a verified update newer than this helper for this platform, else
+    ('', None). Outside a test run (SLC_UPDATE_URL) the file has to come over https."""
+    b = _UPDATE.get("block") or {}
+    ver = str(b.get("version") or "")
+    if not ver or _ver_tuple(ver) <= _ver_tuple(HELPER_VERSION):
+        return "", None
+    entry = (b.get("files") or {}).get("windows" if FROZEN else "python")
+    if not isinstance(entry, dict):
+        return "", None
+    url = str(entry.get("url") or "")
+    if not (url.startswith("https://") or (os.environ.get("SLC_UPDATE_URL") and url.startswith("http://"))):
+        return "", None
+    return ver, entry
+
+
+def _fetch_update(entry, dest):
+    """Download entry's url to dest, checking its size and SHA-256 against the signed entry."""
+    want, size = str(entry.get("sha256") or "").lower(), int(entry.get("size") or 0)
+    if not re.fullmatch(r"[0-9a-f]{64}", want) or not 0 < size <= UPDATE_MAX_BYTES:
+        raise ValueError("the entry has no usable hash or size")
+    part, h, got = dest + ".part", hashlib.sha256(), 0
+    req = urllib.request.Request(entry["url"], headers={"User-Agent": f"streaming-lan-cast/{HELPER_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > size:
+                    raise ValueError("the download is larger than the signed size")
+                h.update(chunk)
+                f.write(chunk)
+        if got != size or h.hexdigest() != want:
+            raise ValueError("the download does not match the signed hash")
+        os.replace(part, dest)
+    finally:
+        _safe_unlink(part)
+
+
+def _apply_python_update(entry, ver):
+    """Replace this file with the new helper and restart in place. The new file has to compile,
+    find its dependencies (missing ones are installed into this venv) and report the announced
+    version before it replaces this one; the previous file is kept beside it."""
+    here = os.path.abspath(__file__)
+    new = here + ".new"
+    py = sys.executable
+    try:
+        _fetch_update(entry, new)
+        r = subprocess.run([py, "-m", "py_compile", new], capture_output=True, text=True, timeout=120)
+        if r.returncode:
+            raise RuntimeError("the new helper does not compile")
+        pip = [x for x in (entry.get("pip") or []) if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(x))]
+        if pip:
+            r = subprocess.run([py, "-m", "pip", "install", "--quiet", *pip],
+                               capture_output=True, text=True, timeout=900)
+            if r.returncode:
+                raise RuntimeError(f"pip could not install its dependencies: {(r.stderr or '').strip()[-120:]}")
+        r = subprocess.run([py, new, "--self-check"], capture_output=True, text=True, timeout=120)
+        said = (r.stdout or "").strip()
+        if r.returncode or said != ver:
+            raise RuntimeError(f"the new helper's self-check reported {said[:40]!r} ({(r.stderr or '').strip()[-120:]})")
+        shutil.copy2(here, here + ".prev")
+        _write_json(UPDATE_MARK, {"from": HELPER_VERSION, "to": ver, "at": time.time(), "boots": 0})
+        os.replace(new, here)
+    finally:
+        _safe_unlink(new)
+    log(f"update: {ver} installed over {HELPER_VERSION}; restarting")
+    os.execv(py, [py, here] + sys.argv[1:])
+
+
+def _apply_windows_update(entry, ver):
+    """Run the new installer silently and exit, so its files are free to replace. The installer
+    starts the new helper once it is done."""
+    exe = os.path.join(UPDATE_DIR, f"Streaming-LAN-Cast-Setup-{ver}.exe")
+    os.makedirs(UPDATE_DIR, mode=0o700, exist_ok=True)
+    _fetch_update(entry, exe)
+    _write_json(UPDATE_MARK, {"from": HELPER_VERSION, "to": ver, "at": time.time(), "boots": 0})
+    setup_log = os.path.join(tempfile.gettempdir(), "streaming-lan-cast-update.log")
+    argv = [exe, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/LOG={setup_log}"]
+    detached = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(argv, creationflags=detached | 0x01000000, close_fds=True)   # + CREATE_BREAKAWAY_FROM_JOB
+    except OSError:
+        subprocess.Popen(argv, creationflags=detached, close_fds=True)
+    log(f"update: the {ver} installer is running (setup log {setup_log}); this helper exits for it")
+    time.sleep(0.5)
+    os._exit(0)
+
+
+def _update_ready():
+    """(version, entry) of a verified update this helper could install now if asked, setting aside
+    whether automatic updates are on; ('', None) when there is none or it cannot replace itself."""
+    ver, entry = _pending_update()
+    if not entry or _self_update_blocker() not in ("", "setting"):
+        return "", None
+    return ver, entry
+
+
+def _install_update(ver, entry, asked=False):
+    """Install ver. The automatic loop gives a version UPDATE_TRIES attempts and leaves alone one
+    that kept a helper from starting; an install the user asks for from the popup always runs."""
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        return
+    try:
+        st = _read_json(UPDATE_STATE)
+        tried = st.setdefault("tried", {})
+        if not asked and (ver in st.get("gave_up", []) or int(tried.get(ver, 0)) >= UPDATE_TRIES):
+            _UPDATE["failed"] = ver             # left alone: the popup offers the update again
+            return
+        tried[ver] = int(tried.get(ver, 0)) + 1
+        _write_json(UPDATE_STATE, st)
+        how = "asked from the popup" if asked else f"attempt {tried[ver]} of {UPDATE_TRIES}"
+        log(f"update: installing {ver} over {HELPER_VERSION} ({how})")
+        (_apply_windows_update if FROZEN else _apply_python_update)(entry, ver)
+    except Exception as e:
+        _UPDATE["failed"] = ver
+        log(f"update: {ver} not installed: {type(e).__name__}: {str(e)[:160]}")
+    finally:
+        _UPDATE_LOCK.release()
+
+
+def _maybe_self_update(is_idle):
+    ver, entry = _pending_update()
+    if not entry or _self_update_blocker() or not is_idle():
+        return
+    _install_update(ver, entry)
+
+
+def _note_update_outcome():
+    """At start, settle an update the previous process began. A Python helper that keeps dying
+    right after an update goes back to the file it replaced, and that version is left alone."""
+    m = _read_json(UPDATE_MARK)
+    if not m:
+        last = _read_json(UPDATE_LAST)
+        if last.get("to") == HELPER_VERSION and time.time() - float(last.get("at") or 0) < 3 * 86400:
+            _UPDATE["updated"] = {"from": last.get("from"), "to": last.get("to")}
+        return
+    to, frm = str(m.get("to") or ""), str(m.get("from") or "")
+    if to != HELPER_VERSION:
+        _UPDATE["failed"] = to
+        _safe_unlink(UPDATE_MARK)
+        log(f"update: {to} did not take; still running {HELPER_VERSION}")
+        return
+    here = os.path.abspath(__file__)
+    boots = int(m.get("boots") or 0) + 1
+    if not FROZEN and boots > 3 and os.path.exists(here + ".prev"):
+        st = _read_json(UPDATE_STATE)
+        st.setdefault("gave_up", []).append(to)
+        _write_json(UPDATE_STATE, st)
+        _safe_unlink(UPDATE_MARK)
+        log(f"update: {to} stopped {boots - 1} times right after starting; going back to {frm}")
+        os.replace(here + ".prev", here)
+        os.execv(sys.executable, [sys.executable, here] + sys.argv[1:])
+    m["boots"] = boots
+    _write_json(UPDATE_MARK, m)
+    if boots == 1:
+        log(f"update: now running {to} (was {frm})")
+    _UPDATE["updated"] = {"from": frm, "to": to}
+
+    def _settle():
+        time.sleep(120)                         # up for two minutes: the update has taken
+        _write_json(UPDATE_LAST, {"from": frm, "to": to, "at": m.get("at") or time.time()})
+        _safe_unlink(UPDATE_MARK)
+    threading.Thread(target=_settle, daemon=True).start()
+
+
 def _lower_quality(snap):
     """The quality one step below the cast's, as (label, media url), from the page's ladder
     when the cast has one, else from the renditions the resolver lists for the page; ('', '')
@@ -2886,6 +3212,7 @@ def _lower_quality(snap):
 def serve_control(port):
     self_script = os.path.abspath(__file__)
     _rotate_log_on_version_change()   # a helper update starts a fresh log (old one -> LOGFILE.old)
+    _note_update_outcome()
     TOKEN = load_or_create_token()
     _tok_ok, _tok_detail = secure_token_file()
     log(f"token file: {TOKEN_FILE} ({_tok_detail})")
@@ -3105,6 +3432,8 @@ def serve_control(port):
             if not self._host_ok() or not self._authed():
                 return
             u = urllib.parse.urlparse(self.path)
+            if u.path != "/ping":
+                _ACTIVITY["at"] = time.monotonic()
             q = urllib.parse.parse_qs(u.query)
             handler = {
                 "/devices": self._devices,
@@ -3127,6 +3456,7 @@ def serve_control(port):
             if not self._host_ok() or not self._authed():
                 return
             u = urllib.parse.urlparse(self.path)
+            _ACTIVITY["at"] = time.monotonic()
             try:
                 length = int(self.headers.get("Content-Length", 0) or 0)
             except ValueError:
@@ -3144,6 +3474,10 @@ def serve_control(port):
                 self._recording(q)
             elif u.path == "/quit":
                 self._quit(q)
+            elif u.path == "/settings":
+                self._settings(q)
+            elif u.path == "/update":
+                self._update_now(q)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
 
@@ -3652,7 +3986,46 @@ def serve_control(port):
                 resp["latest"] = _UPDATE["latest"]
                 if _UPDATE["min_ext"]:
                     resp["min_ext"] = _UPDATE["min_ext"]
+            resp["auto_update"] = _auto_update_setting()
+            _off = _self_update_blocker()
+            if _off and _off != "setting":
+                resp["auto_update_off"] = _off       # env, source, readonly or platform
+            if _UPDATE["updated"]:
+                resp["updated"] = _UPDATE["updated"]
+            if _UPDATE["failed"]:
+                resp["update_failed"] = _UPDATE["failed"]
+            _ready, _entry = _update_ready()
+            if _entry:
+                resp["update_ready"] = _ready        # the popup's notice can install it on a click
             self._json(resp)
+
+        def _update_now(self, q):
+            # The popup's update notice asks for the verified update to be installed now, whether or
+            # not automatic updates are on, unless a cast is running.
+            ver, entry = _update_ready()
+            if not entry:
+                _check_latest_version()
+                ver, entry = _update_ready()
+            if not entry:
+                self._json({"ok": False, "error": _self_update_blocker() or "none"})
+                return
+            with _state_lock:
+                casting = bool(state.get("url"))
+            if casting or proxy_alive():
+                self._json({"ok": False, "error": "casting"})
+                return
+            self._json({"ok": True, "version": ver})
+            threading.Thread(target=lambda: (time.sleep(0.3), _install_update(ver, entry, asked=True)),
+                             daemon=True).start()
+
+        def _settings(self, q):
+            v = (q.get("auto_update", [""])[0]).strip()
+            if v in ("0", "1"):
+                st = _read_json(SETTINGS_FILE)
+                st["auto_update"] = v == "1"
+                _write_json(SETTINGS_FILE, st)
+                log(f"settings: automatic helper updates {'on' if v == '1' else 'off'}")
+            self._json({"ok": True, "auto_update": _auto_update_setting()})
 
         def _quit(self, q):
             # Graceful self-shutdown so an installer can replace our exe without killing us from
@@ -3688,7 +4061,13 @@ def serve_control(port):
             time.sleep(25)
     threading.Thread(target=_dev_loop, daemon=True).start()
 
-    threading.Thread(target=_update_check_loop, daemon=True).start()   # keeps /ping's latest/min_ext fresh
+    def _idle_for_update():
+        with _state_lock:
+            casting = bool(state.get("url"))
+        return (not casting and not proxy_alive()
+                and time.monotonic() - _ACTIVITY["at"] >= UPDATE_IDLE_SECS)
+    # keeps /ping's latest/min_ext fresh, and installs a verified update while idle
+    threading.Thread(target=_update_check_loop, args=(_idle_for_update,), daemon=True).start()
     threading.Thread(target=_refresh_ytdlp_loop, daemon=True).start()  # keeps YouTube resolves working
     def _link_watch_loop():
         """Steps the cast's quality down once the proxy reports that the TV takes less than it
@@ -6926,11 +7305,17 @@ def main():
     ap.add_argument("--cast-name", default="", help=argparse.SUPPRESS)
     ap.add_argument("--cast-model", default="", help=argparse.SUPPRESS)
     ap.add_argument("--serve", action="store_true", help="run the local control server for the browser extension")
+    ap.add_argument("--self-check", action="store_true", help=argparse.SUPPRESS)   # print the version once the dependencies import
     ap.add_argument("--control-port", type=int, default=9988, help="control server port (localhost)")
     args = ap.parse_args()
     if args.low_latency:
         args.live_edge = 1
 
+    if args.self_check:
+        if not FROZEN:
+            import streamlink, pychromecast, zeroconf   # noqa: F401  (what a cast needs, in this interpreter)
+        print(HELPER_VERSION)
+        return
     if args.serve:
         serve_control(args.control_port)
     elif args.stop:

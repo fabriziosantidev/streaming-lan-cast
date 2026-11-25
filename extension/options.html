@@ -35,6 +35,10 @@
                     accent-color:var(--accent); }
   label.opt span { flex:1; }
   #saved.on { opacity:1; }
+  .ask { background:var(--card); border:1px solid var(--border); border-radius:8px;
+         padding:10px 12px; margin-top:16px; }
+  .ask b { display:block; margin-bottom:2px; }
+  .ask p.muted { margin:4px 0 10px; }
 </style>
 </head>
 <body>
@@ -49,12 +53,24 @@
     <button id="save" data-i18n="save">Save</button>
     <span id="saved"></span>
   </div>
+  <div id="updAsk" class="ask" hidden>
+    <b data-i18n="optUpdAsk">Should the helper update itself?</b>
+    <p class="muted" data-i18n="optUpdAskHelp">It installs only versions signed by the project, never during a cast. You can change this later under Helper updates.</p>
+    <div class="trow">
+      <button id="updYes" type="button" data-i18n="optUpdYes">Yes, update it automatically</button>
+      <button id="updNo" type="button" class="ghost" data-i18n="optUpdNo">No, I'll update it myself</button>
+    </div>
+  </div>
   <h2 data-i18n="optCastHead">Cast controls on other devices</h2>
   <p class="muted" data-i18n="optCastHelp">Phones on your network can show a card with controls for a cast running on a TV. These settings decide what that card shows and whether it can act on the cast. A cast to a DLNA device shows no card.</p>
   <label class="opt"><input id="castMeta" type="checkbox"> <span data-i18n="optCastMeta">Show the stream's title and image on those controls</span></label>
   <label class="opt"><input id="castOthers" type="checkbox"> <span data-i18n="optCastOthers">Let other devices on the network control the cast (play, pause, seek, stop)</span></label>
   <h2 data-i18n="optAwakeHead">This computer</h2>
   <label class="opt"><input id="castAwake" type="checkbox"> <span data-i18n="optCastAwake">Keep this computer awake while casting</span></label>
+  <h2 data-i18n="optUpdHead">Helper updates</h2>
+  <label class="opt"><input id="autoUpdate" type="checkbox"> <span data-i18n="optAutoUpdate">Install new helper versions automatically</span></label>
+  <p class="muted" data-i18n="optAutoUpdateHelp">Signed versions only, never during a cast.</p>
+  <p class="muted" id="autoUpdOff" hidden></p>
 <script src="browser-polyfill.js"></script>
 <script src="constants.js"></script>
 <script src="options.js"></script>
