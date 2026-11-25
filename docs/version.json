@@ -1,4 +1,26 @@
 {
-  "helper": "0.5.17",
-  "min_extension": "0.4.0"
+  "helper": "0.6.0",
+  "min_extension": "0.4.0",
+  "update": {
+    "version": "0.6.0",
+    "files": {
+      "python": {
+        "url": "https://raw.githubusercontent.com/fabriziosantidev/streaming-lan-cast/v0.6.0/helper/streaming-lan-cast-helper.py",
+        "sha256": "154ff57312db0754edd647e754d945e177f5532d6fcb1183988b7fda17938737",
+        "size": 388593,
+        "pip": [
+          "streamlink",
+          "pychromecast",
+          "curl_cffi",
+          "yt-dlp"
+        ]
+      },
+      "windows": {
+        "url": "https://github.com/fabriziosantidev/streaming-lan-cast/releases/download/v0.6.0/Streaming-LAN-Cast-Setup-0.6.0.exe",
+        "sha256": "e6061c1906e6acce75b8b538acf47ad89fbba7c0aaf6f57f554b95ea28846bae",
+        "size": 90985220
+      }
+    },
+    "sig": "529511aa3c65946fda3ef5016752d7681b1247d5403dcb8fc05a3c96d04debd201e678e862bd175089ed77532258d38d6a5b73b38b8c077b99aad00b30e8cd0c"
+  }
 }
